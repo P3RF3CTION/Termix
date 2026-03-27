@@ -31,6 +31,7 @@ import {
   getSSHHosts,
   deleteSSHHost,
   bulkImportSSHHosts,
+  bulkUpdateSSHHosts,
   updateSSHHost,
   renameFolder,
   exportSSHHostWithCredentials,
@@ -40,6 +41,9 @@ import {
   refreshServerPolling,
   isElectron,
   getConfiguredServerUrl,
+  getGuacamoleTokenFromHost,
+  getGuacamoleToken,
+  logActivity,
 } from "@/ui/main-axios.ts";
 import { useServerStatus } from "@/ui/contexts/ServerStatusContext";
 import { toast } from "sonner";
@@ -80,6 +84,11 @@ import {
   Container,
   Link,
   Plus,
+  ListChecks,
+  ChevronDown,
+  Monitor,
+  MessagesSquare,
+  Eye,
 } from "lucide-react";
 import type {
   SSHHost,
@@ -87,6 +96,7 @@ import type {
   SSHManagerHostViewerProps,
 } from "../../../../../types";
 import { DEFAULT_STATS_CONFIG } from "@/types/stats-widgets.ts";
+import { Checkbox } from "@/components/ui/checkbox.tsx";
 import { FolderEditDialog } from "@/ui/desktop/apps/host-manager/dialogs/FolderEditDialog.tsx";
 import { useTabs } from "@/ui/desktop/navigation/tabs/TabContext.tsx";
 
@@ -104,6 +114,7 @@ export function HostManagerViewer({
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [importing, setImporting] = useState(false);
+  const overwriteRef = useRef(false);
   const [draggedHost, setDraggedHost] = useState<SSHHost | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const [editingFolder, setEditingFolder] = useState<string | null>(null);
@@ -118,6 +129,12 @@ export function HostManagerViewer({
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(),
   );
+  const [openAccordions, setOpenAccordions] = useState<string[]>([]);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedHostIds, setSelectedHostIds] = useState<Set<number>>(
+    new Set(),
+  );
+  const [bulkUpdating, setBulkUpdating] = useState(false);
   const { getStatus } = useServerStatus();
   const dragCounter = useRef(0);
 
@@ -344,9 +361,58 @@ export function HostManagerViewer({
   };
 
   const handleEdit = (host: SSHHost) => {
+    if (selectionMode) return;
     if (onEditHost) {
       onEditHost(host);
     }
+  };
+
+  const toggleHostSelection = (hostId: number) => {
+    setSelectedHostIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(hostId)) next.delete(hostId);
+      else next.add(hostId);
+      return next;
+    });
+  };
+
+  const exitSelectionMode = () => {
+    setSelectionMode(false);
+    setSelectedHostIds(new Set());
+  };
+
+  const handleBulkUpdate = async (updates: Record<string, unknown>) => {
+    if (selectedHostIds.size === 0) return;
+    try {
+      setBulkUpdating(true);
+      const result = await bulkUpdateSSHHosts(
+        Array.from(selectedHostIds),
+        updates,
+      );
+      if (result.updated > 0) {
+        toast.success(t("hosts.bulkUpdateSuccess", { count: result.updated }));
+      }
+      if (result.errors.length > 0) {
+        toast.error(result.errors.join(", "));
+      }
+      await fetchHosts();
+      window.dispatchEvent(new CustomEvent("ssh-hosts:changed"));
+    } catch {
+      toast.error(t("hosts.bulkUpdateFailed"));
+    } finally {
+      setBulkUpdating(false);
+    }
+  };
+
+  const selectAllHosts = () => {
+    const selectableIds = hosts
+      .filter((h) => !(h as any).isShared)
+      .map((h) => h.id);
+    setSelectedHostIds(new Set(selectableIds));
+  };
+
+  const deselectAllHosts = () => {
+    setSelectedHostIds(new Set());
   };
 
   const handleClone = (host: SSHHost) => {
@@ -527,6 +593,7 @@ export function HostManagerViewer({
   const getSampleData = () => ({
     hosts: [
       {
+        connectionType: "ssh",
         name: t("interface.webServerProduction"),
         ip: "192.168.1.100",
         port: 22,
@@ -541,9 +608,13 @@ export function HostManagerViewer({
         enableTunnel: false,
         enableFileManager: true,
         enableDocker: false,
+        showTerminalInSidebar: true,
+        showFileManagerInSidebar: true,
+        showServerStatsInSidebar: true,
         defaultPath: "/var/www",
       },
       {
+        connectionType: "ssh",
         name: t("interface.databaseServer"),
         ip: "192.168.1.101",
         port: 22,
@@ -560,6 +631,9 @@ export function HostManagerViewer({
         enableTunnel: true,
         enableFileManager: false,
         enableDocker: false,
+        showTerminalInSidebar: true,
+        showTunnelInSidebar: true,
+        showServerStatsInSidebar: true,
         tunnelConnections: [
           {
             sourcePort: 5432,
@@ -579,6 +653,7 @@ export function HostManagerViewer({
         },
       },
       {
+        connectionType: "ssh",
         name: t("interface.developmentServer"),
         ip: "192.168.1.102",
         port: 2222,
@@ -594,9 +669,73 @@ export function HostManagerViewer({
         enableTunnel: false,
         enableFileManager: true,
         enableDocker: true,
+        showTerminalInSidebar: true,
+        showFileManagerInSidebar: true,
+        showDockerInSidebar: true,
         defaultPath: "/home/developer",
+        sudoPassword: "dev_sudo_password",
       },
       {
+        connectionType: "rdp",
+        name: "Windows Server 2022",
+        ip: "192.168.1.200",
+        port: 3389,
+        username: "Administrator",
+        password: "windows_password",
+        domain: "COMPANY",
+        security: "nla",
+        ignoreCert: false,
+        folder: "Remote Desktop",
+        tags: ["rdp", "windows", "production"],
+        pin: false,
+        notes: "Production Windows Server with RDP access",
+        guacamoleConfig: {
+          "enable-drive": true,
+          "drive-path": "/shared",
+          "create-drive-path": true,
+          "server-layout": "en-us-qwerty",
+          "resize-method": "display-update",
+        },
+      },
+      {
+        connectionType: "vnc",
+        name: "Ubuntu Desktop",
+        ip: "192.168.1.201",
+        port: 5900,
+        username: "vncuser",
+        password: "vnc_password",
+        folder: "Remote Desktop",
+        tags: ["vnc", "linux", "desktop"],
+        pin: false,
+        notes: "Ubuntu desktop with VNC server",
+        guacamoleConfig: {
+          "color-depth": 24,
+          cursor: "remote",
+          "read-only": false,
+          "clipboard-encoding": "UTF-8",
+        },
+      },
+      {
+        connectionType: "telnet",
+        name: "Network Switch",
+        ip: "192.168.1.254",
+        port: 23,
+        username: "admin",
+        password: "switch_password",
+        folder: "Infrastructure",
+        tags: ["telnet", "network", "switch"],
+        pin: false,
+        notes: "Legacy network switch with Telnet access",
+        guacamoleConfig: {
+          "color-scheme": "green-black",
+          "font-name": "monospace",
+          "font-size": 12,
+          scrollback: 1024,
+          backspace: 127,
+        },
+      },
+      {
+        connectionType: "ssh",
         name: "Jump Host Server",
         ip: "10.0.0.50",
         port: 22,
@@ -623,6 +762,7 @@ export function HostManagerViewer({
         ],
       },
       {
+        connectionType: "ssh",
         name: "Server with SOCKS5 Proxy",
         ip: "10.10.10.100",
         port: 22,
@@ -643,6 +783,7 @@ export function HostManagerViewer({
         socks5Password: "proxypass",
       },
       {
+        connectionType: "ssh",
         name: "Customized Terminal Server",
         ip: "192.168.1.150",
         port: 22,
@@ -727,15 +868,17 @@ export function HostManagerViewer({
         throw new Error(t("hosts.maxHostsAllowed"));
       }
 
-      const result = await bulkImportSSHHosts(hostsArray);
+      const result = await bulkImportSSHHosts(hostsArray, overwriteRef.current);
 
-      if (result.success > 0) {
-        toast.success(
-          t("hosts.importCompleted", {
-            success: result.success,
-            failed: result.failed,
-          }),
-        );
+      if (result.success > 0 || result.updated > 0) {
+        const parts: string[] = [];
+        if (result.success > 0)
+          parts.push(`${result.success} ${t("hosts.importCreated")}`);
+        if (result.updated > 0)
+          parts.push(`${result.updated} ${t("hosts.importUpdated")}`);
+        if (result.failed > 0)
+          parts.push(`${result.failed} ${t("hosts.importFailedCount")}`);
+        toast.success(parts.join(", "));
         if (result.errors.length > 0) {
           toast.error(`Import errors: ${result.errors.join(", ")}`);
         }
@@ -810,6 +953,22 @@ export function HostManagerViewer({
     return sortedGrouped;
   }, [filteredAndSortedHosts]);
 
+  const folderKeys = useMemo(() => Object.keys(hostsByFolder), [hostsByFolder]);
+  const folderKeysString = useMemo(() => folderKeys.join(","), [folderKeys]);
+
+  useEffect(() => {
+    setOpenAccordions((prev) => {
+      if (prev.length === 0 && folderKeys.length > 0) {
+        return folderKeys;
+      }
+      const existingFolders = prev.filter((folder) =>
+        folderKeys.includes(folder),
+      );
+      const newFolders = folderKeys.filter((folder) => !prev.includes(folder));
+      return [...existingFolders, ...newFolders];
+    });
+  }, [folderKeysString]);
+
   const toggleFolderExpansion = useCallback((folderName: string) => {
     setExpandedFolders((prev) => {
       const next = new Set(prev);
@@ -871,31 +1030,31 @@ export function HostManagerViewer({
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="relative"
-                    onClick={() =>
-                      document.getElementById("json-import-input")?.click()
-                    }
-                    disabled={importing}
-                  >
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" disabled={importing}>
                     {importing ? t("hosts.importing") : t("hosts.importJson")}
                   </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" className="max-w-sm">
-                  <div className="space-y-2">
-                    <p className="font-semibold text-sm">
-                      {t("hosts.importJsonTitle")}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {t("hosts.importJsonDesc")}
-                    </p>
-                  </div>
-                </TooltipContent>
-              </Tooltip>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    onClick={() => {
+                      overwriteRef.current = false;
+                      document.getElementById("json-import-input")?.click();
+                    }}
+                  >
+                    {t("hosts.importSkipExisting")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      overwriteRef.current = true;
+                      document.getElementById("json-import-input")?.click();
+                    }}
+                  >
+                    {t("hosts.importOverwriteExisting")}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               <Button
                 variant="outline"
@@ -975,31 +1134,31 @@ export function HostManagerViewer({
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="relative"
-                  onClick={() =>
-                    document.getElementById("json-import-input")?.click()
-                  }
-                  disabled={importing}
-                >
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" disabled={importing}>
                   {importing ? t("hosts.importing") : t("hosts.importJson")}
                 </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="max-w-sm">
-                <div className="space-y-2">
-                  <p className="font-semibold text-sm">
-                    {t("hosts.importJsonTitle")}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {t("hosts.importJsonDesc")}
-                  </p>
-                </div>
-              </TooltipContent>
-            </Tooltip>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onClick={() => {
+                    overwriteRef.current = false;
+                    document.getElementById("json-import-input")?.click();
+                  }}
+                >
+                  {t("hosts.importSkipExisting")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    overwriteRef.current = true;
+                    document.getElementById("json-import-input")?.click();
+                  }}
+                >
+                  {t("hosts.importOverwriteExisting")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             <Button variant="outline" size="sm" onClick={handleDownloadSample}>
               {t("hosts.downloadSample")}
@@ -1045,6 +1204,17 @@ export function HostManagerViewer({
             <Plus className="h-4 w-4 mr-2" />
             {t("hosts.addHost")}
           </Button>
+          <Button
+            variant={selectionMode ? "default" : "outline"}
+            className="h-9"
+            onClick={() => {
+              if (selectionMode) exitSelectionMode();
+              else setSelectionMode(true);
+            }}
+          >
+            <ListChecks className="h-4 w-4 mr-2" />
+            {selectionMode ? t("hosts.exitSelectMode") : t("hosts.selectMode")}
+          </Button>
         </div>
 
         <ScrollArea className="flex-1 min-h-0">
@@ -1064,7 +1234,8 @@ export function HostManagerViewer({
               >
                 <Accordion
                   type="multiple"
-                  defaultValue={Object.keys(hostsByFolder)}
+                  value={openAccordions}
+                  onValueChange={setOpenAccordions}
                 >
                   <AccordionItem value={folder} className="border-none">
                     <AccordionTrigger className="px-2 py-1 bg-muted/20 border-b hover:no-underline rounded-t-md">
@@ -1162,6 +1333,39 @@ export function HostManagerViewer({
                         <Badge variant="secondary" className="text-xs">
                           {folderHosts.length}
                         </Badge>
+                        {selectionMode &&
+                          (() => {
+                            const selectableIds = folderHosts
+                              .filter((h) => !(h as any).isShared)
+                              .map((h) => h.id);
+                            const allSelected =
+                              selectableIds.length > 0 &&
+                              selectableIds.every((id) =>
+                                selectedHostIds.has(id),
+                              );
+                            return (
+                              <Checkbox
+                                checked={allSelected}
+                                onCheckedChange={(checked) => {
+                                  setSelectedHostIds((prev) => {
+                                    const next = new Set(prev);
+                                    if (checked) {
+                                      selectableIds.forEach((id) =>
+                                        next.add(id),
+                                      );
+                                    } else {
+                                      selectableIds.forEach((id) =>
+                                        next.delete(id),
+                                      );
+                                    }
+                                    return next;
+                                  });
+                                }}
+                                onClick={(e) => e.stopPropagation()}
+                                className="ml-1"
+                              />
+                            );
+                          })()}
                         {folder !== t("hosts.uncategorized") && (
                           <div className="flex items-center gap-1 ml-auto">
                             <Tooltip>
@@ -1210,49 +1414,92 @@ export function HostManagerViewer({
                           <Tooltip key={host.id}>
                             <TooltipTrigger asChild>
                               <div
-                                draggable
+                                draggable={!selectionMode}
                                 onDragStart={(e) => handleDragStart(e, host)}
                                 onDragEnd={handleDragEnd}
-                                className={`bg-field border border-input rounded-lg cursor-pointer hover:shadow-lg hover:border-blue-400/50 hover:bg-hover-alt transition-all duration-200 p-3 group relative ${
+                                className={`bg-field border rounded-lg cursor-pointer hover:shadow-lg hover:bg-hover-alt transition-all duration-200 p-3 group relative ${
                                   draggedHost?.id === host.id
                                     ? "opacity-50 scale-95"
                                     : ""
+                                } ${
+                                  selectionMode && selectedHostIds.has(host.id)
+                                    ? "ring-2 ring-blue-500 border-blue-500"
+                                    : "border-input hover:border-blue-400/50"
+                                } ${
+                                  selectionMode && (host as any).isShared
+                                    ? "opacity-50 pointer-events-none"
+                                    : ""
                                 }`}
-                                onClick={() => handleEdit(host)}
+                                onClick={() => {
+                                  if (
+                                    selectionMode &&
+                                    !(host as any).isShared
+                                  ) {
+                                    toggleHostSelection(host.id);
+                                  } else {
+                                    handleEdit(host);
+                                  }
+                                }}
                               >
                                 <div className="flex items-start justify-between">
                                   <div className="flex-1 min-w-0">
                                     <div className="flex items-center gap-1">
+                                      {selectionMode &&
+                                        !(host as any).isShared && (
+                                          <Checkbox
+                                            checked={selectedHostIds.has(
+                                              host.id,
+                                            )}
+                                            onCheckedChange={() =>
+                                              toggleHostSelection(host.id)
+                                            }
+                                            onClick={(e) => e.stopPropagation()}
+                                            className="bg-background border-2 mr-1 flex-shrink-0"
+                                          />
+                                        )}
                                       {(() => {
                                         const statsConfig = (() => {
+                                          if (!host.statsConfig) {
+                                            return DEFAULT_STATS_CONFIG;
+                                          }
+                                          if (
+                                            typeof host.statsConfig === "object"
+                                          ) {
+                                            return host.statsConfig;
+                                          }
                                           try {
-                                            return host.statsConfig
-                                              ? JSON.parse(host.statsConfig)
-                                              : DEFAULT_STATS_CONFIG;
-                                          } catch {
+                                            return JSON.parse(host.statsConfig);
+                                          } catch (e) {
                                             return DEFAULT_STATS_CONFIG;
                                           }
                                         })();
-                                        const shouldShowStatus =
-                                          statsConfig.statusCheckEnabled !==
-                                          false;
-                                        const serverStatus = getStatus(host.id);
+                                        const shouldShowStatus = ![
+                                          false,
+                                          "false",
+                                        ].includes(
+                                          statsConfig.statusCheckEnabled,
+                                        );
 
-                                        return shouldShowStatus ? (
+                                        if (!shouldShowStatus) return null;
+
+                                        const serverStatus = getStatus(host.id);
+                                        return (
                                           <Status
                                             status={serverStatus}
                                             className="!bg-transparent !p-0.75 flex-shrink-0"
                                           >
                                             <StatusIndicator />
                                           </Status>
-                                        ) : null;
+                                        );
                                       })()}
                                       {host.pin && (
                                         <Pin className="h-3 w-3 text-yellow-500 flex-shrink-0" />
                                       )}
                                       <h3 className="font-medium truncate text-sm">
                                         {host.name ||
-                                          `${host.username}@${host.ip}`}
+                                          (host.username
+                                            ? `${host.username}@${host.ip}`
+                                            : host.ip)}
                                       </h3>
                                       {(host as any).isShared && (
                                         <Badge
@@ -1266,9 +1513,11 @@ export function HostManagerViewer({
                                     <p className="text-xs text-muted-foreground truncate">
                                       {host.ip}:{host.port}
                                     </p>
-                                    <p className="text-xs text-muted-foreground truncate">
-                                      {host.username}
-                                    </p>
+                                    {host.username && (
+                                      <p className="text-xs text-muted-foreground truncate">
+                                        {host.username}
+                                      </p>
+                                    )}
                                     <p className="text-xs text-muted-foreground truncate">
                                       ID: {host.id}
                                     </p>
@@ -1406,74 +1655,118 @@ export function HostManagerViewer({
                                             </TooltipContent>
                                           </Tooltip>
                                           <DropdownMenuContent align="end">
-                                            {host.enableTerminal && (
-                                              <DropdownMenuItem
-                                                onClick={(e) => {
-                                                  e.stopPropagation();
-                                                  copyFullScreenUrl(
-                                                    host,
-                                                    "terminal",
-                                                  );
-                                                }}
-                                              >
-                                                <Terminal className="h-4 w-4 mr-2" />
-                                                {t("hosts.copyTerminalUrl")}
-                                              </DropdownMenuItem>
-                                            )}
-                                            {host.enableFileManager && (
-                                              <DropdownMenuItem
-                                                onClick={(e) => {
-                                                  e.stopPropagation();
-                                                  copyFullScreenUrl(
-                                                    host,
-                                                    "file-manager",
-                                                  );
-                                                }}
-                                              >
-                                                <FolderOpen className="h-4 w-4 mr-2" />
-                                                {t("hosts.copyFileManagerUrl")}
-                                              </DropdownMenuItem>
-                                            )}
-                                            {host.enableTunnel && (
-                                              <DropdownMenuItem
-                                                onClick={(e) => {
-                                                  e.stopPropagation();
-                                                  copyFullScreenUrl(
-                                                    host,
-                                                    "tunnel",
-                                                  );
-                                                }}
-                                              >
-                                                <ArrowDownUp className="h-4 w-4 mr-2" />
-                                                {t("hosts.copyTunnelUrl")}
-                                              </DropdownMenuItem>
-                                            )}
-                                            <DropdownMenuItem
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                copyFullScreenUrl(
-                                                  host,
-                                                  "server-stats",
+                                            {(() => {
+                                              const connType = (host as any)
+                                                .connectionType;
+                                              const isRemoteDesktop =
+                                                connType === "rdp" ||
+                                                connType === "vnc" ||
+                                                connType === "telnet";
+
+                                              if (isRemoteDesktop) {
+                                                return (
+                                                  <DropdownMenuItem
+                                                    onClick={(e) => {
+                                                      e.stopPropagation();
+                                                      copyFullScreenUrl(
+                                                        host,
+                                                        connType,
+                                                      );
+                                                    }}
+                                                  >
+                                                    {connType === "rdp" ? (
+                                                      <Monitor className="h-4 w-4 mr-2" />
+                                                    ) : connType === "vnc" ? (
+                                                      <Eye className="h-4 w-4 mr-2" />
+                                                    ) : (
+                                                      <MessagesSquare className="h-4 w-4 mr-2" />
+                                                    )}
+                                                    {t(
+                                                      "hosts.copyRemoteDesktopUrl",
+                                                    )}
+                                                  </DropdownMenuItem>
                                                 );
-                                              }}
-                                            >
-                                              <Server className="h-4 w-4 mr-2" />
-                                              {t("hosts.copyServerStatsUrl")}
-                                            </DropdownMenuItem>
-                                            {host.enableDocker && (
-                                              <DropdownMenuItem
-                                                onClick={(e) => {
-                                                  e.stopPropagation();
-                                                  copyFullScreenUrl(
-                                                    host,
-                                                    "docker",
-                                                  );
-                                                }}
-                                              >
-                                                <Container className="h-4 w-4 mr-2" />
-                                                {t("hosts.copyDockerUrl")}
-                                              </DropdownMenuItem>
-                                            )}
+                                              }
+
+                                              return (
+                                                <>
+                                                  {host.enableTerminal && (
+                                                    <DropdownMenuItem
+                                                      onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        copyFullScreenUrl(
+                                                          host,
+                                                          "terminal",
+                                                        );
+                                                      }}
+                                                    >
+                                                      <Terminal className="h-4 w-4 mr-2" />
+                                                      {t(
+                                                        "hosts.copyTerminalUrl",
+                                                      )}
+                                                    </DropdownMenuItem>
+                                                  )}
+                                                  {host.enableFileManager && (
+                                                    <DropdownMenuItem
+                                                      onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        copyFullScreenUrl(
+                                                          host,
+                                                          "file-manager",
+                                                        );
+                                                      }}
+                                                    >
+                                                      <FolderOpen className="h-4 w-4 mr-2" />
+                                                      {t(
+                                                        "hosts.copyFileManagerUrl",
+                                                      )}
+                                                    </DropdownMenuItem>
+                                                  )}
+                                                  {host.enableTunnel && (
+                                                    <DropdownMenuItem
+                                                      onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        copyFullScreenUrl(
+                                                          host,
+                                                          "tunnel",
+                                                        );
+                                                      }}
+                                                    >
+                                                      <ArrowDownUp className="h-4 w-4 mr-2" />
+                                                      {t("hosts.copyTunnelUrl")}
+                                                    </DropdownMenuItem>
+                                                  )}
+                                                  <DropdownMenuItem
+                                                    onClick={(e) => {
+                                                      e.stopPropagation();
+                                                      copyFullScreenUrl(
+                                                        host,
+                                                        "server-stats",
+                                                      );
+                                                    }}
+                                                  >
+                                                    <Server className="h-4 w-4 mr-2" />
+                                                    {t(
+                                                      "hosts.copyServerStatsUrl",
+                                                    )}
+                                                  </DropdownMenuItem>
+                                                  {host.enableDocker && (
+                                                    <DropdownMenuItem
+                                                      onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        copyFullScreenUrl(
+                                                          host,
+                                                          "docker",
+                                                        );
+                                                      }}
+                                                    >
+                                                      <Container className="h-4 w-4 mr-2" />
+                                                      {t("hosts.copyDockerUrl")}
+                                                    </DropdownMenuItem>
+                                                  )}
+                                                </>
+                                              );
+                                            })()}
                                           </DropdownMenuContent>
                                         </DropdownMenu>
                                       </>
@@ -1508,185 +1801,339 @@ export function HostManagerViewer({
                                   )}
 
                                   <div className="flex flex-wrap gap-1">
-                                    {host.enableTerminal && (
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs px-1 py-0"
-                                      >
-                                        <Terminal className="h-2 w-2 mr-0.5" />
-                                        {t("hosts.terminalBadge")}
-                                      </Badge>
-                                    )}
-                                    {host.enableTunnel && (
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs px-1 py-0"
-                                      >
-                                        <Network className="h-2 w-2 mr-0.5" />
-                                        {t("hosts.tunnelBadge")}
-                                        {host.tunnelConnections &&
-                                          host.tunnelConnections.length > 0 && (
-                                            <span className="ml-0.5">
-                                              ({host.tunnelConnections.length})
-                                            </span>
+                                    {(() => {
+                                      const connType = (host as any)
+                                        .connectionType;
+                                      if (connType === "rdp") {
+                                        return (
+                                          <Badge
+                                            variant="outline"
+                                            className="text-xs px-1 py-0"
+                                          >
+                                            <Monitor className="h-2 w-2 mr-0.5" />
+                                            {t("hosts.rdp")}
+                                          </Badge>
+                                        );
+                                      }
+                                      if (connType === "vnc") {
+                                        return (
+                                          <Badge
+                                            variant="outline"
+                                            className="text-xs px-1 py-0"
+                                          >
+                                            <Eye className="h-2 w-2 mr-0.5" />
+                                            {t("hosts.vnc")}
+                                          </Badge>
+                                        );
+                                      }
+                                      if (connType === "telnet") {
+                                        return (
+                                          <Badge
+                                            variant="outline"
+                                            className="text-xs px-1 py-0"
+                                          >
+                                            <MessagesSquare className="h-2 w-2 mr-0.5" />
+                                            {t("hosts.telnet")}
+                                          </Badge>
+                                        );
+                                      }
+                                      return (
+                                        <>
+                                          {host.enableTerminal && (
+                                            <Badge
+                                              variant="outline"
+                                              className="text-xs px-1 py-0"
+                                            >
+                                              <Terminal className="h-2 w-2 mr-0.5" />
+                                              {t("hosts.terminalBadge")}
+                                            </Badge>
                                           )}
-                                      </Badge>
-                                    )}
-                                    {host.enableFileManager && (
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs px-1 py-0"
-                                      >
-                                        <FileEdit className="h-2 w-2 mr-0.5" />
-                                        {t("hosts.fileManagerBadge")}
-                                      </Badge>
-                                    )}
-                                    {host.enableDocker && (
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs px-1 py-0"
-                                      >
-                                        <Container className="h-2 w-2 mr-0.5" />
-                                        {t("hosts.docker")}
-                                      </Badge>
-                                    )}
+                                          {host.enableTunnel && (
+                                            <Badge
+                                              variant="outline"
+                                              className="text-xs px-1 py-0"
+                                            >
+                                              <Network className="h-2 w-2 mr-0.5" />
+                                              {t("hosts.tunnelBadge")}
+                                              {host.tunnelConnections &&
+                                                host.tunnelConnections.length >
+                                                  0 && (
+                                                  <span className="ml-0.5">
+                                                    (
+                                                    {
+                                                      host.tunnelConnections
+                                                        .length
+                                                    }
+                                                    )
+                                                  </span>
+                                                )}
+                                            </Badge>
+                                          )}
+                                          {host.enableFileManager && (
+                                            <Badge
+                                              variant="outline"
+                                              className="text-xs px-1 py-0"
+                                            >
+                                              <FileEdit className="h-2 w-2 mr-0.5" />
+                                              {t("hosts.fileManagerBadge")}
+                                            </Badge>
+                                          )}
+                                          {host.enableDocker && (
+                                            <Badge
+                                              variant="outline"
+                                              className="text-xs px-1 py-0"
+                                            >
+                                              <Container className="h-2 w-2 mr-0.5" />
+                                              {t("hosts.docker")}
+                                            </Badge>
+                                          )}
+                                        </>
+                                      );
+                                    })()}
                                   </div>
                                 </div>
 
                                 <div className="mt-3 pt-3 border-t border-border/50 flex items-center justify-center gap-1">
-                                  {host.enableTerminal && (
-                                    <Tooltip>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            const title = host.name?.trim()
-                                              ? host.name
-                                              : `${host.username}@${host.ip}:${host.port}`;
-                                            addTab({
-                                              type: "terminal",
-                                              title,
-                                              hostConfig: host,
-                                            });
-                                          }}
-                                          className="h-7 px-2 hover:bg-blue-500/10 hover:border-blue-500/50 flex-1"
-                                        >
-                                          <Terminal className="h-3.5 w-3.5" />
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        <p>{t("hosts.openTerminal")}</p>
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                  {host.enableFileManager && (
-                                    <Tooltip>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            const title = host.name?.trim()
-                                              ? host.name
-                                              : `${host.username}@${host.ip}:${host.port}`;
-                                            addTab({
-                                              type: "file_manager",
-                                              title,
-                                              hostConfig: host,
-                                            });
-                                          }}
-                                          className="h-7 px-2 hover:bg-emerald-500/10 hover:border-emerald-500/50 flex-1"
-                                        >
-                                          <FolderOpen className="h-3.5 w-3.5" />
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        <p>Open File Manager</p>
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                  {host.enableTunnel && (
-                                    <Tooltip>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            const title = host.name?.trim()
-                                              ? host.name
-                                              : `${host.username}@${host.ip}:${host.port}`;
-                                            addTab({
-                                              type: "tunnel",
-                                              title,
-                                              hostConfig: host,
-                                            });
-                                          }}
-                                          className="h-7 px-2 hover:bg-orange-500/10 hover:border-orange-500/50 flex-1"
-                                        >
-                                          <ArrowDownUp className="h-3.5 w-3.5" />
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        <p>Open Tunnels</p>
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                  {host.enableDocker && (
-                                    <Tooltip>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            const title = host.name?.trim()
-                                              ? host.name
-                                              : `${host.username}@${host.ip}:${host.port}`;
-                                            addTab({
-                                              type: "docker",
-                                              title,
-                                              hostConfig: host,
-                                            });
-                                          }}
-                                          className="h-7 px-2 hover:bg-cyan-500/10 hover:border-cyan-500/50 flex-1"
-                                        >
-                                          <Container className="h-3.5 w-3.5" />
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        <p>{t("hosts.openDocker")}</p>
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <Button
-                                        size="sm"
-                                        variant="outline"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          const title = host.name?.trim()
-                                            ? host.name
-                                            : `${host.username}@${host.ip}:${host.port}`;
-                                          addTab({
-                                            type: "server_stats",
-                                            title,
-                                            hostConfig: host,
-                                          });
-                                        }}
-                                        className="h-7 px-2 hover:bg-purple-500/10 hover:border-purple-500/50 flex-1"
-                                      >
-                                        <Server className="h-3.5 w-3.5" />
-                                      </Button>
-                                    </TooltipTrigger>
-                                    <TooltipContent>
-                                      <p>Open Server Details</p>
-                                    </TooltipContent>
-                                  </Tooltip>
+                                  {(() => {
+                                    const connType = (host as any)
+                                      .connectionType;
+                                    const isRemoteDesktop =
+                                      connType === "rdp" ||
+                                      connType === "vnc" ||
+                                      connType === "telnet";
+
+                                    if (isRemoteDesktop) {
+                                      return (
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <Button
+                                              size="sm"
+                                              variant="outline"
+                                              onClick={async (e) => {
+                                                e.stopPropagation();
+                                                const title = host.name?.trim()
+                                                  ? host.name
+                                                  : `${host.ip}:${host.port}`;
+
+                                                try {
+                                                  const protocol = connType as
+                                                    | "rdp"
+                                                    | "vnc"
+                                                    | "telnet";
+                                                  const result =
+                                                    await getGuacamoleToken({
+                                                      protocol,
+                                                      hostname: host.ip,
+                                                      port: host.port,
+                                                      username: host.username,
+                                                      password: host.password,
+                                                      domain: host.domain,
+                                                      security: host.security,
+                                                      ignoreCert:
+                                                        host.ignoreCert,
+                                                      guacamoleConfig:
+                                                        host.guacamoleConfig as any,
+                                                    });
+
+                                                  addTab({
+                                                    type: protocol,
+                                                    title,
+                                                    hostConfig: host,
+                                                    connectionConfig: {
+                                                      token: result.token,
+                                                      protocol,
+                                                      type: protocol,
+                                                      hostname: host.ip,
+                                                      port: host.port,
+                                                      username: host.username,
+                                                      password: host.password,
+                                                      domain: host.domain,
+                                                      security: host.security,
+                                                      "ignore-cert":
+                                                        host.ignoreCert,
+                                                    },
+                                                  });
+
+                                                  try {
+                                                    await logActivity(
+                                                      protocol,
+                                                      host.id,
+                                                      title,
+                                                    );
+                                                  } catch (err) {
+                                                    console.warn(
+                                                      `Failed to log ${protocol} activity:`,
+                                                      err,
+                                                    );
+                                                  }
+                                                } catch (error) {
+                                                  toast.error(
+                                                    `Failed to connect: ${error instanceof Error ? error.message : "Unknown error"}`,
+                                                  );
+                                                }
+                                              }}
+                                              className="h-7 px-2 hover:bg-indigo-500/10 hover:border-indigo-500/50 flex-1"
+                                            >
+                                              {connType === "rdp" ? (
+                                                <Monitor className="h-3.5 w-3.5" />
+                                              ) : connType === "vnc" ? (
+                                                <Eye className="h-3.5 w-3.5" />
+                                              ) : (
+                                                <MessagesSquare className="h-3.5 w-3.5" />
+                                              )}
+                                            </Button>
+                                          </TooltipTrigger>
+                                          <TooltipContent>
+                                            <p>{t("hosts.remoteDesktop")}</p>
+                                          </TooltipContent>
+                                        </Tooltip>
+                                      );
+                                    }
+
+                                    return (
+                                      <>
+                                        {host.enableTerminal && (
+                                          <Tooltip>
+                                            <TooltipTrigger asChild>
+                                              <Button
+                                                size="sm"
+                                                variant="outline"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  const title =
+                                                    host.name?.trim()
+                                                      ? host.name
+                                                      : `${host.username}@${host.ip}:${host.port}`;
+                                                  addTab({
+                                                    type: "terminal",
+                                                    title,
+                                                    hostConfig: host,
+                                                  });
+                                                }}
+                                                className="h-7 px-2 hover:bg-blue-500/10 hover:border-blue-500/50 flex-1"
+                                              >
+                                                <Terminal className="h-3.5 w-3.5" />
+                                              </Button>
+                                            </TooltipTrigger>
+                                            <TooltipContent>
+                                              <p>{t("hosts.openTerminal")}</p>
+                                            </TooltipContent>
+                                          </Tooltip>
+                                        )}
+                                        {host.enableFileManager && (
+                                          <Tooltip>
+                                            <TooltipTrigger asChild>
+                                              <Button
+                                                size="sm"
+                                                variant="outline"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  const title =
+                                                    host.name?.trim()
+                                                      ? host.name
+                                                      : `${host.username}@${host.ip}:${host.port}`;
+                                                  addTab({
+                                                    type: "file_manager",
+                                                    title,
+                                                    hostConfig: host,
+                                                  });
+                                                }}
+                                                className="h-7 px-2 hover:bg-emerald-500/10 hover:border-emerald-500/50 flex-1"
+                                              >
+                                                <FolderOpen className="h-3.5 w-3.5" />
+                                              </Button>
+                                            </TooltipTrigger>
+                                            <TooltipContent>
+                                              <p>
+                                                {t("hosts.openFileManager")}
+                                              </p>
+                                            </TooltipContent>
+                                          </Tooltip>
+                                        )}
+                                        {host.enableTunnel && (
+                                          <Tooltip>
+                                            <TooltipTrigger asChild>
+                                              <Button
+                                                size="sm"
+                                                variant="outline"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  const title =
+                                                    host.name?.trim()
+                                                      ? host.name
+                                                      : `${host.username}@${host.ip}:${host.port}`;
+                                                  addTab({
+                                                    type: "tunnel",
+                                                    title,
+                                                    hostConfig: host,
+                                                  });
+                                                }}
+                                                className="h-7 px-2 hover:bg-orange-500/10 hover:border-orange-500/50 flex-1"
+                                              >
+                                                <ArrowDownUp className="h-3.5 w-3.5" />
+                                              </Button>
+                                            </TooltipTrigger>
+                                            <TooltipContent>
+                                              <p>{t("hosts.openTunnels")}</p>
+                                            </TooltipContent>
+                                          </Tooltip>
+                                        )}
+                                        {host.enableDocker && (
+                                          <Tooltip>
+                                            <TooltipTrigger asChild>
+                                              <Button
+                                                size="sm"
+                                                variant="outline"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  const title =
+                                                    host.name?.trim()
+                                                      ? host.name
+                                                      : `${host.username}@${host.ip}:${host.port}`;
+                                                  addTab({
+                                                    type: "docker",
+                                                    title,
+                                                    hostConfig: host,
+                                                  });
+                                                }}
+                                                className="h-7 px-2 hover:bg-cyan-500/10 hover:border-cyan-500/50 flex-1"
+                                              >
+                                                <Container className="h-3.5 w-3.5" />
+                                              </Button>
+                                            </TooltipTrigger>
+                                            <TooltipContent>
+                                              <p>{t("hosts.openDocker")}</p>
+                                            </TooltipContent>
+                                          </Tooltip>
+                                        )}
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <Button
+                                              size="sm"
+                                              variant="outline"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                const title = host.name?.trim()
+                                                  ? host.name
+                                                  : `${host.username}@${host.ip}:${host.port}`;
+                                                addTab({
+                                                  type: "server_stats",
+                                                  title,
+                                                  hostConfig: host,
+                                                });
+                                              }}
+                                              className="h-7 px-2 hover:bg-purple-500/10 hover:border-purple-500/50 flex-1"
+                                            >
+                                              <Server className="h-3.5 w-3.5" />
+                                            </Button>
+                                          </TooltipTrigger>
+                                          <TooltipContent>
+                                            <p>{t("hosts.openServerStats")}</p>
+                                          </TooltipContent>
+                                        </Tooltip>
+                                      </>
+                                    );
+                                  })()}
                                 </div>
                               </div>
                             </TooltipTrigger>
@@ -1747,6 +2194,322 @@ export function HostManagerViewer({
               setEditingFolderAppearance(null);
             }}
           />
+        )}
+
+        {selectionMode && (
+          <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-popover border border-border rounded-lg shadow-xl px-4 py-3 flex items-center gap-2 max-w-[90vw]">
+            <span className="text-sm font-medium whitespace-nowrap">
+              {t("hosts.selectedCount", { count: selectedHostIds.size })}
+            </span>
+            <div className="w-px h-6 bg-border" />
+
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={
+                selectedHostIds.size ===
+                hosts.filter((h) => !(h as any).isShared).length
+                  ? deselectAllHosts
+                  : selectAllHosts
+              }
+            >
+              {selectedHostIds.size ===
+              hosts.filter((h) => !(h as any).isShared).length
+                ? t("hosts.deselectAll")
+                : t("hosts.selectAll")}
+            </Button>
+
+            <div className="w-px h-6 bg-border" />
+
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={bulkUpdating || selectedHostIds.size === 0}
+                >
+                  <Share2 className="h-3.5 w-3.5 mr-1.5" />
+                  {t("hosts.bulkMonitoring")}
+                  <ChevronDown className="h-3 w-3 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="center">
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      statsConfig: { statusCheckEnabled: true },
+                    });
+                  }}
+                >
+                  <Check className="h-3.5 w-3.5 mr-2 text-green-500" />
+                  {t("hosts.enableStatusCheck")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      statsConfig: { statusCheckEnabled: false },
+                    });
+                  }}
+                >
+                  <X className="h-3.5 w-3.5 mr-2 text-red-500" />
+                  {t("hosts.disableStatusCheck")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      statsConfig: { useGlobalStatusInterval: true },
+                    });
+                  }}
+                >
+                  <Globe className="h-3.5 w-3.5 mr-2 text-blue-500" />
+                  {t("hosts.useGlobalStatusDefault")}
+                </DropdownMenuItem>
+                <div className="h-px bg-border my-1" />
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ statsConfig: { metricsEnabled: true } });
+                  }}
+                >
+                  <Check className="h-3.5 w-3.5 mr-2 text-green-500" />
+                  {t("hosts.enableMetrics")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      statsConfig: { metricsEnabled: false },
+                    });
+                  }}
+                >
+                  <X className="h-3.5 w-3.5 mr-2 text-red-500" />
+                  {t("hosts.disableMetrics")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      statsConfig: { useGlobalMetricsInterval: true },
+                    });
+                  }}
+                >
+                  <Globe className="h-3.5 w-3.5 mr-2 text-blue-500" />
+                  {t("hosts.useGlobalMetricsDefault")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={bulkUpdating || selectedHostIds.size === 0}
+                >
+                  <Layers className="h-3.5 w-3.5 mr-1.5" />
+                  {t("hosts.bulkFeatures")}
+                  <ChevronDown className="h-3 w-3 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="center">
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      enableTerminal: true,
+                      enableFileManager: true,
+                      enableTunnel: true,
+                      enableDocker: true,
+                    });
+                  }}
+                >
+                  <Check className="h-3.5 w-3.5 mr-2 text-green-500" />
+                  {t("hosts.enableAllFeatures")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({
+                      enableTerminal: false,
+                      enableFileManager: false,
+                      enableTunnel: false,
+                      enableDocker: false,
+                    });
+                  }}
+                >
+                  <X className="h-3.5 w-3.5 mr-2 text-red-500" />
+                  {t("hosts.disableAllFeatures")}
+                </DropdownMenuItem>
+                <div className="h-px bg-border my-1" />
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableTerminal: true });
+                  }}
+                >
+                  <Terminal className="h-3.5 w-3.5 mr-2" />
+                  {t("hosts.bulkEnableTerminal")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableTerminal: false });
+                  }}
+                >
+                  <Terminal className="h-3.5 w-3.5 mr-2 opacity-30" />
+                  {t("hosts.bulkDisableTerminal")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableFileManager: true });
+                  }}
+                >
+                  <FolderOpen className="h-3.5 w-3.5 mr-2" />
+                  {t("hosts.bulkEnableFileManager")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableFileManager: false });
+                  }}
+                >
+                  <FolderOpen className="h-3.5 w-3.5 mr-2 opacity-30" />
+                  {t("hosts.bulkDisableFileManager")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableTunnel: true });
+                  }}
+                >
+                  <Network className="h-3.5 w-3.5 mr-2" />
+                  {t("hosts.bulkEnableTunnel")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableTunnel: false });
+                  }}
+                >
+                  <Network className="h-3.5 w-3.5 mr-2 opacity-30" />
+                  {t("hosts.bulkDisableTunnel")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableDocker: true });
+                  }}
+                >
+                  <Container className="h-3.5 w-3.5 mr-2" />
+                  {t("hosts.bulkEnableDocker")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ enableDocker: false });
+                  }}
+                >
+                  <Container className="h-3.5 w-3.5 mr-2 opacity-30" />
+                  {t("hosts.bulkDisableDocker")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={bulkUpdating || selectedHostIds.size === 0}
+                >
+                  <Folder className="h-3.5 w-3.5 mr-1.5" />
+                  {t("hosts.bulkMoveFolder")}
+                  <ChevronDown className="h-3 w-3 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="center"
+                className="max-h-[300px] overflow-y-auto"
+              >
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ folder: "" });
+                  }}
+                >
+                  <FolderOpen className="h-3.5 w-3.5 mr-2" />
+                  {t("hosts.uncategorized")}
+                </DropdownMenuItem>
+                {Object.keys(hostsByFolder)
+                  .filter((f) => f !== t("hosts.uncategorized"))
+                  .map((f) => {
+                    const FolderIcon = getFolderIcon(f);
+                    const folderColor = getFolderColor(f);
+                    return (
+                      <DropdownMenuItem
+                        key={f}
+                        onSelect={(e) => {
+                          e.preventDefault();
+                          handleBulkUpdate({ folder: f });
+                        }}
+                      >
+                        <FolderIcon
+                          className="h-3.5 w-3.5 mr-2"
+                          style={
+                            folderColor ? { color: folderColor } : undefined
+                          }
+                        />
+                        {f}
+                      </DropdownMenuItem>
+                    );
+                  })}
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={bulkUpdating || selectedHostIds.size === 0}
+                >
+                  <Pin className="h-3.5 w-3.5 mr-1.5" />
+                  {t("hosts.pin")}
+                  <ChevronDown className="h-3 w-3 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="center">
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ pin: true });
+                  }}
+                >
+                  <Pin className="h-3.5 w-3.5 mr-2 text-yellow-500" />
+                  {t("hosts.bulkPin")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    handleBulkUpdate({ pin: false });
+                  }}
+                >
+                  <Pin className="h-3.5 w-3.5 mr-2 opacity-30" />
+                  {t("hosts.bulkUnpin")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <div className="w-px h-6 bg-border" />
+            <Button variant="ghost" size="sm" onClick={exitSelectionMode}>
+              <X className="h-4 w-4 mr-1" />
+              {t("hosts.exitSelectMode")}
+            </Button>
+          </div>
         )}
       </div>
     </TooltipProvider>

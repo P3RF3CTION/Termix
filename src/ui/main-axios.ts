@@ -1,6 +1,7 @@
 import axios, { AxiosError, type AxiosInstance } from "axios";
 import { toast } from "sonner";
 import { getBasePath } from "@/lib/base-path";
+import { clearTermixSessionStorage } from "@/ui/desktop/navigation/tabs/TabContext";
 import type {
   SSHHost,
   SSHHostData,
@@ -13,6 +14,7 @@ import type {
   DockerStats,
   DockerLogOptions,
   DockerValidation,
+  ProxyNode,
 } from "../types/index.js";
 
 // ============================================================================
@@ -121,6 +123,7 @@ interface AuthResponse {
   data_unlocked?: boolean;
   requires_totp?: boolean;
   temp_token?: string;
+  rememberMe?: boolean;
 }
 
 interface UserInfo {
@@ -461,6 +464,12 @@ function createApiInstance(
 
           if (isElectron()) {
             electronSettingsCache.delete("jwt");
+            const electronAPI = (
+              window as unknown as {
+                electronAPI?: { clearSessionCookies?: () => Promise<void> };
+              }
+            ).electronAPI;
+            electronAPI?.clearSessionCookies?.().catch(() => {});
           }
 
           if (typeof window !== "undefined") {
@@ -512,6 +521,7 @@ function isDev(): boolean {
 
 const apiHost = import.meta.env.VITE_API_HOST || "localhost";
 let configuredServerUrl: string | null = null;
+let embeddedMode = false;
 
 export interface ServerConfig {
   serverUrl: string;
@@ -656,11 +666,53 @@ export async function checkElectronUpdate(): Promise<{
   }
 }
 
+export async function getEmbeddedServerStatus(): Promise<{
+  running: boolean;
+  embedded: boolean;
+  dataDir: string | null;
+} | null> {
+  if (!isElectron()) return null;
+
+  try {
+    const result = await (
+      window as Window &
+        typeof globalThis & {
+          IS_ELECTRON?: boolean;
+          electronAPI?: {
+            invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
+          };
+        }
+    ).electronAPI?.invoke("get-embedded-server-status");
+    return result as {
+      running: boolean;
+      embedded: boolean;
+      dataDir: string | null;
+    } | null;
+  } catch {
+    return null;
+  }
+}
+
+export function isEmbeddedMode(): boolean {
+  return embeddedMode;
+}
+
+export function setEmbeddedMode(value: boolean): void {
+  embeddedMode = value;
+  if (value) {
+    configuredServerUrl = null;
+    initializeApiInstances();
+  }
+}
+
 function getApiUrl(path: string, defaultPort: number): string {
   const devMode = isDev();
   const electronMode = isElectron();
 
   if (electronMode) {
+    if (embeddedMode && !configuredServerUrl) {
+      return `http://localhost:${defaultPort}${path}`;
+    }
     if (configuredServerUrl) {
       const baseUrl = configuredServerUrl.replace(/\/$/, "");
       const url = `${baseUrl}${path}`;
@@ -679,8 +731,9 @@ function getApiUrl(path: string, defaultPort: number): string {
 }
 
 function initializeApiInstances() {
-  // SSH Host Management API (port 30001)
-  sshHostApi = createApiInstance(getApiUrl("/ssh", 30001), "SSH_HOST");
+  // Host Management API (port 30001) - supports SSH, RDP, VNC, Telnet
+  hostApi = createApiInstance(getApiUrl("/host", 30001), "HOST");
+  sshHostApi = hostApi;
 
   // Tunnel Management API (port 30003)
   tunnelApi = createApiInstance(getApiUrl("/ssh", 30003), "TUNNEL");
@@ -707,7 +760,9 @@ function initializeApiInstances() {
   dockerApi = createApiInstance(getApiUrl("/docker", 30007), "DOCKER");
 }
 
-// SSH Host Management API (port 30001)
+// Host Management API (port 30001) - supports SSH, RDP, VNC, Telnet
+export let hostApi: AxiosInstance;
+// Backward compatibility
 export let sshHostApi: AxiosInstance;
 
 // Tunnel Management API (port 30003)
@@ -733,8 +788,11 @@ export let dockerApi: AxiosInstance;
 
 function initializeApp() {
   if (isElectron()) {
-    getServerConfig()
-      .then((config) => {
+    Promise.all([getServerConfig(), getEmbeddedServerStatus()])
+      .then(([config, status]) => {
+        if (status?.embedded && status?.running) {
+          embeddedMode = true;
+        }
         if (config?.serverUrl) {
           configuredServerUrl = config.serverUrl;
           (
@@ -745,6 +803,8 @@ function initializeApp() {
                 configuredServerUrl?: string;
               }
           ).configuredServerUrl = configuredServerUrl;
+        } else if (embeddedMode) {
+          // Embedded backend running, no remote server needed
         } else {
           console.warn("No server URL in config");
         }
@@ -963,6 +1023,7 @@ export async function getSSHHosts(): Promise<SSHHostWithStatus[]> {
 export async function createSSHHost(hostData: SSHHostData): Promise<SSHHost> {
   try {
     const submitData = {
+      connectionType: hostData.connectionType || "ssh",
       name: hostData.name || "",
       ip: hostData.ip,
       port: parseInt(hostData.port.toString()) || 22,
@@ -971,7 +1032,12 @@ export async function createSSHHost(hostData: SSHHostData): Promise<SSHHost> {
       tags: hostData.tags || [],
       pin: Boolean(hostData.pin),
       authType: hostData.authType,
-      password: hostData.authType === "password" ? hostData.password : null,
+      password:
+        hostData.connectionType !== "ssh"
+          ? hostData.password || null
+          : hostData.authType === "password"
+            ? hostData.password
+            : null,
       key: hostData.authType === "key" ? hostData.key : null,
       keyPassword: hostData.authType === "key" ? hostData.keyPassword : null,
       keyType: hostData.authType === "key" ? hostData.keyType : null,
@@ -991,13 +1057,15 @@ export async function createSSHHost(hostData: SSHHostData): Promise<SSHHost> {
       tunnelConnections: hostData.tunnelConnections || [],
       jumpHosts: hostData.jumpHosts || [],
       quickActions: hostData.quickActions || [],
-      statsConfig: hostData.statsConfig
-        ? typeof hostData.statsConfig === "string"
-          ? hostData.statsConfig
-          : JSON.stringify(hostData.statsConfig)
-        : null,
+      sudoPassword: hostData.sudoPassword || null,
+      statsConfig: hostData.statsConfig || null,
+      dockerConfig: hostData.dockerConfig || null,
       terminalConfig: hostData.terminalConfig || null,
       forceKeyboardInteractive: Boolean(hostData.forceKeyboardInteractive),
+      domain: hostData.domain || null,
+      security: hostData.security || null,
+      ignoreCert: Boolean(hostData.ignoreCert),
+      guacamoleConfig: hostData.guacamoleConfig || null,
       notes: hostData.notes || "",
       useSocks5: Boolean(hostData.useSocks5),
       socks5Host: hostData.socks5Host || null,
@@ -1042,6 +1110,7 @@ export async function updateSSHHost(
 ): Promise<SSHHost> {
   try {
     const submitData = {
+      connectionType: hostData.connectionType || "ssh",
       name: hostData.name || "",
       ip: hostData.ip,
       port: parseInt(hostData.port.toString()) || 22,
@@ -1050,7 +1119,12 @@ export async function updateSSHHost(
       tags: hostData.tags || [],
       pin: Boolean(hostData.pin),
       authType: hostData.authType,
-      password: hostData.authType === "password" ? hostData.password : null,
+      password:
+        hostData.connectionType !== "ssh"
+          ? hostData.password || null
+          : hostData.authType === "password"
+            ? hostData.password
+            : null,
       key: hostData.authType === "key" ? hostData.key : null,
       keyPassword: hostData.authType === "key" ? hostData.keyPassword : null,
       keyType: hostData.authType === "key" ? hostData.keyType : null,
@@ -1070,13 +1144,15 @@ export async function updateSSHHost(
       tunnelConnections: hostData.tunnelConnections || [],
       jumpHosts: hostData.jumpHosts || [],
       quickActions: hostData.quickActions || [],
-      statsConfig: hostData.statsConfig
-        ? typeof hostData.statsConfig === "string"
-          ? hostData.statsConfig
-          : JSON.stringify(hostData.statsConfig)
-        : null,
+      sudoPassword: hostData.sudoPassword || null,
+      statsConfig: hostData.statsConfig || null,
+      dockerConfig: hostData.dockerConfig || null,
       terminalConfig: hostData.terminalConfig || null,
       forceKeyboardInteractive: Boolean(hostData.forceKeyboardInteractive),
+      domain: hostData.domain || null,
+      security: hostData.security || null,
+      ignoreCert: Boolean(hostData.ignoreCert),
+      guacamoleConfig: hostData.guacamoleConfig || null,
       notes: hostData.notes || "",
       useSocks5: Boolean(hostData.useSocks5),
       socks5Host: hostData.socks5Host || null,
@@ -1114,17 +1190,40 @@ export async function updateSSHHost(
   }
 }
 
-export async function bulkImportSSHHosts(hosts: SSHHostData[]): Promise<{
+export async function bulkImportSSHHosts(
+  hosts: SSHHostData[],
+  overwrite = false,
+): Promise<{
   message: string;
   success: number;
+  updated: number;
+  skipped: number;
   failed: number;
   errors: string[];
 }> {
   try {
-    const response = await sshHostApi.post("/bulk-import", { hosts });
+    const response = await sshHostApi.post("/bulk-import", {
+      hosts,
+      overwrite,
+    });
     return response.data;
   } catch (error) {
     handleApiError(error, "bulk import SSH hosts");
+  }
+}
+
+export async function bulkUpdateSSHHosts(
+  hostIds: number[],
+  updates: Record<string, unknown>,
+): Promise<{ updated: number; failed: number; errors: string[] }> {
+  try {
+    const response = await sshHostApi.patch("/bulk-update", {
+      hostIds,
+      updates,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "bulk update SSH hosts");
   }
 }
 
@@ -1204,6 +1303,32 @@ export async function getAutoStartStatus(): Promise<{
     return response.data;
   } catch (error) {
     handleApiError(error, "fetch autostart status");
+  }
+}
+
+// ============================================================================
+// PROXY CONNECTIVITY TEST
+// ============================================================================
+
+export async function testProxyConnection(options: {
+  singleProxy?: {
+    host: string;
+    port: number;
+    type?: 4 | 5 | "http";
+    username?: string;
+    password?: string;
+  };
+  proxyChain?: ProxyNode[];
+  testTarget?: { host: string; port: number };
+}): Promise<{ success: boolean; latencyMs?: number; error?: string }> {
+  try {
+    const response = await sshHostApi.post("/db/proxy/test", options);
+    return response.data;
+  } catch (error) {
+    if (error instanceof AxiosError && error.response?.data?.error) {
+      return { success: false, error: error.response.data.error };
+    }
+    handleApiError(error, "test proxy connection");
   }
 }
 
@@ -1411,7 +1536,6 @@ export async function connectSSH(
     });
     return response.data;
   } catch (error: any) {
-    // Preserve connection logs from error response
     if (error?.response?.data?.connectionLogs) {
       const errorWithLogs = new Error(
         error?.response?.data?.error ||
@@ -1420,7 +1544,6 @@ export async function connectSSH(
       );
       (errorWithLogs as any).connectionLogs =
         error.response.data.connectionLogs;
-      // Also preserve other fields like requires_totp
       if (error.response.data.requires_totp) {
         (errorWithLogs as any).requires_totp = true;
         (errorWithLogs as any).sessionId = error.response.data.sessionId;
@@ -1553,7 +1676,7 @@ export async function quickConnect(
   data: Record<string, unknown>,
 ): Promise<SSHHost> {
   try {
-    const response = await authApi.post("/ssh/quick-connect", data);
+    const response = await authApi.post("/host/quick-connect", data);
     return response.data;
   } catch (error) {
     throw handleApiError(error, "quick connect");
@@ -1612,6 +1735,20 @@ export async function identifySSHSymlink(
     return response.data;
   } catch (error) {
     handleApiError(error, "identify SSH symlink");
+  }
+}
+
+export async function resolveSSHPath(
+  sessionId: string,
+  path: string,
+): Promise<string> {
+  try {
+    const response = await fileManagerApi.get("/ssh/resolvePath", {
+      params: { sessionId, path },
+    });
+    return response.data?.resolvedPath || path;
+  } catch {
+    return path;
   }
 }
 
@@ -2021,7 +2158,7 @@ export async function getRecentFiles(
   hostId: number,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.get("/ssh/file_manager/recent", {
+    const response = await authApi.get("/host/file_manager/recent", {
       params: { hostId },
     });
     return response.data;
@@ -2037,7 +2174,7 @@ export async function addRecentFile(
   name?: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.post("/ssh/file_manager/recent", {
+    const response = await authApi.post("/host/file_manager/recent", {
       hostId,
       path,
       name,
@@ -2054,7 +2191,7 @@ export async function removeRecentFile(
   path: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.delete("/ssh/file_manager/recent", {
+    const response = await authApi.delete("/host/file_manager/recent", {
       data: { hostId, path },
     });
     return response.data;
@@ -2068,7 +2205,7 @@ export async function getPinnedFiles(
   hostId: number,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.get("/ssh/file_manager/pinned", {
+    const response = await authApi.get("/host/file_manager/pinned", {
       params: { hostId },
     });
     return response.data;
@@ -2084,7 +2221,7 @@ export async function addPinnedFile(
   name?: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.post("/ssh/file_manager/pinned", {
+    const response = await authApi.post("/host/file_manager/pinned", {
       hostId,
       path,
       name,
@@ -2101,7 +2238,7 @@ export async function removePinnedFile(
   path: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.delete("/ssh/file_manager/pinned", {
+    const response = await authApi.delete("/host/file_manager/pinned", {
       data: { hostId, path },
     });
     return response.data;
@@ -2115,7 +2252,7 @@ export async function getFolderShortcuts(
   hostId: number,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.get("/ssh/file_manager/shortcuts", {
+    const response = await authApi.get("/host/file_manager/shortcuts", {
       params: { hostId },
     });
     return response.data;
@@ -2131,7 +2268,7 @@ export async function addFolderShortcut(
   name?: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.post("/ssh/file_manager/shortcuts", {
+    const response = await authApi.post("/host/file_manager/shortcuts", {
       hostId,
       path,
       name,
@@ -2148,7 +2285,7 @@ export async function removeFolderShortcut(
   path: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.delete("/ssh/file_manager/shortcuts", {
+    const response = await authApi.delete("/host/file_manager/shortcuts", {
       data: { hostId, path },
     });
     return response.data;
@@ -2205,7 +2342,6 @@ export async function startMetricsPolling(hostId: number): Promise<{
     const response = await statsApi.post(`/metrics/start/${hostId}`);
     return response.data;
   } catch (error: any) {
-    // Preserve connection logs from error response
     if (error?.response?.data?.connectionLogs) {
       const errorWithLogs = new Error(
         error?.response?.data?.error || error.message,
@@ -2309,6 +2445,60 @@ export async function notifyHostCreatedOrUpdated(
 }
 
 // ============================================================================
+// GLOBAL MONITORING SETTINGS
+// ============================================================================
+
+export async function getGlobalMonitoringSettings(): Promise<{
+  statusCheckInterval: number;
+  metricsInterval: number;
+}> {
+  try {
+    const response = await statsApi.get("/global-settings");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch global monitoring settings");
+  }
+}
+
+export async function updateGlobalMonitoringSettings(settings: {
+  statusCheckInterval?: number;
+  metricsInterval?: number;
+}): Promise<void> {
+  try {
+    await statsApi.post("/global-settings", settings);
+  } catch (error) {
+    handleApiError(error, "update global monitoring settings");
+  }
+}
+
+// ============================================================================
+// GUACAMOLE SETTINGS
+// ============================================================================
+
+export async function getGuacamoleSettings(): Promise<{
+  enabled: boolean;
+  url: string;
+}> {
+  try {
+    const response = await authApi.get("/users/guacamole-settings");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch guacamole settings");
+  }
+}
+
+export async function updateGuacamoleSettings(settings: {
+  enabled?: boolean;
+  url?: string;
+}): Promise<void> {
+  try {
+    await authApi.patch("/users/guacamole-settings", settings);
+  } catch (error) {
+    handleApiError(error, "update guacamole settings");
+  }
+}
+
+// ============================================================================
 // AUTHENTICATION
 // ============================================================================
 
@@ -2330,9 +2520,14 @@ export async function registerUser(
 export async function loginUser(
   username: string,
   password: string,
+  rememberMe: boolean = false,
 ): Promise<AuthResponse> {
   try {
-    const response = await authApi.post("/users/login", { username, password });
+    const response = await authApi.post("/users/login", {
+      username,
+      password,
+      rememberMe,
+    });
 
     const hasToken = response.data.token;
 
@@ -2369,6 +2564,7 @@ export async function loginUser(
       username: response.data.username,
       requires_totp: response.data.requires_totp,
       temp_token: response.data.temp_token,
+      rememberMe: response.data.rememberMe,
       is_oidc: response.data.is_oidc,
       totp_enabled: response.data.totp_enabled,
       data_unlocked: response.data.data_unlocked,
@@ -2385,9 +2581,17 @@ export async function logoutUser(): Promise<{
   try {
     const response = await authApi.post("/users/logout");
 
+    clearTermixSessionStorage();
+
     if (isElectron()) {
       localStorage.removeItem("jwt");
       electronSettingsCache.delete("jwt");
+      const electronAPI = (
+        window as unknown as {
+          electronAPI?: { clearSessionCookies?: () => Promise<void> };
+        }
+      ).electronAPI;
+      electronAPI?.clearSessionCookies?.().catch(() => {});
     } else {
       const isSecure = window.location.protocol === "https:";
       const cookieString = isSecure
@@ -2398,9 +2602,17 @@ export async function logoutUser(): Promise<{
 
     return response.data;
   } catch (error) {
+    clearTermixSessionStorage();
+
     if (isElectron()) {
       localStorage.removeItem("jwt");
       electronSettingsCache.delete("jwt");
+      const electronAPI = (
+        window as unknown as {
+          electronAPI?: { clearSessionCookies?: () => Promise<void> };
+        }
+      ).electronAPI;
+      electronAPI?.clearSessionCookies?.().catch(() => {});
     } else {
       const isSecure = window.location.protocol === "https:";
       const cookieString = isSecure
@@ -2545,9 +2757,13 @@ export async function changePassword(oldPassword: string, newPassword: string) {
   }
 }
 
-export async function getOIDCAuthorizeUrl(): Promise<OIDCAuthorize> {
+export async function getOIDCAuthorizeUrl(
+  rememberMe = false,
+): Promise<OIDCAuthorize> {
   try {
-    const response = await authApi.get("/users/oidc/authorize");
+    const response = await authApi.get("/users/oidc/authorize", {
+      params: { rememberMe },
+    });
     return response.data;
   } catch (error) {
     handleApiError(error, "get OIDC authorize URL");
@@ -2778,11 +2994,13 @@ export async function disableTOTP(
 export async function verifyTOTPLogin(
   temp_token: string,
   totp_code: string,
+  rememberMe: boolean = false,
 ): Promise<AuthResponse> {
   try {
     const response = await authApi.post("/users/totp/verify-login", {
       temp_token,
       totp_code,
+      rememberMe,
     });
 
     const hasToken = response.data.token;
@@ -3036,7 +3254,7 @@ export async function migrateHostToCredential(
 
 export async function getFoldersWithStats(): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.get("/ssh/db/folders/with-stats");
+    const response = await authApi.get("/host/db/folders/with-stats");
     return response.data;
   } catch (error) {
     handleApiError(error, "fetch folders with statistics");
@@ -3048,7 +3266,7 @@ export async function renameFolder(
   newName: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const response = await authApi.put("/ssh/folders/rename", {
+    const response = await authApi.put("/host/folders/rename", {
       oldName,
       newName,
     });
@@ -3064,7 +3282,7 @@ export async function getSSHFolders(): Promise<SSHFolder[]> {
       operation: "fetch_ssh_folders",
     });
 
-    const response = await authApi.get("/ssh/folders");
+    const response = await authApi.get("/host/folders");
 
     sshLogger.success("SSH folders fetched successfully", {
       operation: "fetch_ssh_folders",
@@ -3094,7 +3312,7 @@ export async function updateFolderMetadata(
       icon,
     });
 
-    await authApi.put("/ssh/folders/metadata", {
+    await authApi.put("/host/folders/metadata", {
       name,
       color,
       icon,
@@ -3124,7 +3342,7 @@ export async function deleteAllHostsInFolder(
     });
 
     const response = await authApi.delete(
-      `/ssh/folders/${encodeURIComponent(folderName)}/hosts`,
+      `/host/folders/${encodeURIComponent(folderName)}/hosts`,
     );
 
     sshLogger.success("All hosts in folder deleted successfully", {
@@ -3431,7 +3649,15 @@ export interface UptimeInfo {
 export interface RecentActivityItem {
   id: number;
   userId: string;
-  type: "terminal" | "file_manager" | "server_stats" | "tunnel" | "docker";
+  type:
+    | "terminal"
+    | "file_manager"
+    | "server_stats"
+    | "tunnel"
+    | "docker"
+    | "telnet"
+    | "vnc"
+    | "rdp";
   hostId: number;
   hostName: string;
   timestamp: string;
@@ -3460,7 +3686,15 @@ export async function getRecentActivity(
 }
 
 export async function logActivity(
-  type: "terminal" | "file_manager" | "server_stats" | "tunnel" | "docker",
+  type:
+    | "terminal"
+    | "file_manager"
+    | "server_stats"
+    | "tunnel"
+    | "docker"
+    | "rdp"
+    | "vnc"
+    | "telnet",
   hostId: number,
   hostName: string,
 ): Promise<{ message: string; id: number | string }> {
@@ -3578,11 +3812,193 @@ export async function unlinkOIDCFromPasswordAccount(
   }
 }
 
+export interface GuacamoleTokenRequest {
+  protocol: "rdp" | "vnc" | "telnet";
+  hostname: string;
+  port?: number;
+  username?: string;
+  password?: string;
+  domain?: string;
+  security?: string;
+  ignoreCert?: boolean;
+  guacamoleConfig?: {
+    colorDepth?: number;
+    width?: number;
+    height?: number;
+    dpi?: number;
+    resizeMethod?: string;
+    forceLossless?: boolean;
+    disableAudio?: boolean;
+    enableAudioInput?: boolean;
+    enableWallpaper?: boolean;
+    enableTheming?: boolean;
+    enableFontSmoothing?: boolean;
+    enableFullWindowDrag?: boolean;
+    enableDesktopComposition?: boolean;
+    enableMenuAnimations?: boolean;
+    disableBitmapCaching?: boolean;
+    disableOffscreenCaching?: boolean;
+    disableGlyphCaching?: boolean;
+    disableGfx?: boolean;
+    enablePrinting?: boolean;
+    printerName?: string;
+    enableDrive?: boolean;
+    driveName?: string;
+    drivePath?: string;
+    createDrivePath?: boolean;
+    disableDownload?: boolean;
+    disableUpload?: boolean;
+    enableTouch?: boolean;
+    clientName?: string;
+    console?: boolean;
+    initialProgram?: string;
+    serverLayout?: string;
+    timezone?: string;
+    gatewayHostname?: string;
+    gatewayPort?: number;
+    gatewayUsername?: string;
+    gatewayPassword?: string;
+    gatewayDomain?: string;
+    remoteApp?: string;
+    remoteAppDir?: string;
+    remoteAppArgs?: string;
+    normalizeClipboard?: string;
+    disableCopy?: boolean;
+    disablePaste?: boolean;
+    cursor?: string;
+    swapRedBlue?: boolean;
+    readOnly?: boolean;
+    recordingPath?: string;
+    recordingName?: string;
+    createRecordingPath?: boolean;
+    recordingExcludeOutput?: boolean;
+    recordingExcludeMouse?: boolean;
+    recordingIncludeKeys?: boolean;
+    wolSendPacket?: boolean;
+    wolMacAddr?: string;
+    wolBroadcastAddr?: string;
+    wolUdpPort?: number;
+    wolWaitTime?: number;
+  };
+}
+
+export interface GuacamoleTokenResponse {
+  token: string;
+}
+
+function toGuacamoleParams(
+  config: GuacamoleTokenRequest["guacamoleConfig"],
+): Record<string, unknown> {
+  if (!config) return {};
+
+  const params: Record<string, unknown> = {};
+
+  const mappings: Record<string, string> = {
+    colorDepth: "color-depth",
+    resizeMethod: "resize-method",
+    forceLossless: "force-lossless",
+    disableAudio: "disable-audio",
+    enableAudioInput: "enable-audio-input",
+    enableWallpaper: "enable-wallpaper",
+    enableTheming: "enable-theming",
+    enableFontSmoothing: "enable-font-smoothing",
+    enableFullWindowDrag: "enable-full-window-drag",
+    enableDesktopComposition: "enable-desktop-composition",
+    enableMenuAnimations: "enable-menu-animations",
+    disableBitmapCaching: "disable-bitmap-caching",
+    disableOffscreenCaching: "disable-offscreen-caching",
+    disableGlyphCaching: "disable-glyph-caching",
+    disableGfx: "disable-gfx",
+    enablePrinting: "enable-printing",
+    printerName: "printer-name",
+    enableDrive: "enable-drive",
+    driveName: "drive-name",
+    drivePath: "drive-path",
+    createDrivePath: "create-drive-path",
+    disableDownload: "disable-download",
+    disableUpload: "disable-upload",
+    enableTouch: "enable-touch",
+    clientName: "client-name",
+    initialProgram: "initial-program",
+    serverLayout: "server-layout",
+    gatewayHostname: "gateway-hostname",
+    gatewayPort: "gateway-port",
+    gatewayUsername: "gateway-username",
+    gatewayPassword: "gateway-password",
+    gatewayDomain: "gateway-domain",
+    remoteApp: "remote-app",
+    remoteAppDir: "remote-app-dir",
+    remoteAppArgs: "remote-app-args",
+    normalizeClipboard: "normalize-clipboard",
+    disableCopy: "disable-copy",
+    disablePaste: "disable-paste",
+    swapRedBlue: "swap-red-blue",
+    readOnly: "read-only",
+    recordingPath: "recording-path",
+    recordingName: "recording-name",
+    createRecordingPath: "create-recording-path",
+    recordingExcludeOutput: "recording-exclude-output",
+    recordingExcludeMouse: "recording-exclude-mouse",
+    recordingIncludeKeys: "recording-include-keys",
+    wolSendPacket: "wol-send-packet",
+    wolMacAddr: "wol-mac-addr",
+    wolBroadcastAddr: "wol-broadcast-addr",
+    wolUdpPort: "wol-udp-port",
+    wolWaitTime: "wol-wait-time",
+  };
+
+  for (const [key, value] of Object.entries(config)) {
+    if (value !== undefined && value !== null && value !== "") {
+      const paramName = mappings[key] || key;
+      if (typeof value === "boolean") {
+        params[paramName] = value ? "true" : "false";
+      } else {
+        params[paramName] = value;
+      }
+    }
+  }
+
+  return params;
+}
+
+export async function getGuacamoleToken(
+  request: GuacamoleTokenRequest,
+): Promise<GuacamoleTokenResponse> {
+  try {
+    const guacParams = toGuacamoleParams(request.guacamoleConfig);
+
+    const response = await authApi.post("/guacamole/token", {
+      type: request.protocol,
+      hostname: request.hostname,
+      port: request.port,
+      username: request.username,
+      password: request.password,
+      domain: request.domain,
+      security: request.security,
+      "ignore-cert": request.ignoreCert,
+      ...guacParams,
+    });
+    return response.data;
+  } catch (error) {
+    throw handleApiError(error, "get guacamole token");
+  }
+}
+
+export async function getGuacamoleTokenFromHost(
+  hostId: number,
+): Promise<GuacamoleTokenResponse> {
+  try {
+    const response = await authApi.post(`/guacamole/connect-host/${hostId}`);
+    return response.data;
+  } catch (error) {
+    throw handleApiError(error, "get guacamole token from host");
+  }
+}
+
 // ============================================================================
 // RBAC MANAGEMENT
 // ============================================================================
 
-// Role Management
 export async function getRoles(): Promise<{ roles: Role[] }> {
   try {
     const response = await rbacApi.get("/rbac/roles");
@@ -3631,7 +4047,6 @@ export async function deleteRole(
   }
 }
 
-// User-Role Management
 export async function getUserRoles(
   userId: string,
 ): Promise<{ roles: UserRole[] }> {
@@ -3671,14 +4086,13 @@ export async function removeRoleFromUser(
   }
 }
 
-// Host Sharing Management
 export async function shareHost(
   hostId: number,
   shareData: {
     targetType: "user" | "role";
     targetUserId?: string;
     targetRoleId?: number;
-    permissionLevel: "view"; // Only view permission is supported
+    permissionLevel: "view";
     durationHours?: number;
   },
 ): Promise<{ success: boolean }> {
@@ -3767,7 +4181,6 @@ export async function connectDockerSession(
     if (error.response?.data?.requires_warpgate) {
       return error.response.data;
     }
-    // Preserve connection logs from error response
     if (error?.response?.data?.connectionLogs) {
       const errorWithLogs = new Error(
         error?.response?.data?.error ||

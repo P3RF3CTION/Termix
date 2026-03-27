@@ -4,7 +4,7 @@ import {
   hostAccess,
   roles,
   userRoles,
-  sshData,
+  hosts,
   users,
 } from "../database/db/schema.js";
 import { eq, and, or, isNull, gte, sql } from "drizzle-orm";
@@ -66,15 +66,14 @@ class PermissionManager {
   private async cleanupExpiredAccess(): Promise<void> {
     try {
       const now = new Date().toISOString();
-      const result = await db
+      await db
         .delete(hostAccess)
         .where(
           and(
             sql`${hostAccess.expiresAt} IS NOT NULL`,
             sql`${hostAccess.expiresAt} <= ${now}`,
           ),
-        )
-        .returning({ id: hostAccess.id });
+        );
     } catch (error) {
       databaseLogger.error("Failed to cleanup expired host access", error, {
         operation: "host_access_cleanup_failed",
@@ -168,8 +167,8 @@ class PermissionManager {
     try {
       const host = await db
         .select()
-        .from(sshData)
-        .where(and(eq(sshData.id, hostId), eq(sshData.userId, userId)))
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
         .limit(1);
 
       if (host.length > 0) {
@@ -211,9 +210,9 @@ class PermissionManager {
         const access = sharedAccess[0];
 
         const hostOwnerCheck = await db
-          .select({ ownerId: sshData.userId })
-          .from(sshData)
-          .where(eq(sshData.id, hostId))
+          .select({ ownerId: hosts.userId })
+          .from(hosts)
+          .where(eq(hosts.id, hostId))
           .limit(1);
 
         if (hostOwnerCheck.length > 0 && hostOwnerCheck[0].ownerId === userId) {
@@ -280,7 +279,7 @@ class PermissionManager {
   async isAdmin(userId: string): Promise<boolean> {
     try {
       const user = await db
-        .select({ isAdmin: users.is_admin })
+        .select({ isAdmin: users.isAdmin })
         .from(users)
         .where(eq(users.id, userId))
         .limit(1);
@@ -383,7 +382,8 @@ class PermissionManager {
         });
       }
 
-      (req as any).hostAccessInfo = accessInfo;
+      (req as unknown as { hostAccessInfo: HostAccessInfo }).hostAccessInfo =
+        accessInfo;
 
       next();
     };

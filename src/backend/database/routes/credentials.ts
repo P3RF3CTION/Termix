@@ -7,7 +7,7 @@ import { db } from "../db/index.js";
 import {
   sshCredentials,
   sshCredentialUsage,
-  sshData,
+  hosts,
   hostAccess,
 } from "../db/schema.js";
 import { eq, and, desc, sql } from "drizzle-orm";
@@ -225,9 +225,9 @@ router.post(
         username: username?.trim() || null,
         password: plainPassword,
         key: plainKey,
-        private_key: keyInfo?.privateKey || plainKey,
-        public_key: keyInfo?.publicKey || null,
-        key_password: plainKeyPassword,
+        privateKey: keyInfo?.privateKey || plainKey,
+        publicKey: keyInfo?.publicKey || null,
+        keyPassword: plainKeyPassword,
         keyType: keyType || null,
         detectedKeyType: keyInfo?.keyType || null,
         usageCount: 0,
@@ -434,14 +434,14 @@ router.get(
       if (credential.key) {
         output.key = credential.key;
       }
-      if (credential.private_key) {
-        output.privateKey = credential.private_key;
+      if (credential.privateKey) {
+        output.privateKey = credential.privateKey;
       }
-      if (credential.public_key) {
-        output.publicKey = credential.public_key;
+      if (credential.publicKey) {
+        output.publicKey = credential.publicKey;
       }
-      if (credential.key_password) {
-        output.keyPassword = credential.key_password;
+      if (credential.keyPassword) {
+        output.keyPassword = credential.keyPassword;
       }
 
       res.json(output);
@@ -564,13 +564,13 @@ router.put(
               error: `Invalid SSH key: ${keyInfo.error}`,
             });
           }
-          updateFields.private_key = keyInfo.privateKey;
-          updateFields.public_key = keyInfo.publicKey;
+          updateFields.privateKey = keyInfo.privateKey;
+          updateFields.publicKey = keyInfo.publicKey;
           updateFields.detectedKeyType = keyInfo.keyType;
         }
       }
       if (updateData.keyPassword !== undefined) {
-        updateFields.key_password = updateData.keyPassword || null;
+        updateFields.keyPassword = updateData.keyPassword || null;
       }
 
       if (Object.keys(updateFields).length === 0) {
@@ -614,7 +614,6 @@ router.put(
         userId,
       );
 
-      const credential = updated[0];
       authLogger.success("SSH credential updated", {
         operation: "credential_update_success",
         userId,
@@ -691,29 +690,23 @@ router.delete(
 
       const hostsUsingCredential = await db
         .select()
-        .from(sshData)
+        .from(hosts)
         .where(
-          and(
-            eq(sshData.credentialId, parseInt(id)),
-            eq(sshData.userId, userId),
-          ),
+          and(eq(hosts.credentialId, parseInt(id)), eq(hosts.userId, userId)),
         );
 
       if (hostsUsingCredential.length > 0) {
         await db
-          .update(sshData)
+          .update(hosts)
           .set({
             credentialId: null,
             password: null,
             key: null,
-            key_password: null,
+            keyPassword: null,
             authType: "password",
           })
           .where(
-            and(
-              eq(sshData.credentialId, parseInt(id)),
-              eq(sshData.userId, userId),
-            ),
+            and(eq(hosts.credentialId, parseInt(id)), eq(hosts.userId, userId)),
           );
 
         for (const host of hostsUsingCredential) {
@@ -751,7 +744,6 @@ router.delete(
           ),
         );
 
-      const credential = credentialToDelete[0];
       authLogger.success("SSH credential deleted", {
         operation: "credential_delete_success",
         userId,
@@ -837,20 +829,18 @@ router.post(
       const credential = credentials[0];
 
       await db
-        .update(sshData)
+        .update(hosts)
         .set({
           credentialId: parseInt(credentialId),
           username: (credential.username as string) || "",
-          authType: (credential.auth_type || credential.authType) as string,
+          authType: credential.authType as string,
           password: null,
           key: null,
-          key_password: null,
+          keyPassword: null,
           keyType: null,
           updatedAt: new Date().toISOString(),
         })
-        .where(
-          and(eq(sshData.id, parseInt(hostId)), eq(sshData.userId, userId)),
-        );
+        .where(and(eq(hosts.id, parseInt(hostId)), eq(hosts.userId, userId)));
 
       await db.insert(sshCredentialUsage).values({
         credentialId: parseInt(credentialId),
@@ -917,17 +907,17 @@ router.get(
     }
 
     try {
-      const hosts = await db
+      const hostsUsingCredential = await db
         .select()
-        .from(sshData)
+        .from(hosts)
         .where(
           and(
-            eq(sshData.credentialId, parseInt(credentialId)),
-            eq(sshData.userId, userId),
+            eq(hosts.credentialId, parseInt(credentialId)),
+            eq(hosts.userId, userId),
           ),
         );
 
-      res.json(hosts.map((host) => formatSSHHostOutput(host)));
+      res.json(hostsUsingCredential.map((host) => formatSSHHostOutput(host)));
     } catch (err) {
       authLogger.error("Failed to fetch hosts using credential", err);
       res.status(500).json({
@@ -954,15 +944,15 @@ function formatCredentialOutput(
           ? credential.tags.split(",").filter(Boolean)
           : []
         : [],
-    authType: credential.authType || credential.auth_type,
+    authType: credential.authType,
     username: credential.username || null,
-    publicKey: credential.public_key || credential.publicKey,
-    keyType: credential.key_type || credential.keyType,
-    detectedKeyType: credential.detected_key_type || credential.detectedKeyType,
-    usageCount: credential.usage_count || credential.usageCount || 0,
-    lastUsed: credential.last_used || credential.lastUsed,
-    createdAt: credential.created_at || credential.createdAt,
-    updatedAt: credential.updated_at || credential.updatedAt,
+    publicKey: credential.publicKey,
+    keyType: credential.keyType,
+    detectedKeyType: credential.detectedKeyType,
+    usageCount: credential.usageCount || 0,
+    lastUsed: credential.lastUsed,
+    createdAt: credential.createdAt,
+    updatedAt: credential.updatedAt,
   };
 }
 
@@ -1508,7 +1498,7 @@ async function deploySSHKeyToHost(
   hostConfig: Record<string, unknown>,
   credData: CredentialBackend,
 ): Promise<{ success: boolean; message?: string; error?: string }> {
-  const publicKey = credData.public_key as string;
+  const publicKey = credData.publicKey as string;
   return new Promise((resolve) => {
     const conn = new Client();
 
@@ -1934,7 +1924,7 @@ router.post(
         });
       }
 
-      const publicKey = credData.public_key;
+      const publicKey = credData.publicKey;
       if (!publicKey) {
         return res.status(400).json({
           success: false,
@@ -1942,7 +1932,7 @@ router.post(
         });
       }
       const targetHost = await SimpleDBOps.select(
-        db.select().from(sshData).where(eq(sshData.id, targetHostId)).limit(1),
+        db.select().from(hosts).where(eq(hosts.id, targetHostId)).limit(1),
         "ssh_data",
         userId,
       );
@@ -1990,15 +1980,14 @@ router.post(
           if (hostCredential && hostCredential.length > 0) {
             const cred = hostCredential[0];
 
-            hostConfig.authType = cred.auth_type || cred.authType;
+            hostConfig.authType = cred.authType;
             hostConfig.username = cred.username;
 
-            if ((cred.auth_type || cred.authType) === "password") {
+            if (cred.authType === "password") {
               hostConfig.password = cred.password;
-            } else if ((cred.auth_type || cred.authType) === "key") {
-              hostConfig.privateKey =
-                cred.private_key || cred.privateKey || cred.key;
-              hostConfig.keyPassword = cred.key_password || cred.keyPassword;
+            } else if (cred.authType === "key") {
+              hostConfig.privateKey = cred.privateKey || cred.key;
+              hostConfig.keyPassword = cred.keyPassword;
             }
           } else {
             return res.status(400).json({

@@ -4,11 +4,11 @@ import cookieParser from "cookie-parser";
 import { getDb, DatabaseSaveTrigger } from "./database/db/index.js";
 import {
   recentActivity,
-  sshData,
+  hosts,
   hostAccess,
   dashboardPreferences,
 } from "./database/db/schema.js";
-import { eq, and, desc, or, sql } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { dashboardLogger } from "./utils/logger.js";
 import { SimpleDBOps } from "./utils/simple-db-ops.js";
 import { AuthManager } from "./utils/auth-manager.js";
@@ -55,6 +55,10 @@ app.use(
 );
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
+app.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 
 app.use(authManager.createAuthMiddleware());
 
@@ -85,9 +89,6 @@ app.use(authManager.createAuthMiddleware());
  */
 app.get("/uptime", async (req, res) => {
   try {
-    const startTime = Date.now();
-    const userId = (req as AuthenticatedRequest).userId;
-
     const uptimeMs = Date.now() - serverStartTime;
     const uptimeSeconds = Math.floor(uptimeMs / 1000);
     const days = Math.floor(uptimeSeconds / 86400);
@@ -175,7 +176,7 @@ app.get("/activity/recent", async (req, res) => {
  *             properties:
  *               type:
  *                 type: string
- *                 enum: [terminal, file_manager, server_stats, tunnel, docker]
+ *                 enum: [terminal, file_manager, server_stats, tunnel, docker, telnet, vnc, rdp]
  *               hostId:
  *                 type: integer
  *               hostName:
@@ -218,11 +219,14 @@ app.post("/activity/log", async (req, res) => {
         "server_stats",
         "tunnel",
         "docker",
+        "telnet",
+        "vnc",
+        "rdp",
       ].includes(type)
     ) {
       return res.status(400).json({
         error:
-          "Invalid activity type. Must be 'terminal', 'file_manager', 'server_stats', 'tunnel', or 'docker'",
+          "Invalid activity type. Must be 'terminal', 'file_manager', 'server_stats', 'tunnel', 'docker', 'telnet', 'vnc', or 'rdp'",
       });
     }
 
@@ -251,8 +255,8 @@ app.post("/activity/log", async (req, res) => {
     const ownedHosts = await SimpleDBOps.select(
       getDb()
         .select()
-        .from(sshData)
-        .where(and(eq(sshData.id, hostId), eq(sshData.userId, userId))),
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId))),
       "ssh_data",
       userId,
     );
@@ -296,7 +300,7 @@ app.post("/activity/log", async (req, res) => {
 
     if (allActivities.length > 100) {
       const toDelete = allActivities.slice(100);
-      for (const activity of toDelete) {
+      for (let i = 0; i < toDelete.length; i++) {
         await SimpleDBOps.delete(recentActivity, "recent_activity", userId);
       }
     }

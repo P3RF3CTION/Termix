@@ -37,10 +37,11 @@ async function initializeDatabaseAsync(): Promise<void> {
         memoryDatabase = new Database(decryptedBuffer);
 
         try {
-          const sessionCount = memoryDatabase
+          memoryDatabase
             .prepare("SELECT COUNT(*) as count FROM sessions")
             .get() as { count: number };
-        } catch (countError) {
+        } catch {
+          // expected - sessions table may not exist yet
         }
       } else {
         const migration = new DatabaseMigration(dataDir);
@@ -179,6 +180,18 @@ async function initializeCompleteDatabase(): Promise<void> {
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         expires_at TEXT NOT NULL,
         last_active_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS trusted_devices (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        device_fingerprint TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        device_info TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT NOT NULL,
+        last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
@@ -414,9 +427,7 @@ async function initializeCompleteDatabase(): Promise<void> {
 `);
 
   try {
-    sqlite
-      .prepare("DELETE FROM sessions WHERE expires_at < datetime('now')")
-      .run();
+    sqlite.prepare("DELETE FROM sessions").run();
   } catch (e) {
     databaseLogger.warn("Could not clear expired sessions on startup", {
       operation: "db_init_session_cleanup_failed",
@@ -457,6 +468,42 @@ async function initializeCompleteDatabase(): Promise<void> {
     }
   } catch (e) {
     databaseLogger.warn("Could not initialize allow_password_login setting", {
+      operation: "db_init",
+      error: e,
+    });
+  }
+
+  try {
+    const row = sqlite
+      .prepare("SELECT value FROM settings WHERE key = 'guac_enabled'")
+      .get();
+    if (!row) {
+      sqlite
+        .prepare(
+          "INSERT INTO settings (key, value) VALUES ('guac_enabled', 'true')",
+        )
+        .run();
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not initialize guac_enabled setting", {
+      operation: "db_init",
+      error: e,
+    });
+  }
+
+  try {
+    const row = sqlite
+      .prepare("SELECT value FROM settings WHERE key = 'guac_url'")
+      .get();
+    if (!row) {
+      sqlite
+        .prepare(
+          "INSERT INTO settings (key, value) VALUES ('guac_url', 'guacd:4822')",
+        )
+        .run();
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not initialize guac_url setting", {
       operation: "db_init",
       error: e,
     });
@@ -578,6 +625,11 @@ const migrateSchema = () => {
   );
   addColumnIfNotExists("ssh_data", "docker_config", "TEXT");
 
+  addColumnIfNotExists("ssh_data", "connection_type", 'TEXT NOT NULL DEFAULT "ssh"');
+  addColumnIfNotExists("ssh_data", "domain", "TEXT");
+  addColumnIfNotExists("ssh_data", "security", "TEXT");
+  addColumnIfNotExists("ssh_data", "ignore_cert", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists("ssh_data", "guacamole_config", "TEXT");
   addColumnIfNotExists("ssh_data", "notes", "TEXT");
 
   addColumnIfNotExists("ssh_data", "use_socks5", "INTEGER");
@@ -752,6 +804,33 @@ const migrateSchema = () => {
 
   try {
     sqlite
+      .prepare("SELECT id FROM trusted_devices LIMIT 1")
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          device_fingerprint TEXT NOT NULL,
+          device_type TEXT NOT NULL,
+          device_info TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT NOT NULL,
+          last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create trusted_devices table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite
       .prepare("SELECT id FROM network_topology LIMIT 1")
       .get();
   } catch {
@@ -851,6 +930,45 @@ const migrateSchema = () => {
         operation: "schema_migration",
         error: alterError,
       });
+    }
+  }
+
+  const sshDataMigrations: Array<{ column: string; sql: string }> = [
+    { column: "connection_type", sql: "ALTER TABLE ssh_data ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'ssh'" },
+    { column: "credential_id", sql: "ALTER TABLE ssh_data ADD COLUMN credential_id INTEGER" },
+    { column: "override_credential_username", sql: "ALTER TABLE ssh_data ADD COLUMN override_credential_username INTEGER" },
+    { column: "jump_hosts", sql: "ALTER TABLE ssh_data ADD COLUMN jump_hosts TEXT" },
+    { column: "show_terminal_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_terminal_in_sidebar INTEGER NOT NULL DEFAULT 1" },
+    { column: "show_file_manager_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_file_manager_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "show_tunnel_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_tunnel_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "show_docker_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_docker_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "show_server_stats_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_server_stats_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "quick_actions", sql: "ALTER TABLE ssh_data ADD COLUMN quick_actions TEXT" },
+    { column: "domain", sql: "ALTER TABLE ssh_data ADD COLUMN domain TEXT" },
+    { column: "security", sql: "ALTER TABLE ssh_data ADD COLUMN security TEXT" },
+    { column: "ignore_cert", sql: "ALTER TABLE ssh_data ADD COLUMN ignore_cert INTEGER NOT NULL DEFAULT 0" },
+    { column: "guacamole_config", sql: "ALTER TABLE ssh_data ADD COLUMN guacamole_config TEXT" },
+    { column: "socks5_proxy_chain", sql: "ALTER TABLE ssh_data ADD COLUMN socks5_proxy_chain TEXT" },
+    { column: "host_key_fingerprint", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_fingerprint TEXT" },
+    { column: "host_key_type", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_type TEXT" },
+    { column: "host_key_algorithm", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_algorithm TEXT NOT NULL DEFAULT 'sha256'" },
+    { column: "host_key_first_seen", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_first_seen TEXT" },
+    { column: "host_key_last_verified", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_last_verified TEXT" },
+    { column: "host_key_changed_count", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_changed_count INTEGER NOT NULL DEFAULT 0" },
+  ];
+
+  for (const migration of sshDataMigrations) {
+    try {
+      sqlite.prepare(`SELECT ${migration.column} FROM ssh_data LIMIT 1`).get();
+    } catch {
+      try {
+        sqlite.exec(migration.sql);
+      } catch (alterError) {
+        databaseLogger.warn(`Failed to add ${migration.column} column`, {
+          operation: "schema_migration",
+          error: alterError,
+        });
+      }
     }
   }
 
@@ -1033,23 +1151,15 @@ const migrateSchema = () => {
     try {
       const validSystemRoles = ['admin', 'user'];
       const unwantedRoleNames = ['superAdmin', 'powerUser', 'readonly', 'member'];
-      let deletedCount = 0;
-
       const deleteByName = sqlite.prepare("DELETE FROM roles WHERE name = ?");
       for (const roleName of unwantedRoleNames) {
-        const result = deleteByName.run(roleName);
-        if (result.changes > 0) {
-          deletedCount += result.changes;
-        }
+        deleteByName.run(roleName);
       }
 
       const deleteOldSystemRole = sqlite.prepare("DELETE FROM roles WHERE name = ? AND is_system = 1");
       for (const role of existingRoles) {
         if (role.is_system === 1 && !validSystemRoles.includes(role.name) && !unwantedRoleNames.includes(role.name)) {
-          const result = deleteOldSystemRole.run(role.name);
-          if (result.changes > 0) {
-            deletedCount += result.changes;
-          }
+          deleteOldSystemRole.run(role.name);
         }
       }
     } catch (cleanupError) {
@@ -1107,7 +1217,7 @@ const migrateSchema = () => {
         for (const admin of adminUsers) {
           try {
             insertUserRole.run(admin.id, adminRole.id);
-          } catch (error) {
+          } catch {
             // Ignore duplicate errors
           }
         }
@@ -1122,7 +1232,7 @@ const migrateSchema = () => {
         for (const user of normalUsers) {
           try {
             insertUserRole.run(user.id, userRole.id);
-          } catch (error) {
+          } catch {
             // Ignore duplicate errors
           }
         }
@@ -1156,10 +1266,11 @@ async function saveMemoryDatabaseToFile() {
     }
 
     try {
-      const sessionCount = memoryDatabase
+      memoryDatabase
         .prepare("SELECT COUNT(*) as count FROM sessions")
         .get() as { count: number };
-    } catch (countError) {
+    } catch {
+      // expected - sessions table may not exist yet
     }
 
     if (enableFileEncryption) {
@@ -1170,6 +1281,8 @@ async function saveMemoryDatabaseToFile() {
     } else {
       fs.writeFileSync(dbPath, buffer);
     }
+
+    DatabaseSaveTrigger.markClean();
   } catch (error) {
     databaseLogger.error("Failed to save in-memory database", error, {
       operation: "memory_db_save_failed",
@@ -1185,7 +1298,11 @@ async function handlePostInitFileEncryption() {
     if (memoryDatabase) {
       await saveMemoryDatabaseToFile();
 
-      setInterval(saveMemoryDatabaseToFile, 15 * 1000);
+      setInterval(() => {
+        if (DatabaseSaveTrigger.isDirty) {
+          saveMemoryDatabaseToFile();
+        }
+      }, 5 * 60 * 1000);
 
       DatabaseSaveTrigger.initialize(saveMemoryDatabaseToFile);
     }
@@ -1254,15 +1371,18 @@ async function cleanupDatabase() {
         try {
           fs.unlinkSync(path.join(tempDir, file));
         } catch {
+          // expected - file cleanup best effort
         }
       }
 
       try {
         fs.rmdirSync(tempDir);
       } catch {
+        // expected - dir cleanup best effort
       }
     }
   } catch {
+    // expected - temp dir cleanup best effort
   }
 }
 
@@ -1271,6 +1391,7 @@ process.on("exit", () => {
     try {
       sqlite.close();
     } catch {
+      // expected - database may already be closed
     }
   }
 });

@@ -3,9 +3,8 @@ import {
   sharedCredentials,
   sshCredentials,
   hostAccess,
-  users,
   userRoles,
-  sshData,
+  hosts,
 } from "../database/db/schema.js";
 import { eq, and } from "drizzle-orm";
 import { DataCrypto } from "./data-crypto.js";
@@ -191,15 +190,27 @@ class SharedCredentialManager {
       const cred = sharedCred[0].shared_credentials;
 
       if (cred.needsReEncryption) {
-        databaseLogger.warn(
-          "Shared credential needs re-encryption but cannot be accessed yet",
-          {
-            operation: "get_shared_credential_pending",
-            hostId,
-            userId,
-          },
-        );
-        return null;
+        await this.reEncryptSharedCredential(cred.id, userId);
+
+        const refreshed = await db
+          .select()
+          .from(sharedCredentials)
+          .where(eq(sharedCredentials.id, cred.id))
+          .limit(1);
+
+        if (refreshed.length === 0 || refreshed[0].needsReEncryption) {
+          databaseLogger.warn(
+            "Shared credential needs re-encryption but cannot be accessed yet",
+            {
+              operation: "get_shared_credential_pending",
+              hostId,
+              userId,
+            },
+          );
+          return null;
+        }
+
+        return this.decryptSharedCredential(refreshed[0], userDEK);
       }
 
       return this.decryptSharedCredential(cred, userDEK);
@@ -293,10 +304,9 @@ class SharedCredentialManager {
     credentialId: number,
   ): Promise<void> {
     try {
-      const result = await db
+      await db
         .delete(sharedCredentials)
-        .where(eq(sharedCredentials.originalCredentialId, credentialId))
-        .returning({ id: sharedCredentials.id });
+        .where(eq(sharedCredentials.originalCredentialId, credentialId));
     } catch (error) {
       databaseLogger.error("Failed to delete shared credentials", error, {
         operation: "delete_shared_credentials",
@@ -364,9 +374,9 @@ class SharedCredentialManager {
       key: cred.key
         ? this.decryptField(cred.key, ownerDEK, credentialId, "key")
         : undefined,
-      keyPassword: cred.key_password
+      keyPassword: cred.keyPassword
         ? this.decryptField(
-            cred.key_password,
+            cred.keyPassword,
             ownerDEK,
             credentialId,
             "key_password",
@@ -534,7 +544,7 @@ class SharedCredentialManager {
         recordId.toString(),
         fieldName,
       );
-    } catch (error) {
+    } catch {
       databaseLogger.warn("Field decryption failed, returning as-is", {
         operation: "decrypt_field",
         fieldName,
@@ -589,7 +599,7 @@ class SharedCredentialManager {
       const access = await db
         .select()
         .from(hostAccess)
-        .innerJoin(sshData, eq(hostAccess.hostId, sshData.id))
+        .innerJoin(hosts, eq(hostAccess.hostId, hosts.id))
         .where(eq(hostAccess.id, cred.hostAccessId))
         .limit(1);
 

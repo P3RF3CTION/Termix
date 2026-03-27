@@ -12,6 +12,7 @@ import { FieldCrypto } from "../utils/field-crypto.js";
 import { promises as fs } from "fs";
 import path from "path";
 import axios from "axios";
+import { getRequestOrigin } from "../utils/request-origin.js";
 
 const AUTH_TIMEOUT = 60 * 1000;
 
@@ -47,41 +48,6 @@ interface OPKSSHAuthSession {
 
 const activeAuthSessions = new Map<string, OPKSSHAuthSession>();
 const cleanupInProgress = new Set<string>();
-
-export function getRequestOrigin(req: IncomingMessage): string {
-  const protoHeader =
-    req.headers["x-forwarded-proto"] ||
-    ((req.socket as any).encrypted ? "https" : "http");
-  const proto =
-    typeof protoHeader === "string"
-      ? protoHeader.split(",")[0].trim()
-      : String(protoHeader);
-
-  const portHeader = req.headers["x-forwarded-port"];
-  const port =
-    typeof portHeader === "string"
-      ? portHeader.split(",")[0].trim()
-      : undefined;
-
-  const hostHeaderRaw =
-    req.headers["x-forwarded-host"] || req.headers.host || "localhost";
-  const hostHeader =
-    typeof hostHeaderRaw === "string"
-      ? hostHeaderRaw.split(",")[0].trim()
-      : String(hostHeaderRaw);
-
-  if (port) {
-    const hostWithoutPort = hostHeader.split(":")[0];
-    const isDefaultPort =
-      (proto === "http" && port === "80") ||
-      (proto === "https" && port === "443");
-    return isDefaultPort
-      ? `${proto}://${hostWithoutPort}`
-      : `${proto}://${hostWithoutPort}:${port}`;
-  }
-
-  return `${proto}://${hostHeader}`;
-}
 
 function getOPKConfigPath(): string {
   const dataDir =
@@ -157,7 +123,7 @@ async function checkOPKConfigExists(): Promise<{
       return {
         exists: false,
         configPath,
-        error: `OPKSSH configuration is missing 'redirect_uris' field.`,
+        error: `OPKSSH configuration is missing 'redirect_uris' field. This field must contain the Termix callback URL that you registered with your OAuth provider (e.g., http://localhost:8080/host/opkssh-callback for Docker). The static callback route will internally redirect to the dynamic route for proper URL rewriting.`,
       };
     }
 
@@ -213,7 +179,7 @@ export async function startOPKSSHAuth(
   }
 
   const requestId = randomUUID();
-  const remoteRedirectUri = `${requestOrigin}/ssh/opkssh-callback`;
+  const remoteRedirectUri = `${requestOrigin}/host/opkssh-callback`;
 
   const session: Partial<OPKSSHAuthSession> = {
     requestId,
@@ -235,11 +201,11 @@ export async function startOPKSSHAuth(
   try {
     const binaryPath = OPKSSHBinaryManager.getBinaryPath();
     const configPath = getOPKConfigPath();
-    const configDir = path.dirname(configPath);
 
     const args = [
       "login",
       "--print-key",
+      "--disable-browser-open",
       `--config-path=${configPath}`,
       `--remote-redirect-uri=${remoteRedirectUri}`,
     ];
@@ -284,7 +250,10 @@ export async function startOPKSSHAuth(
     opksshProcess.stderr?.on("data", async (data) => {
       const stderr = data.toString();
 
-      if (stderr.includes("Opening browser to")) {
+      if (
+        stderr.includes("Opening browser to") ||
+        stderr.includes("Open your browser to:")
+      ) {
         handleOPKSSHOutput(requestId, stderr);
       }
 
@@ -371,7 +340,7 @@ function handleOPKSSHOutput(requestId: string, output: string): void {
   session.stdoutBuffer += output;
 
   const chooserUrlMatch = session.stdoutBuffer.match(
-    /Opening browser to http:\/\/localhost:(\d+)\/chooser/,
+    /(?:Opening browser to|Open your browser to:)\s*http:\/\/localhost:(\d+)\/chooser/,
   );
   if (chooserUrlMatch && session.status === "starting") {
     const actualPort = parseInt(chooserUrlMatch[1], 10);
@@ -383,7 +352,7 @@ function handleOPKSSHOutput(requestId: string, output: string): void {
       /\/ssh\/opkssh-callback$/,
       "",
     );
-    const proxiedChooserUrl = `${baseUrl}/ssh/opkssh-chooser/${requestId}`;
+    const proxiedChooserUrl = `${baseUrl}/host/opkssh-chooser/${requestId}`;
 
     session.status = "waiting_for_auth";
     session.ws.send(
@@ -784,7 +753,10 @@ export function getActiveSessionsAll(): OPKSSHAuthSession[] {
   return Array.from(activeAuthSessions.values());
 }
 
-export async function getUserIdFromRequest(req: any): Promise<string | null> {
+export async function getUserIdFromRequest(req: {
+  cookies?: Record<string, string>;
+  headers: Record<string, string | undefined>;
+}): Promise<string | null> {
   try {
     const { AuthManager } = await import("../utils/auth-manager.js");
     const authManager = AuthManager.getInstance();
@@ -797,7 +769,7 @@ export async function getUserIdFromRequest(req: any): Promise<string | null> {
 
     const decoded = await authManager.verifyJWTToken(token);
     return decoded?.userId || null;
-  } catch (error) {
+  } catch {
     return null;
   }
 }

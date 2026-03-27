@@ -3,15 +3,14 @@ import express from "express";
 import { db } from "../db/index.js";
 import {
   hostAccess,
-  sshData,
+  hosts,
   users,
   roles,
   userRoles,
-  auditLogs,
   sharedCredentials,
 } from "../db/schema.js";
 import { eq, and, desc, sql, or, isNull, gte } from "drizzle-orm";
-import type { Request, Response } from "express";
+import type { Response } from "express";
 import { databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
@@ -112,8 +111,8 @@ router.post(
 
       const host = await db
         .select()
-        .from(sshData)
-        .where(and(eq(sshData.id, hostId), eq(sshData.userId, userId)))
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
         .limit(1);
 
       if (host.length === 0) {
@@ -335,8 +334,8 @@ router.delete(
     try {
       const host = await db
         .select()
-        .from(sshData)
-        .where(and(eq(sshData.id, hostId), eq(sshData.userId, userId)))
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
         .limit(1);
 
       if (host.length === 0) {
@@ -403,8 +402,8 @@ router.get(
     try {
       const host = await db
         .select()
-        .from(sshData)
-        .where(and(eq(sshData.id, hostId), eq(sshData.userId, userId)))
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
         .limit(1);
 
       if (host.length === 0) {
@@ -483,21 +482,21 @@ router.get(
 
       const sharedHosts = await db
         .select({
-          id: sshData.id,
-          name: sshData.name,
-          ip: sshData.ip,
-          port: sshData.port,
-          username: sshData.username,
-          folder: sshData.folder,
-          tags: sshData.tags,
+          id: hosts.id,
+          name: hosts.name,
+          ip: hosts.ip,
+          port: hosts.port,
+          username: hosts.username,
+          folder: hosts.folder,
+          tags: hosts.tags,
           permissionLevel: hostAccess.permissionLevel,
           expiresAt: hostAccess.expiresAt,
           grantedBy: hostAccess.grantedBy,
           ownerUsername: users.username,
         })
         .from(hostAccess)
-        .innerJoin(sshData, eq(hostAccess.hostId, sshData.id))
-        .innerJoin(users, eq(sshData.userId, users.id))
+        .innerJoin(hosts, eq(hostAccess.hostId, hosts.id))
+        .innerJoin(users, eq(hosts.userId, users.id))
         .where(
           and(
             eq(hostAccess.userId, userId),
@@ -857,10 +856,7 @@ router.delete(
         permissionManager.invalidateUserPermissionCache(userId);
       }
 
-      const deletedHostAccess = await db
-        .delete(hostAccess)
-        .where(eq(hostAccess.roleId, roleId))
-        .returning({ id: hostAccess.id });
+      await db.delete(hostAccess).where(eq(hostAccess.roleId, roleId));
 
       await db.delete(roles).where(eq(roles.id, roleId));
 
@@ -980,7 +976,7 @@ router.post(
       const hostsSharedWithRole = await db
         .select()
         .from(hostAccess)
-        .innerJoin(sshData, eq(hostAccess.hostId, sshData.id))
+        .innerJoin(hosts, eq(hostAccess.hostId, hosts.id))
         .where(eq(hostAccess.roleId, roleId));
 
       const { SharedCredentialManager } =

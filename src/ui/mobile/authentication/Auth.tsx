@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils.ts";
 import { Button } from "@/components/ui/button.tsx";
 import { Input } from "@/components/ui/input.tsx";
 import { Label } from "@/components/ui/label.tsx";
+import { Checkbox } from "@/components/ui/checkbox.tsx";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert.tsx";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "@/ui/desktop/user/LanguageSwitcher.tsx";
@@ -93,6 +94,14 @@ export function Auth({
   const [localUsername, setLocalUsername] = useState("");
   const [password, setPassword] = useState("");
   const [signupConfirmPassword, setSignupConfirmPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(() => {
+    try {
+      const saved = localStorage.getItem("rememberMe");
+      return saved === "true";
+    } catch {
+      return false;
+    }
+  });
   const [loading, setLoading] = useState(false);
   const [oidcLoading, setOidcLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -129,6 +138,14 @@ export function Auth({
       totpInputRef.current.focus();
     }
   }, [totpRequired]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("rememberMe", rememberMe.toString());
+    } catch {
+      // expected - localStorage might not be available
+    }
+  }, [rememberMe]);
 
   useEffect(() => {
     getRegistrationAllowed().then((res) => {
@@ -218,7 +235,7 @@ export function Auth({
     try {
       let res;
       if (tab === "login") {
-        res = await loginUser(localUsername, password);
+        res = await loginUser(localUsername, password, rememberMe);
       } else {
         if (password !== signupConfirmPassword) {
           toast.error(t("errors.passwordMismatch"));
@@ -232,7 +249,7 @@ export function Auth({
         }
 
         await registerUser(localUsername, password);
-        res = await loginUser(localUsername, password);
+        res = await loginUser(localUsername, password, rememberMe);
       }
 
       if (res.requires_totp) {
@@ -441,7 +458,7 @@ export function Auth({
     setTotpLoading(true);
 
     try {
-      const res = await verifyTOTPLogin(totpTempToken, totpCode);
+      const res = await verifyTOTPLogin(totpTempToken, totpCode, rememberMe);
 
       if (!res || !res.success) {
         throw new Error(t("errors.loginFailed"));
@@ -532,7 +549,7 @@ export function Auth({
     setError(null);
     setOidcLoading(true);
     try {
-      const authResponse = await getOIDCAuthorizeUrl();
+      const authResponse = await getOIDCAuthorizeUrl(rememberMe);
       const { auth_url: authUrl } = authResponse;
 
       if (!authUrl || authUrl === "undefined") {
@@ -563,6 +580,8 @@ export function Auth({
       let errorMessage: string;
       if (error === "registration_disabled") {
         errorMessage = t("messages.registrationDisabled");
+      } else if (error === "user_not_allowed") {
+        errorMessage = t("messages.userNotAllowed");
       } else {
         errorMessage = `${t("errors.oidcAuthFailed")}: ${error}`;
       }
@@ -889,6 +908,18 @@ export function Auth({
                           <div className="text-center text-muted-foreground mb-4">
                             <p>{t("auth.loginWithExternalDesc")}</p>
                           </div>
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              id="rememberMeOIDC"
+                              checked={rememberMe}
+                              onCheckedChange={(checked) =>
+                                setRememberMe(checked === true)
+                              }
+                            />
+                            <Label htmlFor="rememberMeOIDC">
+                              {t("auth.rememberMe")}
+                            </Label>
+                          </div>
                           <Button
                             type="button"
                             className="w-full h-11 mt-2 text-base font-semibold"
@@ -1106,6 +1137,24 @@ export function Auth({
                           disabled={loading || internalLoggedIn}
                         />
                       </div>
+                      {tab === "login" && (
+                        <div className="flex items-center gap-2">
+                          <Checkbox
+                            id="rememberMe"
+                            checked={rememberMe}
+                            onCheckedChange={(checked) =>
+                              setRememberMe(checked === true)
+                            }
+                            disabled={loading || internalLoggedIn}
+                          />
+                          <Label
+                            htmlFor="rememberMe"
+                            className="text-sm font-normal cursor-pointer"
+                          >
+                            {t("auth.rememberMe")}
+                          </Label>
+                        </div>
+                      )}
                       {tab === "signup" && (
                         <div className="flex flex-col gap-2">
                           <Label htmlFor="signup-confirm-password">

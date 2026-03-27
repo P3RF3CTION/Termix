@@ -3,11 +3,12 @@ import bodyParser from "body-parser";
 import multer from "multer";
 import cookieParser from "cookie-parser";
 import userRoutes from "./routes/users.js";
-import sshRoutes from "./routes/ssh.js";
+import hostRoutes from "./routes/host.js";
 import alertRoutes from "./routes/alerts.js";
 import credentialsRoutes from "./routes/credentials.js";
 import snippetsRoutes from "./routes/snippets.js";
 import terminalRoutes from "./routes/terminal.js";
+import guacamoleRoutes from "../guacamole/routes.js";
 import networkTopologyRoutes from "./routes/network-topology.js";
 import rbacRoutes from "./routes/rbac.js";
 import cors from "cors";
@@ -28,7 +29,7 @@ import { parseUserAgent } from "../utils/user-agent-parser.js";
 import { getProxyAgent } from "../utils/proxy-agent.js";
 import {
   users,
-  sshData,
+  hosts,
   sshCredentials,
   fileManagerRecent,
   fileManagerPinned,
@@ -45,6 +46,10 @@ import type {
 } from "../../types/index.js";
 import { getDb, DatabaseSaveTrigger } from "./db/index.js";
 import Database from "better-sqlite3";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 
@@ -203,6 +208,10 @@ app.use(bodyParser.json({ limit: "1gb" }));
 app.use(bodyParser.urlencoded({ limit: "1gb", extended: true }));
 app.use(bodyParser.raw({ limit: "5gb", type: "application/octet-stream" }));
 app.use(cookieParser());
+app.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 
 /**
  * @openapi
@@ -595,21 +604,41 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).userId;
     const { password } = req.body;
-
-    if (!password) {
-      return res.status(400).json({
-        error: "Password required for export",
-        code: "PASSWORD_REQUIRED",
-      });
-    }
     const deviceInfo = parseUserAgent(req);
-    const unlocked = await authManager.authenticateUser(
-      userId,
-      password,
-      deviceInfo.type,
-    );
-    if (!unlocked) {
-      return res.status(401).json({ error: "Invalid password" });
+
+    const user = await getDb().select().from(users).where(eq(users.id, userId));
+    if (!user || user.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const isOidcUser = !!user[0].isOidc;
+
+    if (!isOidcUser) {
+      if (!password) {
+        return res.status(400).json({
+          error: "Password required for export",
+          code: "PASSWORD_REQUIRED",
+        });
+      }
+
+      const unlocked = await authManager.authenticateUser(
+        userId,
+        password,
+        deviceInfo.type,
+      );
+      if (!unlocked) {
+        return res.status(401).json({ error: "Invalid password" });
+      }
+    } else if (!DataCrypto.getUserDataKey(userId)) {
+      const oidcUnlocked = await authManager.authenticateOIDCUser(
+        userId,
+        deviceInfo.type,
+      );
+      if (!oidcUnlocked) {
+        return res.status(403).json({
+          error: "Failed to unlock user data with SSO credentials",
+        });
+      }
     }
 
     apiLogger.info("Exporting user data as SQLite", {
@@ -620,11 +649,6 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
     const userDataKey = DataCrypto.getUserDataKey(userId);
     if (!userDataKey) {
       throw new Error("User data not unlocked");
-    }
-
-    const user = await getDb().select().from(users).where(eq(users.id, userId));
-    if (!user || user.length === 0) {
-      throw new Error(`User not found: ${userId}`);
     }
 
     const tempDir =
@@ -805,26 +829,26 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
         userRecord.id,
         userRecord.username,
         "[EXPORTED_USER_NO_PASSWORD]",
-        userRecord.is_admin ? 1 : 0,
-        userRecord.is_oidc ? 1 : 0,
-        userRecord.oidc_identifier || null,
-        userRecord.client_id || null,
-        userRecord.client_secret || null,
-        userRecord.issuer_url || null,
-        userRecord.authorization_url || null,
-        userRecord.token_url || null,
-        userRecord.identifier_path || null,
-        userRecord.name_path || null,
+        userRecord.isAdmin ? 1 : 0,
+        userRecord.isOidc ? 1 : 0,
+        userRecord.oidcIdentifier || null,
+        userRecord.clientId || null,
+        userRecord.clientSecret || null,
+        userRecord.issuerUrl || null,
+        userRecord.authorizationUrl || null,
+        userRecord.tokenUrl || null,
+        userRecord.identifierPath || null,
+        userRecord.namePath || null,
         userRecord.scopes || null,
-        userRecord.totp_secret || null,
-        userRecord.totp_enabled ? 1 : 0,
-        userRecord.totp_backup_codes || null,
+        userRecord.totpSecret || null,
+        userRecord.totpEnabled ? 1 : 0,
+        userRecord.totpBackupCodes || null,
       );
 
       const sshHosts = await getDb()
         .select()
-        .from(sshData)
-        .where(eq(sshData.userId, userId));
+        .from(hosts)
+        .where(eq(hosts.userId, userId));
       const insertHost = exportDb.prepare(`
         INSERT INTO ssh_data (id, user_id, name, ip, port, username, folder, tags, pin, auth_type, force_keyboard_interactive, password, key, key_password, key_type, sudo_password, autostart_password, autostart_key, autostart_key_password, credential_id, override_credential_username, enable_terminal, enable_tunnel, tunnel_connections, jump_hosts, enable_file_manager, enable_docker, show_terminal_in_sidebar, show_file_manager_in_sidebar, show_tunnel_in_sidebar, show_docker_in_sidebar, show_server_stats_in_sidebar, default_path, stats_config, terminal_config, quick_actions, notes, use_socks5, socks5_host, socks5_port, socks5_username, socks5_password, socks5_proxy_chain, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -851,31 +875,31 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
           decrypted.forceKeyboardInteractive || null,
           decrypted.password || null,
           decrypted.key || null,
-          decrypted.key_password || null,
+          decrypted.keyPassword || null,
           decrypted.keyType || null,
           decrypted.sudoPassword || null,
           decrypted.autostartPassword || null,
           decrypted.autostartKey || null,
           decrypted.autostartKeyPassword || null,
           decrypted.credentialId || null,
-          Boolean(decrypted.overrideCredentialUsername) ? 1 : 0,
-          Boolean(decrypted.enableTerminal) ? 1 : 0,
-          Boolean(decrypted.enableTunnel) ? 1 : 0,
+          decrypted.overrideCredentialUsername ? 1 : 0,
+          decrypted.enableTerminal ? 1 : 0,
+          decrypted.enableTunnel ? 1 : 0,
           decrypted.tunnelConnections || null,
           decrypted.jumpHosts || null,
-          Boolean(decrypted.enableFileManager) ? 1 : 0,
-          Boolean(decrypted.enableDocker) ? 1 : 0,
-          Boolean(decrypted.showTerminalInSidebar) ? 1 : 0,
-          Boolean(decrypted.showFileManagerInSidebar) ? 1 : 0,
-          Boolean(decrypted.showTunnelInSidebar) ? 1 : 0,
-          Boolean(decrypted.showDockerInSidebar) ? 1 : 0,
-          Boolean(decrypted.showServerStatsInSidebar) ? 1 : 0,
+          decrypted.enableFileManager ? 1 : 0,
+          decrypted.enableDocker ? 1 : 0,
+          decrypted.showTerminalInSidebar ? 1 : 0,
+          decrypted.showFileManagerInSidebar ? 1 : 0,
+          decrypted.showTunnelInSidebar ? 1 : 0,
+          decrypted.showDockerInSidebar ? 1 : 0,
+          decrypted.showServerStatsInSidebar ? 1 : 0,
           decrypted.defaultPath || null,
           decrypted.statsConfig || null,
           decrypted.terminalConfig || null,
           decrypted.quickActions || null,
           decrypted.notes || null,
-          Boolean(decrypted.useSocks5) ? 1 : 0,
+          decrypted.useSocks5 ? 1 : 0,
           decrypted.socks5Host || null,
           decrypted.socks5Port || null,
           decrypted.socks5Username || null,
@@ -913,9 +937,9 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
           decrypted.username,
           decrypted.password || null,
           decrypted.key || null,
-          decrypted.private_key || null,
-          decrypted.public_key || null,
-          decrypted.key_password || null,
+          decrypted.privateKey || null,
+          decrypted.publicKey || null,
+          decrypted.keyPassword || null,
           decrypted.keyType || null,
           decrypted.detectedKeyType || null,
           decrypted.usageCount || 0,
@@ -1135,7 +1159,7 @@ app.post(
         return res.status(404).json({ error: "User not found" });
       }
 
-      const isOidcUser = !!userRecords[0].is_oidc;
+      const isOidcUser = !!userRecords[0].isOidc;
 
       if (!isOidcUser) {
         if (!password) {
@@ -1244,13 +1268,13 @@ app.post(
             try {
               const existing = await mainDb
                 .select()
-                .from(sshData)
+                .from(hosts)
                 .where(
                   and(
-                    eq(sshData.userId, userId),
-                    eq(sshData.ip, host.ip),
-                    eq(sshData.port, host.port),
-                    eq(sshData.username, host.username),
+                    eq(hosts.userId, userId),
+                    eq(hosts.ip, host.ip),
+                    eq(hosts.port, host.port),
+                    eq(hosts.username, host.username),
                   ),
                 );
 
@@ -1318,7 +1342,7 @@ app.post(
                 userId,
                 userDataKey,
               );
-              await mainDb.insert(sshData).values(encrypted);
+              await mainDb.insert(hosts).values(encrypted);
               result.summary.sshHostsImported++;
             } catch (hostError) {
               result.summary.errors.push(
@@ -1506,7 +1530,7 @@ app.post(
           .select()
           .from(users)
           .where(eq(users.id, userId));
-        if (targetUser.length > 0 && targetUser[0].is_admin) {
+        if (targetUser.length > 0 && targetUser[0].isAdmin) {
           try {
             const importedSettings = importDb
               .prepare("SELECT * FROM settings")
@@ -1736,15 +1760,42 @@ app.post("/database/restore", requireAdmin, async (req, res) => {
 });
 
 app.use("/users", userRoutes);
-app.use("/ssh", sshRoutes);
+app.use("/host", hostRoutes);
 app.use("/alerts", alertRoutes);
 app.use("/credentials", credentialsRoutes);
 app.use("/snippets", snippetsRoutes);
 app.use("/terminal", terminalRoutes);
+app.use("/guacamole", guacamoleRoutes);
 app.use("/network-topology", networkTopologyRoutes);
 app.use("/rbac", rbacRoutes);
 
+const frontendDistPaths = [
+  path.join(__dirname, "../../../dist"),
+  path.join(__dirname, "../../dist"),
+  path.join(process.cwd(), "dist"),
+];
+
+const frontendDist = frontendDistPaths.find((p) =>
+  fs.existsSync(path.join(p, "index.html")),
+);
+
+if (frontendDist) {
+  databaseLogger.info(`Serving frontend from: ${frontendDist}`, {
+    operation: "static_files",
+  });
+  app.use(express.static(frontendDist));
+
+  app.use((req, res, next) => {
+    if (req.method === "GET" && req.accepts("html")) {
+      res.sendFile(path.join(frontendDist, "index.html"));
+    } else {
+      next();
+    }
+  });
+}
+
 app.use(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   (
     err: unknown,
     req: express.Request,
@@ -1819,13 +1870,17 @@ app.get(
       if (status.hasUnencryptedDb) {
         try {
           unencryptedSize = fs.statSync(dbPath).size;
-        } catch (error) {}
+        } catch {
+          // expected - file may not exist
+        }
       }
 
       if (status.hasEncryptedDb) {
         try {
           encryptedSize = fs.statSync(encryptedDbPath).size;
-        } catch (error) {}
+        } catch {
+          // expected - file may not exist
+        }
       }
 
       res.json({

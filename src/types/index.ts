@@ -2,8 +2,20 @@ import type { Client } from "ssh2";
 import type { Request } from "express";
 
 // ============================================================================
-// SSH HOST TYPES
+// HOST TYPES (SSH, RDP, VNC, Telnet)
 // ============================================================================
+
+export type ConnectionType = "ssh" | "rdp" | "vnc" | "telnet";
+export type SSHAuthType = "password" | "key" | "credential" | "none" | "opkssh";
+export type GuacamoleAuthType = "password" | "credential";
+
+export interface HostFeatureFlags {
+  enableTerminal: boolean; // SSH, Telnet only
+  enableTunnel: boolean; // SSH only
+  enableFileManager: boolean; // SSH only
+  enableDocker: boolean; // SSH only
+  enableRemoteDesktop: boolean; // RDP, VNC only
+}
 
 export interface JumpHost {
   hostId: number;
@@ -14,7 +26,7 @@ export interface QuickAction {
   snippetId: number;
 }
 
-export interface SSHHost {
+export interface Host {
   id: number;
   name: string;
   ip: string;
@@ -62,6 +74,12 @@ export interface SSHHost {
   socks5Password?: string;
   socks5ProxyChain?: ProxyNode[];
 
+  connectionType?: "ssh" | "rdp" | "vnc" | "telnet";
+  domain?: string;
+  security?: string;
+  ignoreCert?: boolean;
+  guacamoleConfig?: string | Record<string, unknown>;
+
   createdAt: string;
   updatedAt: string;
 
@@ -82,12 +100,12 @@ export interface QuickActionData {
 export interface ProxyNode {
   host: string;
   port: number;
-  type: 4 | 5;
+  type: 4 | 5 | "http";
   username?: string;
   password?: string;
 }
 
-export interface SSHHostData {
+export interface HostData {
   name?: string;
   ip: string;
   port: number;
@@ -127,7 +145,17 @@ export interface SSHHostData {
   socks5Username?: string;
   socks5Password?: string;
   socks5ProxyChain?: ProxyNode[];
+
+  connectionType?: "ssh" | "rdp" | "vnc" | "telnet";
+  domain?: string;
+  security?: string;
+  ignoreCert?: boolean;
+  guacamoleConfig?: Record<string, unknown> | null;
+  dockerConfig?: Record<string, unknown> | null;
 }
+
+export type SSHHost = Host;
+export type SSHHostData = HostData;
 
 export interface SSHFolder {
   id: number;
@@ -173,9 +201,9 @@ export interface CredentialBackend {
   username: string | null;
   password: string | null;
   key: string;
-  private_key?: string;
-  public_key?: string;
-  key_password: string | null;
+  privateKey?: string;
+  publicKey?: string;
+  keyPassword: string | null;
   keyType?: string;
   detectedKeyType: string;
   usageCount: number;
@@ -395,6 +423,8 @@ export interface TerminalConfig {
   autoMosh: boolean;
   moshCommand: string;
   sudoPasswordAutoFill: boolean;
+  keepaliveInterval?: number;
+  keepaliveCountMax?: number;
 }
 
 // ============================================================================
@@ -403,6 +433,7 @@ export interface TerminalConfig {
 
 export interface TabContextTab {
   id: number;
+  instanceId?: string;
   type:
     | "home"
     | "terminal"
@@ -412,12 +443,16 @@ export interface TabContextTab {
     | "file_manager"
     | "user_profile"
     | "docker"
-    | "network_graph";
+    | "network_graph"
+    | "rdp"
+    | "vnc"
+    | "telnet";
   title: string;
   hostConfig?: SSHHost;
   terminalRef?: any;
   initialTab?: string;
   _updateTimestamp?: number;
+  connectionConfig?: Record<string, unknown>;
 }
 
 export type SplitLayout = "2h" | "2v" | "3l" | "3r" | "3t" | "4grid";

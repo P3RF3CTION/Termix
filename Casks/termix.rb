@@ -1,6 +1,6 @@
 cask "termix" do
-  version "1.11.1"
-  sha256 "0551e2bd7a3a030ffb967627d04320c1456259dd26b7a992fc02ea0fd9940315"
+  version "2.0.0"
+  sha256 "a752ad4f05b4991b8a2ef986da80a86b79a70c93fe1045c4399fcf348a28c1d0"
 
   url "https://github.com/Termix-SSH/Termix/releases/download/release-#{version}-tag/termix_macos_universal_dmg.dmg"
   name "Termix"

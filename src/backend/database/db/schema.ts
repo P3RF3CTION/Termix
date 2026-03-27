@@ -4,25 +4,25 @@ import { sql } from "drizzle-orm";
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
   username: text("username").notNull(),
-  password_hash: text("password_hash").notNull(),
-  is_admin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
+  passwordHash: text("password_hash").notNull(),
+  isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
 
-  is_oidc: integer("is_oidc", { mode: "boolean" }).notNull().default(false),
-  oidc_identifier: text("oidc_identifier"),
-  client_id: text("client_id"),
-  client_secret: text("client_secret"),
-  issuer_url: text("issuer_url"),
-  authorization_url: text("authorization_url"),
-  token_url: text("token_url"),
-  identifier_path: text("identifier_path"),
-  name_path: text("name_path"),
+  isOidc: integer("is_oidc", { mode: "boolean" }).notNull().default(false),
+  oidcIdentifier: text("oidc_identifier"),
+  clientId: text("client_id"),
+  clientSecret: text("client_secret"),
+  issuerUrl: text("issuer_url"),
+  authorizationUrl: text("authorization_url"),
+  tokenUrl: text("token_url"),
+  identifierPath: text("identifier_path"),
+  namePath: text("name_path"),
   scopes: text().default("openid email profile"),
 
-  totp_secret: text("totp_secret"),
-  totp_enabled: integer("totp_enabled", { mode: "boolean" })
+  totpSecret: text("totp_secret"),
+  totpEnabled: integer("totp_enabled", { mode: "boolean" })
     .notNull()
     .default(false),
-  totp_backup_codes: text("totp_backup_codes"),
+  totpBackupCodes: text("totp_backup_codes"),
 });
 
 export const settings = sqliteTable("settings", {
@@ -47,11 +47,29 @@ export const sessions = sqliteTable("sessions", {
     .default(sql`CURRENT_TIMESTAMP`),
 });
 
-export const sshData = sqliteTable("ssh_data", {
+export const trustedDevices = sqliteTable("trusted_devices", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  deviceFingerprint: text("device_fingerprint").notNull(),
+  deviceType: text("device_type").notNull(),
+  deviceInfo: text("device_info").notNull(),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  expiresAt: text("expires_at").notNull(),
+  lastUsedAt: text("last_used_at")
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const hosts = sqliteTable("ssh_data", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   userId: text("user_id")
     .notNull()
     .references(() => users.id, { onDelete: "cascade" }),
+  connectionType: text("connection_type").notNull().default("ssh"),
   name: text("name"),
   ip: text("ip").notNull(),
   port: integer("port").notNull(),
@@ -64,7 +82,7 @@ export const sshData = sqliteTable("ssh_data", {
 
   password: text("password"),
   key: text("key", { length: 8192 }),
-  key_password: text("key_password"),
+  keyPassword: text("key_password"),
   keyType: text("key_type"),
   sudoPassword: text("sudo_password"),
 
@@ -107,9 +125,14 @@ export const sshData = sqliteTable("ssh_data", {
     .default(false),
   defaultPath: text("default_path"),
   statsConfig: text("stats_config"),
+  dockerConfig: text("docker_config"),
   terminalConfig: text("terminal_config"),
   quickActions: text("quick_actions"),
   notes: text("notes"),
+  domain: text("domain"),
+  security: text("security"),
+  ignoreCert: integer("ignore_cert", { mode: "boolean" }).default(false),
+  guacamoleConfig: text("guacamole_config"),
 
   useSocks5: integer("use_socks5", { mode: "boolean" }),
   socks5Host: text("socks5_host"),
@@ -140,7 +163,7 @@ export const fileManagerRecent = sqliteTable("file_manager_recent", {
     .references(() => users.id, { onDelete: "cascade" }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   path: text("path").notNull(),
   lastOpened: text("last_opened")
@@ -155,7 +178,7 @@ export const fileManagerPinned = sqliteTable("file_manager_pinned", {
     .references(() => users.id, { onDelete: "cascade" }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   path: text("path").notNull(),
   pinnedAt: text("pinned_at")
@@ -170,7 +193,7 @@ export const fileManagerShortcuts = sqliteTable("file_manager_shortcuts", {
     .references(() => users.id, { onDelete: "cascade" }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   path: text("path").notNull(),
   createdAt: text("created_at")
@@ -202,9 +225,9 @@ export const sshCredentials = sqliteTable("ssh_credentials", {
   username: text("username"),
   password: text("password"),
   key: text("key", { length: 16384 }),
-  private_key: text("private_key", { length: 16384 }),
-  public_key: text("public_key", { length: 4096 }),
-  key_password: text("key_password"),
+  privateKey: text("private_key", { length: 16384 }),
+  publicKey: text("public_key", { length: 4096 }),
+  keyPassword: text("key_password"),
   keyType: text("key_type"),
   detectedKeyType: text("detected_key_type"),
 
@@ -229,7 +252,7 @@ export const sshCredentialUsage = sqliteTable("ssh_credential_usage", {
     .references(() => sshCredentials.id, { onDelete: "cascade" }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   userId: text("user_id")
     .notNull()
     .references(() => users.id, { onDelete: "cascade" }),
@@ -296,7 +319,7 @@ export const recentActivity = sqliteTable("recent_activity", {
   type: text("type").notNull(),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   hostName: text("host_name"),
   timestamp: text("timestamp")
     .notNull()
@@ -310,7 +333,7 @@ export const commandHistory = sqliteTable("command_history", {
     .references(() => users.id, { onDelete: "cascade" }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   command: text("command").notNull(),
   executedAt: text("executed_at")
     .notNull()
@@ -350,7 +373,7 @@ export const hostAccess = sqliteTable("host_access", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
 
   userId: text("user_id")
     .references(() => users.id, { onDelete: "cascade" }),
@@ -475,7 +498,7 @@ export const sessionRecordings = sqliteTable("session_recordings", {
 
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
   userId: text("user_id")
     .notNull()
     .references(() => users.id, { onDelete: "cascade" }),
@@ -506,7 +529,7 @@ export const opksshTokens = sqliteTable("opkssh_tokens", {
     .references(() => users.id, { onDelete: "cascade" }),
   hostId: integer("host_id")
     .notNull()
-    .references(() => sshData.id, { onDelete: "cascade" }),
+    .references(() => hosts.id, { onDelete: "cascade" }),
 
   sshCert: text("ssh_cert", { length: 8192 }).notNull(),
   privateKey: text("private_key", { length: 8192 }).notNull(),

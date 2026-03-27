@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import crypto from "crypto";
 
 export type DeviceType = "web" | "desktop" | "mobile";
 
@@ -22,7 +23,18 @@ export function detectPlatform(req: Request): DeviceType {
     return "mobile";
   }
 
-  if (userAgent.includes("Android")) {
+  const isDesktopOS =
+    userAgent.includes("Windows") ||
+    userAgent.includes("Macintosh") ||
+    userAgent.includes("Mac OS X") ||
+    userAgent.includes("X11") ||
+    userAgent.includes("Linux x86_64");
+
+  if (
+    (userAgent.includes("Android") && !isDesktopOS) ||
+    userAgent.includes("iPhone") ||
+    userAgent.includes("iPad")
+  ) {
     return "mobile";
   }
 
@@ -236,4 +248,23 @@ function parseMacVersion(userAgent: string): string {
     return `macOS ${version}`;
   }
   return "macOS";
+}
+
+/**
+ * Generate a stable device fingerprint based on device type, browser, and OS.
+ * Ignores minor version numbers to handle browser auto-updates.
+ */
+export function generateDeviceFingerprint(deviceInfo: DeviceInfo): string {
+  let fingerprintString = "";
+
+  if (deviceInfo.type === "desktop") {
+    fingerprintString = `${deviceInfo.type}|${deviceInfo.browser}|${deviceInfo.os}`;
+  } else if (deviceInfo.type === "mobile") {
+    fingerprintString = `${deviceInfo.type}|${deviceInfo.browser}|${deviceInfo.os}`;
+  } else {
+    const browserMajor = deviceInfo.version.split(".")[0];
+    fingerprintString = `${deviceInfo.type}|${deviceInfo.browser} ${browserMajor}|${deviceInfo.os}`;
+  }
+
+  return crypto.createHash("sha256").update(fingerprintString).digest("hex");
 }
