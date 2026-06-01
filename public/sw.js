@@ -1,13 +1,11 @@
-const CACHE_NAME = "termix-v1";
+const CACHE_NAME = "termix-static-v2";
+const BASE_PATH = "__TERMIX_SW_BASE_PATH__";
 const STATIC_ASSETS = [
-  "/",
-  "/index.html",
-  "/manifest.json",
-  "/favicon.ico",
-  "/icons/48x48.png",
-  "/icons/128x128.png",
-  "/icons/256x256.png",
-  "/icons/512x512.png",
+  `${BASE_PATH}/favicon.ico`,
+  `${BASE_PATH}/icons/48x48.png`,
+  `${BASE_PATH}/icons/128x128.png`,
+  `${BASE_PATH}/icons/256x256.png`,
+  `${BASE_PATH}/icons/512x512.png`,
 ];
 
 self.addEventListener("install", (event) => {
@@ -66,18 +64,11 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (request.mode === "navigate") {
-    event.respondWith(
-      fetch(request).catch(() => {
-        return caches.match("/index.html");
-      }),
-    );
+    event.respondWith(fetch(request));
     return;
   }
 
-  const isStaticAsset = STATIC_ASSETS.some((asset) => {
-    if (asset === "/") return url.pathname === "/";
-    return url.pathname === asset || url.pathname.startsWith("/assets/");
-  });
+  const isStaticAsset = STATIC_ASSETS.some((asset) => url.pathname === asset);
 
   if (!isStaticAsset) {
     return;

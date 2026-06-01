@@ -9,12 +9,12 @@
     }
   ],
   "compilerOptions": {
-    "baseUrl": ".",
     "module": "ESNext",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "paths": {
-      "@/*": ["./src/*"]
+      "@/types/*": ["./src/types/*"],
+      "@/*": ["./src/ui/*"]
     }
   }
 }

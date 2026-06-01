@@ -1,6 +1,6 @@
 import { Client as SSHClient } from "ssh2";
+import { SSH_ALGORITHMS } from "../utils/ssh-algorithms.js";
 import { WebSocketServer, WebSocket } from "ws";
-import { parse as parseUrl } from "url";
 import { AuthManager } from "../utils/auth-manager.js";
 import { hosts, sshCredentials } from "../database/db/schema.js";
 import { and, eq } from "drizzle-orm";
@@ -25,35 +25,6 @@ const activeSessions = new Map<string, SSHSession>();
 const wss = new WebSocketServer({
   host: "0.0.0.0",
   port: 30009,
-  verifyClient: async (info) => {
-    try {
-      const url = parseUrl(info.req.url || "", true);
-      let token = url.query.token as string;
-
-      if (!token) {
-        const cookieHeader = info.req.headers.cookie;
-        if (cookieHeader) {
-          const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
-          if (match) token = decodeURIComponent(match[1]);
-        }
-      }
-
-      if (!token) {
-        return false;
-      }
-
-      const authManager = AuthManager.getInstance();
-      const decoded = await authManager.verifyJWTToken(token);
-
-      if (!decoded || !decoded.userId) {
-        return false;
-      }
-
-      return true;
-    } catch {
-      return false;
-    }
-  },
 });
 
 async function detectShell(
@@ -170,7 +141,9 @@ async function createJumpHostChain(
         const credential = credentials[0];
         resolvedCredentials = {
           password: credential.password as string | undefined,
-          sshKey: credential.privateKey as string | undefined,
+          sshKey: (credential.key || credential.privateKey) as
+            | string
+            | undefined,
           keyPassword: credential.keyPassword as string | undefined,
           authType: credential.authType as string | undefined,
         };
@@ -183,12 +156,50 @@ async function createJumpHostChain(
       host: jumpHost.ip?.replace(/^\[|\]$/g, "") || jumpHost.ip,
       port: jumpHost.port || 22,
       username: jumpHost.username,
-      tryKeyboard: true,
+      tryKeyboard: resolvedCredentials.authType !== "none",
       readyTimeout: 60000,
       keepaliveInterval: 30000,
       keepaliveCountMax: 120,
       tcpKeepAlive: true,
       tcpKeepAliveInitialDelay: 30000,
+      algorithms: {
+        kex: [
+          "curve25519-sha256",
+          "curve25519-sha256@libssh.org",
+          "ecdh-sha2-nistp521",
+          "ecdh-sha2-nistp384",
+          "ecdh-sha2-nistp256",
+          "diffie-hellman-group-exchange-sha256",
+          "diffie-hellman-group18-sha512",
+          "diffie-hellman-group17-sha512",
+          "diffie-hellman-group16-sha512",
+          "diffie-hellman-group15-sha512",
+          "diffie-hellman-group14-sha256",
+          "diffie-hellman-group14-sha1",
+          "diffie-hellman-group-exchange-sha1",
+          "diffie-hellman-group1-sha1",
+        ],
+        serverHostKey: [
+          "ssh-ed25519",
+          "ecdsa-sha2-nistp521",
+          "ecdsa-sha2-nistp384",
+          "ecdsa-sha2-nistp256",
+          "rsa-sha2-512",
+          "rsa-sha2-256",
+          "ssh-rsa",
+          "ssh-dss",
+        ],
+        cipher: SSH_ALGORITHMS.cipher,
+        hmac: [
+          "hmac-sha2-512-etm@openssh.com",
+          "hmac-sha2-256-etm@openssh.com",
+          "hmac-sha2-512",
+          "hmac-sha2-256",
+          "hmac-sha1",
+          "hmac-md5",
+        ],
+        compress: ["none", "zlib@openssh.com", "zlib"],
+      },
     };
 
     if (
@@ -209,6 +220,25 @@ async function createJumpHostChain(
         config.passphrase = resolvedCredentials.keyPassword;
       }
     }
+
+    client.on(
+      "keyboard-interactive",
+      (
+        _name: string,
+        _instructions: string,
+        _lang: string,
+        prompts: Array<{ prompt: string; echo: boolean }>,
+        finish: (responses: string[]) => void,
+      ) => {
+        const responses = prompts.map((p) => {
+          if (/password/i.test(p.prompt) && resolvedCredentials.password) {
+            return resolvedCredentials.password as string;
+          }
+          return "";
+        });
+        finish(responses);
+      },
+    );
 
     if (currentClient) {
       await new Promise<void>((resolve, reject) => {
@@ -239,15 +269,25 @@ async function createJumpHostChain(
 }
 
 wss.on("connection", async (ws: WebSocket, req) => {
-  const url = parseUrl(req.url || "", true);
-  let token = url.query.token as string;
+  let token: string | undefined;
+
+  const cookieHeader = req.headers.cookie;
+  if (cookieHeader) {
+    const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
+    if (match) token = decodeURIComponent(match[1]);
+  }
 
   if (!token) {
-    const cookieHeader = req.headers.cookie;
-    if (cookieHeader) {
-      const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
-      if (match) token = decodeURIComponent(match[1]);
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      token = authHeader.slice("Bearer ".length);
     }
+  }
+
+  if (!token) {
+    const urlObj = new URL(req.url || "", "http://localhost");
+    const qp = urlObj.searchParams.get("token");
+    if (qp) token = qp;
   }
 
   if (!token) {

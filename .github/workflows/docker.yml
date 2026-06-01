@@ -25,12 +25,12 @@ jobs:
           fetch-depth: 1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Determine tags
         id: tags
@@ -57,7 +57,7 @@ jobs:
           echo "ALL_TAGS=$(IFS=,; echo "${ALL_TAGS[*]}")" >> $GITHUB_ENV
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: lukegus
@@ -65,27 +65,28 @@ jobs:
 
       - name: Login to Docker Hub (prod only)
         if: ${{ github.event.inputs.build_type == 'Production' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: bugattiguy527
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push multi-arch image
-        uses: docker/build-push-action@v5
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: ./docker/Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
           tags: ${{ env.ALL_TAGS }}
           build-args: |
-            BUILDKIT_INLINE_CACHE=1
             BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ github.run_id }}
-          outputs: type=registry,compression=gzip,compression-level=9
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=registry,compression=zstd
 
       - name: Cleanup Docker
         if: always()

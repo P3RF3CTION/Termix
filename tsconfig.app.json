@@ -27,9 +27,9 @@
     "allowUnreachableCode": true,
     "noImplicitOverride": false,
     "noEmitOnError": false,
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/types/*": ["./src/types/*"],
+      "@/*": ["./src/ui/*"]
     }
   },
   "include": ["src"]

@@ -7,14 +7,14 @@ PGID=${PGID:-1000}
 if [ "$(id -u)" = "0" ]; then
     if [ "$PUID" = "0" ]; then
         echo "Running as root (PUID=0, PGID=$PGID)"
-        chown -R root:root /app/data /app/uploads /app/nginx 2>/dev/null || true
+        chown -R root:root /app/data /app/uploads /tmp/nginx 2>/dev/null || true
     else
         echo "Setting up user permissions (PUID: $PUID, PGID: $PGID)..."
 
         groupmod -o -g "$PGID" node 2>/dev/null || true
         usermod -o -u "$PUID" node 2>/dev/null || true
 
-        chown -R node:node /app/data /app/uploads /app/nginx 2>/dev/null || true
+        chown -R node:node /app/data /app/uploads /tmp/nginx 2>/dev/null || true
 
         echo "User node is now UID: $PUID, GID: $PGID"
 
@@ -38,7 +38,8 @@ else
     NGINX_CONF_SOURCE="/app/nginx/nginx.conf.template"
 fi
 
-envsubst '${PORT} ${SSL_PORT} ${SSL_CERT_PATH} ${SSL_KEY_PATH}' < $NGINX_CONF_SOURCE > /app/nginx/nginx.conf
+mkdir -p /tmp/nginx
+envsubst '${PORT} ${SSL_PORT} ${SSL_CERT_PATH} ${SSL_KEY_PATH}' < $NGINX_CONF_SOURCE > /tmp/nginx/nginx.conf
 
 mkdir -p /app/data /app/uploads /app/data/.opk
 chmod 755 /app/data /app/uploads /app/data/.opk 2>/dev/null || true
@@ -132,7 +133,20 @@ EOF
 fi
 
 echo "Starting nginx..."
-nginx -c /app/nginx/nginx.conf
+nginx -c /tmp/nginx/nginx.conf
+
+# Inject runtime BASE_PATH into frontend if configured
+if [ -n "$BASE_PATH" ]; then
+    echo "Injecting BASE_PATH: $BASE_PATH"
+    # Strip trailing slash for use as a path prefix
+    CLEAN_BASE_PATH="${BASE_PATH%/}"
+    find /app/html -name "index.html" -exec sed -i "s|window.__TERMIX_BASE_PATH__ = \"\"|window.__TERMIX_BASE_PATH__ = \"$CLEAN_BASE_PATH\"|g" {} \;
+    # Patch sw.js static asset paths with the base path prefix
+    find /app/html -name "sw.js" -exec sed -i "s|__TERMIX_SW_BASE_PATH__|$CLEAN_BASE_PATH|g" {} \;
+else
+    # No base path - replace placeholder with empty string so paths stay absolute from root
+    find /app/html -name "sw.js" -exec sed -i "s|__TERMIX_SW_BASE_PATH__||g" {} \;
+fi
 
 echo "Starting backend services..."
 cd /app

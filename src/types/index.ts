@@ -1,5 +1,6 @@
 import type { Client } from "ssh2";
 import type { Request } from "express";
+import type { RefObject } from "react";
 
 // ============================================================================
 // HOST TYPES (SSH, RDP, VNC, Telnet)
@@ -87,12 +88,28 @@ export interface Host {
   ignoreCert?: boolean;
   guacamoleConfig?: string | Record<string, unknown>;
 
+  enableSsh?: boolean;
+  enableRdp?: boolean;
+  enableVnc?: boolean;
+  enableTelnet?: boolean;
+  sshPort?: number;
+  rdpPort?: number;
+  vncPort?: number;
+  telnetPort?: number;
+  rdpUser?: string;
+  rdpPassword?: string;
+  rdpDomain?: string;
+  rdpSecurity?: string;
+  rdpIgnoreCert?: boolean;
+  vncPassword?: string;
+  vncUser?: string;
+  telnetUser?: string;
+  telnetPassword?: string;
   createdAt: string;
   updatedAt: string;
 
-  hasPassword?: boolean;
   hasKey?: boolean;
-  hasSudoPassword?: boolean;
+  hasKeyPassword?: boolean;
 
   isShared?: boolean;
   permissionLevel?: "view";
@@ -170,6 +187,24 @@ export interface HostData {
   ignoreCert?: boolean;
   guacamoleConfig?: Record<string, unknown> | null;
   dockerConfig?: Record<string, unknown> | null;
+
+  enableSsh?: boolean;
+  enableRdp?: boolean;
+  enableVnc?: boolean;
+  enableTelnet?: boolean;
+  sshPort?: number;
+  rdpPort?: number;
+  vncPort?: number;
+  telnetPort?: number;
+  rdpUser?: string;
+  rdpPassword?: string;
+  rdpDomain?: string;
+  rdpSecurity?: string;
+  rdpIgnoreCert?: boolean;
+  vncPassword?: string;
+  vncUser?: string;
+  telnetUser?: string;
+  telnetPassword?: string;
 }
 
 export type SSHHost = Host;
@@ -200,6 +235,10 @@ export interface Credential {
   password?: string;
   key?: string;
   publicKey?: string;
+  /** CA-signed certificate file content (e.g. id_ed25519-cert.pub) */
+  certPublicKey?: string;
+  /** True when a cert is stored but certPublicKey content is redacted in list responses */
+  hasCertPublicKey?: boolean;
   keyPassword?: string;
   keyType?: string;
   usageCount: number;
@@ -221,6 +260,8 @@ export interface CredentialBackend {
   key: string;
   privateKey?: string;
   publicKey?: string;
+  /** CA-signed certificate file content (e.g. id_ed25519-cert.pub) */
+  certPublicKey?: string;
   keyPassword: string | null;
   keyType?: string;
   detectedKeyType: string;
@@ -240,6 +281,8 @@ export interface CredentialData {
   password?: string;
   key?: string;
   publicKey?: string;
+  /** CA-signed certificate file content (e.g. id_ed25519-cert.pub) */
+  certPublicKey?: string | null;
   keyPassword?: string;
   keyType?: string;
 }
@@ -248,11 +291,20 @@ export interface CredentialData {
 // TUNNEL TYPES
 // ============================================================================
 
+export type TunnelScope = "s2s" | "c2s";
+export type TunnelMode = "local" | "remote" | "dynamic";
+
 export interface TunnelConnection {
+  scope?: TunnelScope;
+  mode?: TunnelMode;
   tunnelType?: "local" | "remote";
+  bindHost?: string;
+  sourceHostId?: number;
+  sourceHostName?: string;
   sourcePort: number;
   endpointPort: number;
-  endpointHost: string;
+  endpointHost?: string;
+  targetHost?: string;
 
   endpointPassword?: string;
   endpointKey?: string;
@@ -267,7 +319,11 @@ export interface TunnelConnection {
 
 export interface TunnelConfig {
   name: string;
+  scope?: TunnelScope;
+  mode?: TunnelMode;
   tunnelType?: "local" | "remote";
+  bindHost?: string;
+  targetHost?: string;
 
   sourceHostId: number;
   tunnelIndex: number;
@@ -309,6 +365,20 @@ export interface TunnelConfig {
   socks5Username?: string;
   socks5Password?: string;
   socks5ProxyChain?: ProxyNode[];
+
+  keepaliveInterval?: number;
+  keepaliveCountMax?: number;
+}
+
+export interface C2STunnelPreset {
+  id: number;
+  userId: string;
+  name: string;
+  config: TunnelConnection[];
+  platform?: string | null;
+  computerName?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface TunnelStatus {
@@ -325,7 +395,7 @@ export interface TunnelStatus {
     type: "info" | "success" | "warning" | "error";
     stage: string;
     message: string;
-    details?: Record<string, any>;
+    details?: Record<string, unknown>;
   }>;
 }
 
@@ -468,10 +538,20 @@ export interface TabContextTab {
     | "telnet";
   title: string;
   hostConfig?: SSHHost;
-  terminalRef?: any;
+  terminalRef?: RefObject<TerminalRefHandle | null>;
   initialTab?: string;
   _updateTimestamp?: number;
   connectionConfig?: Record<string, unknown>;
+}
+
+export interface TerminalRefHandle {
+  disconnect?: () => void;
+  reconnect?: () => void;
+  fit?: () => void;
+  sendInput?: (data: string) => void;
+  notifyResize?: () => void;
+  refresh?: () => void;
+  openFileManager?: () => void;
 }
 
 export type SplitLayout = "2h" | "2v" | "3l" | "3r" | "3t" | "4grid";
@@ -715,6 +795,7 @@ export type PartialExcept<T, K extends keyof T> = Partial<T> & Pick<T, K>;
 
 export interface AuthenticatedRequest extends Request {
   userId: string;
+  sessionId?: string;
   user?: {
     id: string;
     username: string;

@@ -1,9 +1,17 @@
 import { WebSocketServer, WebSocket, type RawData } from "ws";
-import { Client, type ClientChannel, type PseudoTtyOptions } from "ssh2";
+import ssh2Pkg, {
+  type Client as SSHClientType,
+  type ClientChannel,
+  type PseudoTtyOptions,
+  type ParsedKey,
+  type SignCallback,
+  type SigningRequestOptions,
+  type IdentityCallback,
+} from "ssh2";
+const { Client, BaseAgent, utils: ssh2Utils } = ssh2Pkg;
 import net from "net";
 import dgram from "dgram";
 import { SSH_ALGORITHMS } from "../utils/ssh-algorithms.js";
-import { parse as parseUrl } from "url";
 import axios from "axios";
 import { getDb } from "../database/db/index.js";
 import { sshCredentials, hosts } from "../database/db/schema.js";
@@ -23,8 +31,43 @@ import { sessionManager } from "./terminal-session-manager.js";
 import {
   detectTmux,
   attachOrCreateTmuxSession,
-  queryNewestTmuxSession,
+  waitForTmuxSession,
 } from "./tmux-helper.js";
+
+class MemoryAgent extends BaseAgent {
+  private key: ParsedKey;
+
+  constructor(key: ParsedKey) {
+    super();
+    this.key = key;
+  }
+
+  getIdentities(cb: IdentityCallback<ParsedKey>): void {
+    cb(null, [this.key]);
+  }
+
+  sign(
+    pubKey: ParsedKey | Buffer | string,
+    data: Buffer,
+    optionsOrCb: SigningRequestOptions | SignCallback,
+    cb?: SignCallback,
+  ): void {
+    const callback = typeof optionsOrCb === "function" ? optionsOrCb : cb!;
+    const options = typeof optionsOrCb === "function" ? {} : optionsOrCb;
+    try {
+      const algo =
+        options.hash === "sha256"
+          ? "rsa-sha2-256"
+          : options.hash === "sha512"
+            ? "rsa-sha2-512"
+            : undefined;
+      const signature = this.key.sign(data, algo);
+      callback(null, signature);
+    } catch (err) {
+      callback(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+}
 
 async function performPortKnocking(
   host: string,
@@ -146,10 +189,7 @@ async function resolveJumpHost(
   });
   try {
     const hostResults = await SimpleDBOps.select(
-      getDb()
-        .select()
-        .from(hosts)
-        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId))),
+      getDb().select().from(hosts).where(eq(hosts.id, hostId)),
       "ssh_data",
       userId,
     );
@@ -159,8 +199,37 @@ async function resolveJumpHost(
     }
 
     const host = hostResults[0];
+    const ownerId = (host.userId || userId) as string;
 
     if (host.credentialId) {
+      if (userId !== ownerId) {
+        try {
+          const { SharedCredentialManager } =
+            await import("../utils/shared-credential-manager.js");
+          const sharedCredManager = SharedCredentialManager.getInstance();
+          const sharedCred = await sharedCredManager.getSharedCredentialForUser(
+            hostId,
+            userId,
+          );
+          if (sharedCred) {
+            return {
+              ...host,
+              password: sharedCred.password,
+              key: sharedCred.key,
+              keyPassword: sharedCred.keyPassword,
+              keyType: sharedCred.keyType,
+              authType: sharedCred.key
+                ? "key"
+                : sharedCred.password
+                  ? "password"
+                  : "none",
+            } as JumpHostConfig;
+          }
+        } catch {
+          // fall through to owner credential lookup
+        }
+      }
+
       const credentials = await SimpleDBOps.select(
         getDb()
           .select()
@@ -168,11 +237,11 @@ async function resolveJumpHost(
           .where(
             and(
               eq(sshCredentials.id, host.credentialId as number),
-              eq(sshCredentials.userId, userId),
+              eq(sshCredentials.userId, ownerId),
             ),
           ),
         "ssh_credentials",
-        userId,
+        ownerId,
       );
 
       if (credentials.length > 0) {
@@ -180,7 +249,7 @@ async function resolveJumpHost(
         return {
           ...host,
           password: credential.password as string | undefined,
-          key: credential.privateKey as string | undefined,
+          key: (credential.key || credential.privateKey) as string | undefined,
           keyPassword: credential.keyPassword as string | undefined,
           keyType: credential.keyType as string | undefined,
           authType: credential.authType as string | undefined,
@@ -203,13 +272,13 @@ async function createJumpHostChain(
   jumpHosts: Array<{ hostId: number }>,
   userId: string,
   socks5Config?: SOCKS5Config | null,
-): Promise<Client | null> {
+): Promise<SSHClientType | null> {
   if (!jumpHosts || jumpHosts.length === 0) {
     return null;
   }
 
-  let currentClient: Client | null = null;
-  const clients: Client[] = [];
+  let currentClient: SSHClientType | null = null;
+  const clients: SSHClientType[] = [];
 
   try {
     const jumpHostConfigs = await Promise.all(
@@ -304,8 +373,46 @@ async function createJumpHostChain(
           port: jumpHostConfig.port || 22,
           username: jumpHostConfig.username,
           tryKeyboard: jumpHostConfig.authType !== "none",
-          readyTimeout: 30000,
+          readyTimeout: 60000,
           hostVerifier: jumpHostVerifier,
+          algorithms: {
+            kex: [
+              "curve25519-sha256",
+              "curve25519-sha256@libssh.org",
+              "ecdh-sha2-nistp521",
+              "ecdh-sha2-nistp384",
+              "ecdh-sha2-nistp256",
+              "diffie-hellman-group-exchange-sha256",
+              "diffie-hellman-group18-sha512",
+              "diffie-hellman-group17-sha512",
+              "diffie-hellman-group16-sha512",
+              "diffie-hellman-group15-sha512",
+              "diffie-hellman-group14-sha256",
+              "diffie-hellman-group14-sha1",
+              "diffie-hellman-group-exchange-sha1",
+              "diffie-hellman-group1-sha1",
+            ],
+            serverHostKey: [
+              "ssh-ed25519",
+              "ecdsa-sha2-nistp521",
+              "ecdsa-sha2-nistp384",
+              "ecdsa-sha2-nistp256",
+              "rsa-sha2-512",
+              "rsa-sha2-256",
+              "ssh-rsa",
+              "ssh-dss",
+            ],
+            cipher: SSH_ALGORITHMS.cipher,
+            hmac: [
+              "hmac-sha2-512-etm@openssh.com",
+              "hmac-sha2-256-etm@openssh.com",
+              "hmac-sha2-512",
+              "hmac-sha2-256",
+              "hmac-sha1",
+              "hmac-md5",
+            ],
+            compress: ["none", "zlib@openssh.com", "zlib"],
+          },
         };
 
         if (jumpHostConfig.authType === "password" && jumpHostConfig.password) {
@@ -320,6 +427,25 @@ async function createJumpHostChain(
             connectConfig.passphrase = jumpHostConfig.keyPassword;
           }
         }
+
+        jumpClient.on(
+          "keyboard-interactive",
+          (
+            _name: string,
+            _instructions: string,
+            _lang: string,
+            prompts: Array<{ prompt: string; echo: boolean }>,
+            finish: (responses: string[]) => void,
+          ) => {
+            const responses = prompts.map((p) => {
+              if (/password/i.test(p.prompt) && jumpHostConfig.password) {
+                return jumpHostConfig.password as string;
+              }
+              return "";
+            });
+            finish(responses);
+          },
+        );
 
         if (currentClient) {
           currentClient.forwardOut(
@@ -365,48 +491,6 @@ async function createJumpHostChain(
 
 const wss = new WebSocketServer({
   port: 30002,
-  verifyClient: async (info) => {
-    try {
-      const url = parseUrl(info.req.url!, true);
-      let token = url.query.token as string;
-
-      if (!token) {
-        const cookieHeader = info.req.headers.cookie;
-        if (cookieHeader) {
-          const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
-          if (match) token = decodeURIComponent(match[1]);
-        }
-      }
-
-      if (!token) {
-        return false;
-      }
-
-      const payload = await authManager.verifyJWTToken(token);
-
-      if (!payload) {
-        return false;
-      }
-
-      if (payload.pendingTOTP) {
-        return false;
-      }
-
-      const existingConnections = userConnections.get(payload.userId);
-
-      if (existingConnections && existingConnections.size >= 10) {
-        return false;
-      }
-
-      return true;
-    } catch (error) {
-      sshLogger.error("WebSocket authentication error", error, {
-        operation: "websocket_auth_error",
-        ip: info.req.socket.remoteAddress,
-      });
-      return false;
-    }
-  },
 });
 
 wss.on("connection", async (ws: WebSocket, req) => {
@@ -414,15 +498,25 @@ wss.on("connection", async (ws: WebSocket, req) => {
   let sessionId: string | undefined;
 
   try {
-    const url = parseUrl(req.url!, true);
-    let token = url.query.token as string;
+    let token: string | undefined;
+
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+      const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
+      if (match) token = decodeURIComponent(match[1]);
+    }
 
     if (!token) {
-      const cookieHeader = req.headers.cookie;
-      if (cookieHeader) {
-        const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
-        if (match) token = decodeURIComponent(match[1]);
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith("Bearer ")) {
+        token = authHeader.slice("Bearer ".length);
       }
+    }
+
+    if (!token) {
+      const urlObj = new URL(req.url || "", "http://localhost");
+      const qp = urlObj.searchParams.get("token");
+      if (qp) token = qp;
     }
 
     if (!token) {
@@ -476,9 +570,9 @@ wss.on("connection", async (ws: WebSocket, req) => {
   });
 
   let currentSessionId: string | null = null;
-  let sshConn: Client | null = null;
+  let sshConn: SSHClientType | null = null;
   let sshStream: ClientChannel | null = null;
-  let lastJumpClient: Client | null = null;
+  let lastJumpClient: SSHClientType | null = null;
   let keyboardInteractiveFinish: ((responses: string[]) => void) | null = null;
   let totpPromptSent = false;
   let totpTimeout: NodeJS.Timeout | null = null;
@@ -487,6 +581,8 @@ wss.on("connection", async (ws: WebSocket, req) => {
   let isConnecting = false;
   let isConnected = false;
   let isCleaningUp = false;
+  let cwdPending = false;
+  let cwdBuffer = "";
   let isShellInitializing = false;
   let warpgateAuthPromptSent = false;
   let warpgateAuthTimeout: NodeJS.Timeout | null = null;
@@ -590,6 +686,22 @@ wss.on("connection", async (ws: WebSocket, req) => {
           connectData.hostConfig.userId = userId;
         }
         handleConnectToHost(connectData).catch((error) => {
+          const errMsg =
+            error instanceof Error ? error.message : "Unknown error";
+          if (
+            errMsg.includes("Cannot parse privateKey") &&
+            errMsg.includes("no passphrase")
+          ) {
+            isAwaitingAuthCredentials = true;
+            ws.send(
+              JSON.stringify({
+                type: "passphrase_required",
+                message:
+                  "The SSH key is encrypted. Please enter the passphrase to unlock it.",
+              }),
+            );
+            return;
+          }
           sshLogger.error("Failed to connect to host", error, {
             operation: "ssh_connect",
             userId,
@@ -599,9 +711,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           ws.send(
             JSON.stringify({
               type: "error",
-              message:
-                "Failed to connect to host: " +
-                (error instanceof Error ? error.message : "Unknown error"),
+              message: "Failed to connect to host: " + errMsg,
             }),
           );
         });
@@ -729,6 +839,21 @@ wss.on("connection", async (ws: WebSocket, req) => {
         sshStream = null;
         break;
 
+      case "get_cwd": {
+        const activeStream =
+          sessionManager.getSession(currentSessionId)?.sshStream ?? sshStream;
+        if (!activeStream) {
+          ws.send(JSON.stringify({ type: "cwd", path: "/" }));
+          break;
+        }
+        cwdPending = true;
+        cwdBuffer = "";
+        // Split the sentinel across shell variables so the echoed command
+        // itself never contains "TERMIX_CWD:" — only the output line does.
+        activeStream.write('a=TERMIX_CWD; echo "$a:$(pwd)"\r');
+        break;
+      }
+
       case "input": {
         const inputData = data as string;
         const inputStream =
@@ -768,8 +893,8 @@ wss.on("connection", async (ws: WebSocket, req) => {
           : null;
         if (session?.sshStream) {
           const existingName = tmuxData.sessionName || undefined;
-          attachOrCreateTmuxSession(session.sshStream, existingName);
           if (existingName) {
+            attachOrCreateTmuxSession(session.sshStream, existingName);
             session.tmuxSessionName = existingName;
             sshLogger.info("User selected tmux session to attach", {
               operation: "tmux_user_attach",
@@ -783,26 +908,47 @@ wss.on("connection", async (ws: WebSocket, req) => {
               }),
             );
           } else {
-            // New session from picker -- query name after startup
+            const newName = `termix-${session.hostId}-${Date.now().toString(36).slice(-4)}`;
+            attachOrCreateTmuxSession(session.sshStream, undefined, newName);
             const sshConn = session.sshConn;
-            setTimeout(async () => {
-              const sessionName = sshConn
-                ? await queryNewestTmuxSession(sshConn)
-                : null;
-              session.tmuxSessionName = sessionName;
-              sshLogger.info("User requested new tmux session", {
-                operation: "tmux_user_create",
-                sessionName,
-                hostId: session.hostId,
-              });
-              ws.send(
-                JSON.stringify({
-                  type: "tmux_session_created",
-                  sessionName,
-                }),
-              );
-            }, 500);
+            if (sshConn) {
+              (async () => {
+                const confirmed = await waitForTmuxSession(sshConn, newName);
+                session.tmuxSessionName = confirmed;
+                sshLogger.info("User requested new tmux session", {
+                  operation: "tmux_user_create",
+                  sessionName: confirmed,
+                  hostId: session.hostId,
+                });
+                ws.send(
+                  JSON.stringify({
+                    type: "tmux_session_created",
+                    sessionName: confirmed,
+                  }),
+                );
+              })();
+            }
           }
+        }
+        break;
+      }
+
+      case "tmux_detach": {
+        const session = currentSessionId
+          ? sessionManager.getSession(currentSessionId)
+          : null;
+        if (session?.sshConn && session.tmuxSessionName) {
+          const tmuxName = session.tmuxSessionName;
+          session.sshStream?.write("\x02d");
+          session.tmuxSessionName = null;
+          sshLogger.info("User detached from tmux session", {
+            operation: "tmux_user_detach",
+            sessionName: tmuxName,
+            hostId: session.hostId,
+          });
+          ws.send(
+            JSON.stringify({ type: "tmux_detached", sessionName: tmuxName }),
+          );
         }
         break;
       }
@@ -898,6 +1044,8 @@ wss.on("connection", async (ws: WebSocket, req) => {
           credentialsData.hostConfig.key = credentialsData.sshKey;
           credentialsData.hostConfig.keyPassword = credentialsData.keyPassword;
           credentialsData.hostConfig.authType = "key";
+        } else if (credentialsData.keyPassword) {
+          credentialsData.hostConfig.keyPassword = credentialsData.keyPassword;
         }
 
         isAwaitingAuthCredentials = false;
@@ -916,6 +1064,22 @@ wss.on("connection", async (ws: WebSocket, req) => {
         };
 
         handleConnectToHost(reconnectData).catch((error) => {
+          const errMsg =
+            error instanceof Error ? error.message : "Unknown error";
+          if (
+            errMsg.includes("Cannot parse privateKey") &&
+            errMsg.includes("no passphrase")
+          ) {
+            isAwaitingAuthCredentials = true;
+            ws.send(
+              JSON.stringify({
+                type: "passphrase_required",
+                message:
+                  "The SSH key is encrypted. Please enter the passphrase to unlock it.",
+              }),
+            );
+            return;
+          }
           sshLogger.error("Failed to reconnect with credentials", error, {
             operation: "ssh_reconnect_with_credentials",
             userId,
@@ -925,9 +1089,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           ws.send(
             JSON.stringify({
               type: "error",
-              message:
-                "Failed to connect with provided credentials: " +
-                (error instanceof Error ? error.message : "Unknown error"),
+              message: "Failed to connect with provided credentials: " + errMsg,
             }),
           );
         });
@@ -1185,6 +1347,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       keyPassword,
       keyType,
       authType,
+      certPublicKey: undefined as string | undefined,
     };
     const authMethodNotAvailable = false;
     if (id && userId && !password && !key) {
@@ -1196,9 +1359,11 @@ wss.on("connection", async (ws: WebSocket, req) => {
             username: resolvedHost.username || username,
             password: resolvedHost.password,
             key: resolvedHost.key,
-            keyPassword: resolvedHost.keyPassword,
+            keyPassword: keyPassword || resolvedHost.keyPassword,
             keyType: resolvedHost.keyType,
             authType: resolvedHost.authType,
+            certPublicKey: (resolvedHost as unknown as Record<string, unknown>)
+              .certPublicKey as string | undefined,
           };
           sendLog(
             "auth",
@@ -1222,9 +1387,12 @@ wss.on("connection", async (ws: WebSocket, req) => {
             username: resolvedHost.username || username,
             password: resolvedHost.password,
             key: resolvedHost.key,
-            keyPassword: resolvedHost.keyPassword,
+            // Preserve user-supplied keyPassword (e.g. from passphrase dialog) over the empty DB value
+            keyPassword: keyPassword || resolvedHost.keyPassword,
             keyType: resolvedHost.keyType,
             authType: resolvedHost.authType,
+            certPublicKey: (resolvedHost as unknown as Record<string, unknown>)
+              .certPublicKey as string | undefined,
           };
         }
       } catch (error) {
@@ -1268,6 +1436,61 @@ wss.on("connection", async (ws: WebSocket, req) => {
         data.rows,
         tabInstanceId,
       );
+
+      // If createSession returned an existing live session (duplicate tabInstanceId),
+      // close the newly-established SSH connection and attach this WS to the live session instead.
+      const existingSession = sessionManager.getSession(currentSessionId);
+      if (
+        existingSession &&
+        existingSession.sshStream &&
+        !existingSession.sshStream.destroyed &&
+        existingSession.sshConn !== sshConn
+      ) {
+        sshLogger.info(
+          "Reusing existing live session after duplicate connectToHost, closing new SSH conn",
+          {
+            operation: "terminal_reuse_existing_session",
+            sessionId: currentSessionId,
+            tabInstanceId,
+            userId,
+          },
+        );
+        try {
+          sshConn?.end();
+        } catch {
+          /* ignore */
+        }
+        sshConn = null;
+
+        sshStream = existingSession.sshStream;
+        sshConn = existingSession.sshConn;
+        isConnecting = false;
+        isConnected = true;
+        sessionManager.attachWs(currentSessionId, userId, ws, tabInstanceId);
+
+        const buffered = sessionManager.getBuffer(existingSession);
+        if (buffered) {
+          ws.send(JSON.stringify({ type: "data", data: buffered }));
+        }
+        ws.send(
+          JSON.stringify({
+            type: "sessionCreated",
+            sessionId: currentSessionId,
+          }),
+        );
+        ws.send(
+          JSON.stringify({
+            type: "sessionAttached",
+            sessionId: currentSessionId,
+          }),
+        );
+        ws.send(
+          JSON.stringify({ type: "connected", message: "Session reattached" }),
+        );
+
+        cleanupAuthState(connectionTimeout);
+        return;
+      }
 
       sshLogger.info("Terminal session created after SSH ready", {
         operation: "terminal_session_created",
@@ -1439,9 +1662,47 @@ wss.on("connection", async (ws: WebSocket, req) => {
 
           const boundSessionId = currentSessionId;
 
+          const CWD_SENTINEL = "TERMIX_CWD:";
+
           stream.on("data", (data: Buffer) => {
             try {
-              const utf8String = data.toString("utf-8");
+              let utf8String = data.toString("utf-8");
+
+              if (cwdPending) {
+                cwdBuffer += utf8String;
+                const sentinelIdx = cwdBuffer.indexOf(CWD_SENTINEL);
+                if (sentinelIdx !== -1) {
+                  const afterSentinel = cwdBuffer.slice(
+                    sentinelIdx + CWD_SENTINEL.length,
+                  );
+                  const newlineIdx = afterSentinel.search(/[\r\n]/);
+                  if (newlineIdx !== -1) {
+                    const cwd =
+                      afterSentinel.slice(0, newlineIdx).trim() || "/";
+                    cwdPending = false;
+                    // Strip the sentinel line from output sent to terminal
+                    const beforeSentinel = cwdBuffer.slice(0, sentinelIdx);
+                    const afterNewline = afterSentinel.slice(newlineIdx);
+                    utf8String = beforeSentinel + afterNewline;
+                    cwdBuffer = "";
+                    const attachedWs =
+                      sessionManager.getSession(boundSessionId)?.attachedWs ??
+                      ws;
+                    if (attachedWs.readyState === WebSocket.OPEN) {
+                      attachedWs.send(
+                        JSON.stringify({ type: "cwd", path: cwd }),
+                      );
+                    }
+                  } else {
+                    return;
+                  }
+                } else {
+                  return;
+                }
+              }
+
+              if (!utf8String) return;
+
               const session = sessionManager.getSession(boundSessionId);
               if (session) {
                 sessionManager.bufferOutput(boundSessionId!, utf8String);
@@ -1472,15 +1733,25 @@ wss.on("connection", async (ws: WebSocket, req) => {
             }
           });
 
-          stream.on("close", () => {
+          stream.on("close", (code: number | null) => {
             const session = sessionManager.getSession(boundSessionId);
             if (session?.attachedWs?.readyState === WebSocket.OPEN) {
-              session.attachedWs.send(
-                JSON.stringify({
-                  type: "disconnected",
-                  message: "Connection lost",
-                }),
-              );
+              if (code != null) {
+                session.attachedWs.send(
+                  JSON.stringify({
+                    type: "session_ended",
+                    code,
+                  }),
+                );
+              } else {
+                session.attachedWs.send(
+                  JSON.stringify({
+                    type: "disconnected",
+                    message: "Connection lost",
+                    graceful: true,
+                  }),
+                );
+              }
             }
             if (boundSessionId) {
               sessionManager.destroySession(boundSessionId);
@@ -1543,31 +1814,27 @@ wss.on("connection", async (ws: WebSocket, req) => {
                         "tmux is not installed on the remote host. Falling back to standard shell.",
                     }),
                   );
-                  // tmux unavailable, run commands in plain shell
                   runPostShellCommands(0);
                 } else if (detection.sessions.length === 0) {
-                  attachOrCreateTmuxSession(stream);
-                  // Query the name tmux assigned after a short delay
-                  setTimeout(async () => {
-                    const sessionName = await queryNewestTmuxSession(conn);
-                    const session = sessionManager.getSession(boundSessionId);
-                    if (session) {
-                      session.tmuxSessionName = sessionName;
-                    }
-                    sshLogger.info("Created new tmux session", {
-                      operation: "tmux_new_session",
-                      sessionName,
-                      hostId: id,
-                    });
-                    ws.send(
-                      JSON.stringify({
-                        type: "tmux_session_created",
-                        sessionName,
-                      }),
-                    );
-                  }, 500);
-                  // Wait for tmux to start before running commands inside it
-                  runPostShellCommands(500);
+                  const newName = `termix-${id}-${Date.now().toString(36).slice(-4)}`;
+                  attachOrCreateTmuxSession(stream, undefined, newName);
+                  const confirmed = await waitForTmuxSession(conn, newName);
+                  const session = sessionManager.getSession(boundSessionId);
+                  if (session) {
+                    session.tmuxSessionName = confirmed;
+                  }
+                  sshLogger.info("Created new tmux session", {
+                    operation: "tmux_new_session",
+                    sessionName: confirmed,
+                    hostId: id,
+                  });
+                  ws.send(
+                    JSON.stringify({
+                      type: "tmux_session_created",
+                      sessionName: confirmed,
+                    }),
+                  );
+                  runPostShellCommands(0);
                 } else if (detection.sessions.length === 1) {
                   attachOrCreateTmuxSession(stream, detection.sessions[0].name);
                   const sessionName = detection.sessions[0].name;
@@ -1735,6 +2002,31 @@ wss.on("connection", async (ws: WebSocket, req) => {
             hostId: id,
             message:
               "OPKSSH authentication failed or expired. Please authenticate again.",
+          }),
+        );
+        return;
+      }
+
+      if (
+        err.message.includes("Cannot parse privateKey") &&
+        err.message.includes("no passphrase")
+      ) {
+        sendLog(
+          "auth",
+          "error",
+          "SSH key is encrypted but no passphrase was provided",
+        );
+        isAwaitingAuthCredentials = true;
+        if (currentSessionId) {
+          sessionManager.destroySession(currentSessionId);
+          currentSessionId = null;
+        }
+        cleanupAuthState(connectionTimeout);
+        ws.send(
+          JSON.stringify({
+            type: "passphrase_required",
+            message:
+              "The SSH key is encrypted. Please enter the passphrase to unlock it.",
           }),
         );
         return;
@@ -1913,7 +2205,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
             }),
           );
         }
-      } else if (!sshStream) {
+      } else {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
@@ -1990,10 +2282,10 @@ wss.on("connection", async (ws: WebSocket, req) => {
       tryKeyboard: resolvedCredentials.authType !== "none",
       keepaliveInterval:
         typeof hostKeepaliveInterval === "number"
-          ? hostKeepaliveInterval
-          : 30000,
+          ? hostKeepaliveInterval * 1000
+          : 60000,
       keepaliveCountMax:
-        typeof hostKeepaliveCountMax === "number" ? hostKeepaliveCountMax : 3,
+        typeof hostKeepaliveCountMax === "number" ? hostKeepaliveCountMax : 5,
       readyTimeout: 120000,
       tcpKeepAlive: true,
       tcpKeepAliveInitialDelay: 30000,
@@ -2102,6 +2394,49 @@ wss.on("connection", async (ws: WebSocket, req) => {
         if (resolvedCredentials.keyPassword) {
           connectConfig.passphrase = resolvedCredentials.keyPassword;
         }
+
+        if (resolvedCredentials.password) {
+          connectConfig.password = resolvedCredentials.password;
+        }
+
+        // Apply CA-signed certificate if one is stored in the credential
+        if (
+          resolvedCredentials.certPublicKey &&
+          resolvedCredentials.certPublicKey.trim()
+        ) {
+          try {
+            const { setupCACertAuth } = await import("./opkssh-cert-auth.js");
+            await setupCACertAuth(
+              connectConfig,
+              sshConn,
+              connectConfig.privateKey as Buffer,
+              resolvedCredentials.certPublicKey,
+              username,
+              resolvedCredentials.keyPassword,
+            );
+            sendLog("auth", "info", "CA certificate authentication configured");
+            sshLogger.info("CA cert auth configured", {
+              operation: "ca_cert_auth_configured",
+              userId,
+              hostId: id,
+            });
+          } catch (certError) {
+            sendLog(
+              "auth",
+              "warning",
+              "CA certificate setup failed – falling back to key-only auth",
+            );
+            sshLogger.warn("CA cert auth setup failed", {
+              operation: "ca_cert_auth_setup_failed",
+              userId,
+              hostId: id,
+              error:
+                certError instanceof Error
+                  ? certError.message
+                  : String(certError),
+            });
+          }
+        }
       } catch (keyError) {
         sshLogger.error("SSH key format error: " + keyError.message);
         ws.send(
@@ -2182,6 +2517,28 @@ wss.on("connection", async (ws: WebSocket, req) => {
     }
 
     if (
+      hostConfig.terminalConfig?.agentForwarding &&
+      connectConfig.privateKey
+    ) {
+      try {
+        const parsed = ssh2Utils.parseKey(
+          connectConfig.privateKey as Buffer,
+          connectConfig.passphrase as string | undefined,
+        );
+        if (parsed && !(parsed instanceof Error)) {
+          connectConfig.agent = new MemoryAgent(parsed);
+          connectConfig.agentForward = true;
+          sendLog("auth", "info", "SSH agent forwarding enabled");
+        }
+      } catch {
+        sshLogger.warn("Failed to set up agent forwarding", {
+          operation: "agent_forward_setup",
+          hostId: id,
+        });
+      }
+    }
+
+    if (
       hostConfig.portKnockSequence &&
       hostConfig.portKnockSequence.length > 0
     ) {
@@ -2191,7 +2548,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           { operation: "port_knock", hostId: hostConfig.id },
         );
         await performPortKnocking(hostConfig.ip, hostConfig.portKnockSequence);
-      } catch (err) {
+      } catch {
         sshLogger.warn("Port knocking failed, attempting connection anyway", {
           operation: "port_knock",
           hostId: hostConfig.id,
@@ -2218,6 +2575,62 @@ wss.on("connection", async (ws: WebSocket, req) => {
       hostConfig.jumpHosts &&
       hostConfig.jumpHosts.length > 0 &&
       hostConfig.userId;
+
+    // Cloudflare Tunnel: connect via WebSocket proxy
+    const cfConfig = hostConfig.terminalConfig as
+      | Record<string, unknown>
+      | undefined;
+    if (cfConfig?.cfAccessClientId && cfConfig?.cfAccessClientSecret) {
+      try {
+        const WebSocket = (await import("ws")).default;
+        const cfHostname = (cfConfig.cfTunnelHostname as string) || ip;
+        const wsUrl = `wss://${cfHostname}/cdn-cgi/access/ssh-connect`;
+        const cfWs = new WebSocket(wsUrl, {
+          headers: {
+            "CF-Access-Client-Id": cfConfig.cfAccessClientId as string,
+            "CF-Access-Client-Secret": cfConfig.cfAccessClientSecret as string,
+          },
+        });
+
+        await new Promise<void>((resolve, reject) => {
+          cfWs.on("open", () => resolve());
+          cfWs.on("error", (err) => reject(err));
+          setTimeout(
+            () => reject(new Error("Cloudflare tunnel timeout")),
+            30000,
+          );
+        });
+
+        const { Duplex } = await import("stream");
+        const duplexStream = new Duplex({
+          read() {},
+          write(chunk, _encoding, callback) {
+            cfWs.send(chunk, callback);
+          },
+        });
+        cfWs.on("message", (data) => duplexStream.push(data));
+        cfWs.on("close", () => duplexStream.push(null));
+
+        connectConfig.sock =
+          duplexStream as unknown as typeof connectConfig.sock;
+        sendLog("handshake", "info", "Connected via Cloudflare Tunnel");
+      } catch (cfError) {
+        sshLogger.error("Cloudflare tunnel connection failed", cfError, {
+          operation: "cf_tunnel_connect",
+          hostId: id,
+        });
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message:
+              "Cloudflare tunnel connection failed: " +
+              (cfError instanceof Error ? cfError.message : "Unknown error"),
+          }),
+        );
+        cleanupAuthState(connectionTimeout);
+        return;
+      }
+    }
 
     if (hasJumpHosts) {
       try {

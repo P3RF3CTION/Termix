@@ -75,10 +75,7 @@ async function resolveJumpHost(
 ): Promise<JumpHostConfig | null> {
   try {
     const hostResults = await SimpleDBOps.select(
-      getDb()
-        .select()
-        .from(hosts)
-        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId))),
+      getDb().select().from(hosts).where(eq(hosts.id, hostId)),
       "ssh_data",
       userId,
     );
@@ -88,8 +85,37 @@ async function resolveJumpHost(
     }
 
     const host = hostResults[0];
+    const ownerId = (host.userId || userId) as string;
 
     if (host.credentialId) {
+      if (userId !== ownerId) {
+        try {
+          const { SharedCredentialManager } =
+            await import("../utils/shared-credential-manager.js");
+          const sharedCredManager = SharedCredentialManager.getInstance();
+          const sharedCred = await sharedCredManager.getSharedCredentialForUser(
+            hostId,
+            userId,
+          );
+          if (sharedCred) {
+            return {
+              ...host,
+              password: sharedCred.password,
+              key: sharedCred.key,
+              keyPassword: sharedCred.keyPassword,
+              keyType: sharedCred.keyType,
+              authType: sharedCred.key
+                ? "key"
+                : sharedCred.password
+                  ? "password"
+                  : "none",
+            } as JumpHostConfig;
+          }
+        } catch {
+          // fall through to owner credential lookup
+        }
+      }
+
       const credentials = await SimpleDBOps.select(
         getDb()
           .select()
@@ -97,11 +123,11 @@ async function resolveJumpHost(
           .where(
             and(
               eq(sshCredentials.id, host.credentialId as number),
-              eq(sshCredentials.userId, userId),
+              eq(sshCredentials.userId, ownerId),
             ),
           ),
         "ssh_credentials",
-        userId,
+        ownerId,
       );
 
       if (credentials.length > 0) {
@@ -109,7 +135,7 @@ async function resolveJumpHost(
         return {
           ...host,
           password: credential.password as string | undefined,
-          key: credential.privateKey as string | undefined,
+          key: (credential.key || credential.privateKey) as string | undefined,
           keyPassword: credential.keyPassword as string | undefined,
           keyType: credential.keyType as string | undefined,
           authType: credential.authType as string | undefined,
@@ -225,9 +251,47 @@ async function createJumpHostChain(
           host: jumpHostConfig.ip?.replace(/^\[|\]$/g, "") || jumpHostConfig.ip,
           port: jumpHostConfig.port || 22,
           username: jumpHostConfig.username,
-          tryKeyboard: true,
-          readyTimeout: 30000,
+          tryKeyboard: jumpHostConfig.authType !== "none",
+          readyTimeout: 60000,
           hostVerifier: jumpHostVerifier,
+          algorithms: {
+            kex: [
+              "curve25519-sha256",
+              "curve25519-sha256@libssh.org",
+              "ecdh-sha2-nistp521",
+              "ecdh-sha2-nistp384",
+              "ecdh-sha2-nistp256",
+              "diffie-hellman-group-exchange-sha256",
+              "diffie-hellman-group18-sha512",
+              "diffie-hellman-group17-sha512",
+              "diffie-hellman-group16-sha512",
+              "diffie-hellman-group15-sha512",
+              "diffie-hellman-group14-sha256",
+              "diffie-hellman-group14-sha1",
+              "diffie-hellman-group-exchange-sha1",
+              "diffie-hellman-group1-sha1",
+            ],
+            serverHostKey: [
+              "ssh-ed25519",
+              "ecdsa-sha2-nistp521",
+              "ecdsa-sha2-nistp384",
+              "ecdsa-sha2-nistp256",
+              "rsa-sha2-512",
+              "rsa-sha2-256",
+              "ssh-rsa",
+              "ssh-dss",
+            ],
+            cipher: SSH_ALGORITHMS.cipher,
+            hmac: [
+              "hmac-sha2-512-etm@openssh.com",
+              "hmac-sha2-256-etm@openssh.com",
+              "hmac-sha2-512",
+              "hmac-sha2-256",
+              "hmac-sha1",
+              "hmac-md5",
+            ],
+            compress: ["none", "zlib@openssh.com", "zlib"],
+          },
         };
 
         if (jumpHostConfig.authType === "password" && jumpHostConfig.password) {
@@ -242,6 +306,25 @@ async function createJumpHostChain(
             connectConfig.passphrase = jumpHostConfig.keyPassword;
           }
         }
+
+        jumpClient.on(
+          "keyboard-interactive",
+          (
+            _name: string,
+            _instructions: string,
+            _lang: string,
+            prompts: Array<{ prompt: string; echo: boolean }>,
+            finish: (responses: string[]) => void,
+          ) => {
+            const responses = prompts.map((p) => {
+              if (/password/i.test(p.prompt) && jumpHostConfig.password) {
+                return jumpHostConfig.password as string;
+              }
+              return "";
+            });
+            finish(responses);
+          },
+        );
 
         if (currentClient) {
           currentClient.forwardOut(
@@ -676,7 +759,18 @@ interface StatsConfig {
 }
 
 const DEFAULT_STATS_CONFIG: StatsConfig = {
-  enabledWidgets: ["cpu", "memory", "disk", "network", "uptime", "system"],
+  enabledWidgets: [
+    "cpu",
+    "memory",
+    "disk",
+    "network",
+    "uptime",
+    "system",
+    "login_stats",
+    "processes",
+    "ports",
+    "firewall",
+  ],
   statusCheckEnabled: true,
   statusCheckInterval: 60,
   metricsEnabled: true,
@@ -1088,8 +1182,6 @@ class PollingManager {
     for (const { host, viewerUserId } of hostsToRefresh) {
       await this.startPollingForHost(host, { statusOnly: true, viewerUserId });
     }
-
-    const skipped = this.pollingConfigs.size - hostsToRefresh.length;
   }
 
   registerViewer(hostId: number, sessionId: string, userId: string): void {
@@ -1331,9 +1423,8 @@ async function resolveHostCredentials(
         const isSharedHost = userId !== ownerId;
 
         if (isSharedHost) {
-          const { SharedCredentialManager } = await import(
-            "../utils/shared-credential-manager.js"
-          );
+          const { SharedCredentialManager } =
+            await import("../utils/shared-credential-manager.js");
           const sharedCredManager = SharedCredentialManager.getInstance();
           const sharedCred = await sharedCredManager.getSharedCredentialForUser(
             host.id as number,
@@ -1459,8 +1550,8 @@ async function buildSshConfig(
     port: host.port,
     username: host.username,
     tryKeyboard: true,
-    keepaliveInterval: 30000,
-    keepaliveCountMax: 3,
+    keepaliveInterval: 60000,
+    keepaliveCountMax: 5,
     readyTimeout: 60000,
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
@@ -1552,7 +1643,9 @@ async function buildSshConfig(
       statsLogger.error(
         `SSH key format error for host ${host.ip}: ${keyError instanceof Error ? keyError.message : "Unknown error"}`,
       );
-      throw new Error(`Invalid SSH key format for host ${host.ip}`);
+      throw new Error(`Invalid SSH key format for host ${host.ip}`, {
+        cause: keyError,
+      });
     }
   } else if (host.authType === "none") {
     // no credentials needed
@@ -1654,6 +1747,7 @@ function createSshFactory(host: SSHHostWithCredentials): () => Promise<Client> {
             (proxyError instanceof Error
               ? proxyError.message
               : "Unknown error"),
+          { cause: proxyError },
         );
       }
     }
@@ -2581,7 +2675,7 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
 
           const errorMessage =
             error instanceof Error ? error.message : String(error);
-          let errorStage: ConnectionStage = "error";
+          let errorStage: ConnectionStage;
 
           if (
             errorMessage.includes("ENOTFOUND") ||

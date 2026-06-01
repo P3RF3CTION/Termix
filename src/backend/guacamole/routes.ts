@@ -6,7 +6,9 @@ import { PermissionManager } from "../utils/permission-manager.js";
 import { SimpleDBOps } from "../utils/simple-db-ops.js";
 import { getDb } from "../database/db/index.js";
 import { hosts } from "../database/db/schema.js";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
+import { Client } from "ssh2";
+import net from "net";
 import type { AuthenticatedRequest } from "../../types/index.js";
 
 const router = express.Router();
@@ -16,22 +18,55 @@ const authManager = AuthManager.getInstance();
 router.use(authManager.createAuthMiddleware());
 
 /**
- * POST /guacamole/token
- * Generate an encrypted connection token for guacamole-lite
- *
- * Body: {
- *   type: "rdp" | "vnc" | "telnet",
- *   hostname: string,
- *   port?: number,
- *   username?: string,
- *   password?: string,
- *   domain?: string,
- *   // Additional protocol-specific options
- * }
+ * @openapi
+ * /guacamole/token:
+ *   post:
+ *     summary: Generate an encrypted Guacamole connection token
+ *     description: Creates an AES-256-CBC encrypted token for guacamole-lite with the given connection parameters
+ *     tags:
+ *       - Guacamole
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - type
+ *               - hostname
+ *             properties:
+ *               type:
+ *                 type: string
+ *                 enum: [rdp, vnc, telnet]
+ *               hostname:
+ *                 type: string
+ *               port:
+ *                 type: integer
+ *               username:
+ *                 type: string
+ *               password:
+ *                 type: string
+ *               domain:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Encrypted connection token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 token:
+ *                   type: string
+ *       400:
+ *         description: Invalid request
+ *       500:
+ *         description: Server error
  */
 router.post("/token", async (req, res) => {
   try {
-    const userId = (req as AuthenticatedRequest).userId;
     const { type, hostname, port, username, password, domain, ...options } =
       req.body;
 
@@ -63,10 +98,15 @@ router.post("/token", async (req, res) => {
         );
         break;
       case "vnc":
-        token = tokenService.createVncToken(hostname, password, {
-          port: port || 5900,
-          ...options,
-        });
+        token = tokenService.createVncToken(
+          hostname,
+          username || undefined,
+          password,
+          {
+            port: port || 5900,
+            ...options,
+          },
+        );
         break;
       case "telnet":
         token = tokenService.createTelnetToken(hostname, username, password, {
@@ -104,6 +144,17 @@ router.post("/token", async (req, res) => {
  *         schema:
  *           type: integer
  *         description: Host ID to connect to
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               protocol:
+ *                 type: string
+ *                 enum: [rdp, vnc, telnet]
+ *                 description: Override the host's default connection type
  *     responses:
  *       200:
  *         description: Connection token generated successfully
@@ -129,7 +180,7 @@ router.post(
   async (req: express.Request, res: express.Response) => {
     try {
       const userId = (req as AuthenticatedRequest).userId!;
-      const hostId = parseInt(req.params.hostId, 10);
+      const hostId = Number.parseInt(String(req.params.hostId), 10);
 
       if (!hostId || isNaN(hostId)) {
         return res.status(400).json({ error: "Invalid host ID" });
@@ -165,10 +216,31 @@ router.post(
         }
       }
 
-      const connectionType = (host.connectionType as string) || "ssh";
+      const requestedProtocol = req.body?.protocol as string | undefined;
+      const connectionType =
+        requestedProtocol || (host.connectionType as string);
+
       if (!["rdp", "vnc", "telnet"].includes(connectionType)) {
         return res.status(400).json({
           error: `Connection type '${connectionType}' is not supported for remote desktop. Only RDP, VNC, and Telnet are supported.`,
+        });
+      }
+
+      // Old hosts only had connectionType set; enableRdp/enableVnc/enableTelnet defaulted to false.
+      // Apply the same migration fallback used in host.ts GET routes.
+      const ct = host.connectionType as string;
+      const rdpRaw = !!host.enableRdp;
+      const vncRaw = !!host.enableVnc;
+      const telRaw = !!host.enableTelnet;
+      const isMigratedNonSsh = !rdpRaw && !vncRaw && !telRaw && ct && ct !== "ssh";
+      const protocolEnabledMap: Record<string, boolean> = {
+        rdp: isMigratedNonSsh ? ct === "rdp" : rdpRaw,
+        vnc: isMigratedNonSsh ? ct === "vnc" : vncRaw,
+        telnet: isMigratedNonSsh ? ct === "telnet" : telRaw,
+      };
+      if (!protocolEnabledMap[connectionType]) {
+        return res.status(400).json({
+          error: `${connectionType.toUpperCase()} is not enabled for this host.`,
         });
       }
 
@@ -188,32 +260,167 @@ router.post(
         }
       }
 
+      if (guacConfig.dpi != null) {
+        const parsed = parseInt(String(guacConfig.dpi), 10);
+        guacConfig.dpi =
+          Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+      }
+
       let token: string;
-      const hostname = host.ip as string;
-      const port = host.port as number;
-      const username = (host.username as string) || "";
-      const password = (host.password as string) || "";
-      const domain = (host.domain as string) || "";
+      let hostname = host.ip as string;
+      let port = host.port as number;
+      let username: string;
+      let password: string;
 
       switch (connectionType) {
         case "rdp":
+          username =
+            (host.rdpUser as string) || (host.username as string) || "";
+          password =
+            (host.rdpPassword as string) || (host.password as string) || "";
+          port = (host.rdpPort as number) || port || 3389;
+          break;
+        case "vnc":
+          username = (host.vncUser as string) || "";
+          password =
+            (host.vncPassword as string) || (host.password as string) || "";
+          port = (host.vncPort as number) || port || 5900;
+          break;
+        case "telnet":
+          username = (host.telnetUser as string) || "";
+          password =
+            (host.telnetPassword as string) || (host.password as string) || "";
+          port = (host.telnetPort as number) || port || 23;
+          break;
+        default:
+          username = "";
+          password = "";
+      }
+      const domain =
+        (host.rdpDomain as string) || (host.domain as string) || "";
+
+      // Establish SSH tunnel if jump hosts are configured
+      let jumpHosts: Array<{ hostId: number }> = [];
+      if (host.jumpHosts) {
+        try {
+          jumpHosts =
+            typeof host.jumpHosts === "string"
+              ? JSON.parse(host.jumpHosts as string)
+              : (host.jumpHosts as Array<{ hostId: number }>);
+        } catch {
+          jumpHosts = [];
+        }
+      }
+
+      if (jumpHosts.length > 0) {
+        try {
+          const { resolveHostById } = await import("../ssh/host-resolver.js");
+          const jumpHost = await resolveHostById(jumpHosts[0].hostId, userId);
+          if (jumpHost) {
+            const tunnelPort = await new Promise<number>((resolve, reject) => {
+              const sshClient = new Client();
+              sshClient.on("ready", () => {
+                const server = net.createServer((sock) => {
+                  sshClient.forwardOut(
+                    "127.0.0.1",
+                    0,
+                    hostname,
+                    port,
+                    (err, stream) => {
+                      if (err) {
+                        sock.destroy();
+                        return;
+                      }
+                      sock.pipe(stream).pipe(sock);
+                    },
+                  );
+                });
+                server.listen(0, "127.0.0.1", () => {
+                  const addr = server.address() as net.AddressInfo;
+                  // Auto-cleanup after 1 hour
+                  setTimeout(
+                    () => {
+                      server.close();
+                      sshClient.end();
+                    },
+                    60 * 60 * 1000,
+                  );
+                  resolve(addr.port);
+                });
+              });
+              sshClient.on("error", reject);
+
+              const connectOpts: Record<string, unknown> = {
+                host: jumpHost.ip,
+                port: jumpHost.port || 22,
+                username: jumpHost.username,
+                readyTimeout: 30000,
+              };
+              if (jumpHost.key) {
+                connectOpts.privateKey = jumpHost.key;
+                if (jumpHost.keyPassword)
+                  connectOpts.passphrase = jumpHost.keyPassword;
+              } else if (jumpHost.password) {
+                connectOpts.password = jumpHost.password;
+              }
+              sshClient.connect(connectOpts);
+            });
+            hostname = "127.0.0.1";
+            port = tunnelPort;
+            guacLogger.info("SSH tunnel established for guacamole", {
+              operation: "guac_ssh_tunnel",
+              hostId,
+              tunnelPort,
+            });
+          }
+        } catch (tunnelError) {
+          guacLogger.error("Failed to establish SSH tunnel", tunnelError, {
+            operation: "guac_ssh_tunnel_error",
+            hostId,
+          });
+          return res.status(500).json({
+            error: "Failed to establish SSH tunnel to remote host",
+          });
+        }
+      }
+
+      switch (connectionType) {
+        case "rdp":
+          if (guacConfig["enable-drive"] && !guacConfig["drive-path"]) {
+            guacConfig["drive-path"] = "/drive";
+            guacConfig["create-drive-path"] = true;
+          }
           token = tokenService.createRdpToken(hostname, username, password, {
-            port: port || 3389,
+            port,
             domain,
-            security: (host.security as string) || undefined,
-            "ignore-cert": (host.ignoreCert as boolean) || false,
+            security:
+              (host.rdpSecurity as string) ||
+              (host.security as string) ||
+              undefined,
+            "ignore-cert":
+              host.rdpIgnoreCert !== undefined
+                ? !!host.rdpIgnoreCert
+                : host.ignoreCert !== undefined
+                  ? !!host.ignoreCert
+                  : true,
             ...guacConfig,
           });
           break;
         case "vnc":
-          token = tokenService.createVncToken(hostname, password, {
-            port: port || 5900,
-            ...guacConfig,
-          });
+          token = tokenService.createVncToken(
+            hostname,
+            username || undefined,
+            password,
+            {
+              port,
+              security: "any",
+              ...guacConfig,
+            },
+          );
           break;
         case "telnet":
           token = tokenService.createTelnetToken(hostname, username, password, {
-            port: port || 23,
+            port,
             ...guacConfig,
           });
           break;

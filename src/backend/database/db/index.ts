@@ -118,6 +118,7 @@ async function initializeDatabaseAsync(): Promise<void> {
 
       throw new Error(
         `Database decryption failed: ${error instanceof Error ? error.message : "Unknown error"}. This prevents data loss.`,
+        { cause: error },
       );
     }
   } else {
@@ -317,6 +318,18 @@ async function initializeCompleteDatabase(): Promise<void> {
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS c2s_tunnel_presets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        config TEXT NOT NULL,
+        platform TEXT,
+        computer_name TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS ssh_folders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -424,10 +437,64 @@ async function initializeCompleteDatabase(): Promise<void> {
         FOREIGN KEY (access_id) REFERENCES host_access (id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        token_prefix TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT,
+        last_used_at TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_open_tabs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        tab_type TEXT NOT NULL,
+        host_id INTEGER,
+        label TEXT NOT NULL,
+        tab_order INTEGER NOT NULL DEFAULT 0,
+        backend_session_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id TEXT PRIMARY KEY,
+        reopen_tabs_on_login INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
 `);
 
   try {
-    sqlite.prepare("DELETE FROM sessions").run();
+    sqlite.prepare("DELETE FROM user_open_tabs").run();
+    databaseLogger.info("Open tabs cleared on startup", {
+      operation: "db_init_open_tabs_cleanup",
+    });
+  } catch (e) {
+    databaseLogger.warn("Could not clear open tabs on startup", {
+      operation: "db_init_open_tabs_cleanup_failed",
+      error: e,
+    });
+  }
+
+  try {
+    const result = sqlite
+      .prepare("DELETE FROM sessions WHERE expires_at <= ?")
+      .run(new Date().toISOString());
+    if (result.changes > 0) {
+      databaseLogger.info("Expired sessions cleaned up on startup", {
+        operation: "db_init_session_cleanup",
+        deletedSessions: result.changes,
+      });
+    }
   } catch (e) {
     databaseLogger.warn("Could not clear expired sessions on startup", {
       operation: "db_init_session_cleanup_failed",
@@ -676,6 +743,8 @@ const migrateSchema = () => {
   addColumnIfNotExists("ssh_credentials", "public_key", "TEXT");
   addColumnIfNotExists("ssh_credentials", "detected_key_type", "TEXT");
 
+  addColumnIfNotExists("ssh_credentials", "cert_public_key", "TEXT");
+
   addColumnIfNotExists("ssh_credentials", "system_password", "TEXT");
   addColumnIfNotExists("ssh_credentials", "system_key", "TEXT");
   addColumnIfNotExists("ssh_credentials", "system_key_password", "TEXT");
@@ -748,6 +817,7 @@ const migrateSchema = () => {
 
   addColumnIfNotExists("snippets", "folder", "TEXT");
   addColumnIfNotExists("snippets", "order", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists("snippets", "host_filter", "TEXT");
 
   try {
     sqlite
@@ -797,6 +867,31 @@ const migrateSchema = () => {
       `);
     } catch (createError) {
       databaseLogger.warn("Failed to create snippet_access table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM c2s_tunnel_presets LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS c2s_tunnel_presets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          config TEXT NOT NULL,
+          platform TEXT,
+          computer_name TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create c2s_tunnel_presets table", {
         operation: "schema_migration",
         error: createError,
       });
@@ -949,6 +1044,19 @@ const migrateSchema = () => {
   }
 
   try {
+    sqlite.prepare("SELECT override_credential_id FROM host_access LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec("ALTER TABLE host_access ADD COLUMN override_credential_id INTEGER REFERENCES ssh_credentials(id) ON DELETE SET NULL");
+    } catch (alterError) {
+      databaseLogger.warn("Failed to add override_credential_id column", {
+        operation: "schema_migration",
+        error: alterError,
+      });
+    }
+  }
+
+  try {
     sqlite.prepare("SELECT sudo_password FROM ssh_data LIMIT 1").get();
   } catch {
     try {
@@ -985,6 +1093,23 @@ const migrateSchema = () => {
     { column: "host_key_changed_count", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_changed_count INTEGER NOT NULL DEFAULT 0" },
     { column: "mac_address", sql: "ALTER TABLE ssh_data ADD COLUMN mac_address TEXT" },
     { column: "port_knock_sequence", sql: "ALTER TABLE ssh_data ADD COLUMN port_knock_sequence TEXT" },
+    { column: "enable_ssh", sql: "ALTER TABLE ssh_data ADD COLUMN enable_ssh INTEGER NOT NULL DEFAULT 1" },
+    { column: "enable_rdp", sql: "ALTER TABLE ssh_data ADD COLUMN enable_rdp INTEGER NOT NULL DEFAULT 0" },
+    { column: "enable_vnc", sql: "ALTER TABLE ssh_data ADD COLUMN enable_vnc INTEGER NOT NULL DEFAULT 0" },
+    { column: "enable_telnet", sql: "ALTER TABLE ssh_data ADD COLUMN enable_telnet INTEGER NOT NULL DEFAULT 0" },
+    { column: "ssh_port", sql: "ALTER TABLE ssh_data ADD COLUMN ssh_port INTEGER DEFAULT 22" },
+    { column: "rdp_port", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_port INTEGER DEFAULT 3389" },
+    { column: "vnc_port", sql: "ALTER TABLE ssh_data ADD COLUMN vnc_port INTEGER DEFAULT 5900" },
+    { column: "telnet_port", sql: "ALTER TABLE ssh_data ADD COLUMN telnet_port INTEGER DEFAULT 23" },
+    { column: "rdp_user", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_user TEXT" },
+    { column: "rdp_password", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_password TEXT" },
+    { column: "rdp_domain", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_domain TEXT" },
+    { column: "rdp_security", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_security TEXT" },
+    { column: "rdp_ignore_cert", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_ignore_cert INTEGER DEFAULT 0" },
+    { column: "vnc_password", sql: "ALTER TABLE ssh_data ADD COLUMN vnc_password TEXT" },
+    { column: "vnc_user", sql: "ALTER TABLE ssh_data ADD COLUMN vnc_user TEXT" },
+    { column: "telnet_user", sql: "ALTER TABLE ssh_data ADD COLUMN telnet_user TEXT" },
+    { column: "telnet_password", sql: "ALTER TABLE ssh_data ADD COLUMN telnet_password TEXT" },
   ];
 
   for (const migration of sshDataMigrations) {
@@ -999,6 +1124,39 @@ const migrateSchema = () => {
           error: alterError,
         });
       }
+    }
+  }
+
+  // Copy unencrypted username/domain into protocol-specific columns for old guac hosts.
+  // Passwords are handled via the legacy field name fallback in lazy-field-encryption.ts.
+  const usernameDomainBackfills = [
+    {
+      protocol: "rdp",
+      sql: "UPDATE ssh_data SET rdp_user = username, rdp_password = password, rdp_domain = domain WHERE connection_type = 'rdp' AND rdp_user IS NULL AND rdp_password IS NULL",
+    },
+    {
+      protocol: "vnc",
+      sql: "UPDATE ssh_data SET vnc_user = username, vnc_password = password WHERE connection_type = 'vnc' AND vnc_user IS NULL AND vnc_password IS NULL",
+    },
+    {
+      protocol: "telnet",
+      sql: "UPDATE ssh_data SET telnet_user = username, telnet_password = password WHERE connection_type = 'telnet' AND telnet_user IS NULL AND telnet_password IS NULL",
+    },
+  ];
+  for (const backfill of usernameDomainBackfills) {
+    try {
+      const result = sqlite.prepare(backfill.sql).run();
+      if (result.changes > 0) {
+        databaseLogger.info(
+          `Backfilled ${result.changes} ${backfill.protocol} host credential(s)`,
+          { operation: "guac_credential_backfill" },
+        );
+      }
+    } catch (e) {
+      databaseLogger.warn(`Failed to backfill ${backfill.protocol} host credentials`, {
+        operation: "guac_credential_backfill",
+        error: e,
+      });
     }
   }
 
@@ -1169,6 +1327,32 @@ const migrateSchema = () => {
       `);
     } catch (createError) {
       databaseLogger.warn("Failed to create opkssh_tokens table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM api_keys LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS api_keys (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          token_prefix TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT,
+          last_used_at TEXT,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create api_keys table", {
         operation: "schema_migration",
         error: createError,
       });

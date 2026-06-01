@@ -1,51 +1,103 @@
-// OPKSSH certificate authentication workarounds for ssh2.
+// SSH certificate authentication workarounds for ssh2.
 // ssh2 doesn't support OpenSSH cert auth natively — this module grafts
 // the certificate onto the parsed key, wraps ECDSA signing to convert
 // DER → SSH wire format, and patches Protocol.authPK to use the base
 // algorithm in the signature wrapper (required by OpenSSH's sshkey_check_sigtype).
+//
+// setupOPKSSHCertAuth: for OPKSSH-issued ephemeral certificates (no passphrase)
+// setupCACertAuth:     for user-managed CA-signed -cert.pub files (passphrase supported)
 
-import type { Client, ConnectConfig } from "ssh2";
+import type {
+  AnyAuthMethod,
+  AuthHandlerMiddleware,
+  AuthenticationType,
+  Client,
+  ConnectConfig,
+  PublicKeyAuthMethod,
+} from "ssh2";
 
 interface OPKSSHToken {
   privateKey: string;
   sshCert: string;
 }
-export async function setupOPKSSHCertAuth(
+
+type SignCallback = (
+  data: Buffer,
+  callback: (signature: Buffer) => void,
+) => void;
+
+interface ParsedPrivateKey {
+  type: string;
+  sign: (data: Buffer, algo?: string) => Buffer | Error;
+  getPublicSSH: () => Buffer;
+  [key: symbol]: unknown;
+}
+
+interface OPKSSHProtocol {
+  authPK: (
+    user: string,
+    pubKey: ParsedPrivateKey,
+    keyAlgo: string | undefined,
+    cbSign?: SignCallback,
+  ) => unknown;
+  _kex: {
+    sessionID: Buffer;
+  };
+  _packetRW: {
+    write: {
+      alloc: (payloadLength: number) => Buffer;
+      allocStart: number;
+      finalize: (packet: Buffer) => Buffer;
+    };
+  };
+  _authsQueue: string[];
+  _debug?: (message: string) => void;
+  _cipher: {
+    encrypt: (packet: Buffer) => void;
+  };
+}
+
+type OPKSSHClient = Client & {
+  _protocol?: OPKSSHProtocol;
+};
+
+type OPKSSHNextAuthHandler = (
+  authInfo: AuthenticationType | AnyAuthMethod | false,
+) => void;
+
+// ── Internal implementation ──────────────────────────────────────────────────
+// Grafts an OpenSSH certificate onto an already-parsed private key object and
+// patches the ssh2 client so that certificate-based publickey auth succeeds.
+
+async function _applyCertToConnection(
   config: ConnectConfig,
   client: Client,
-  token: OPKSSHToken,
-  username: string,
+  privKey: ParsedPrivateKey,
+  certStr: string,
 ): Promise<void> {
-  const { createRequire } = await import("node:module");
-  const esmRequire = createRequire(import.meta.url);
-  const {
-    utils: { parseKey },
-  } = esmRequire("ssh2");
-
-  const parsed = parseKey(Buffer.from(token.privateKey));
-  if (parsed instanceof Error || !parsed) {
-    throw new Error("Failed to parse OPKSSH private key");
-  }
-  const privKey: any = Array.isArray(parsed) ? parsed[0] : parsed;
-
   // Extract cert type and blob from the stored certificate
-  const certParts = token.sshCert.trim().split(/\s+/);
+  const certParts = certStr.trim().split(/\s+/);
+  if (certParts.length < 2) {
+    throw new Error(
+      "Invalid certificate format: expected '<type> <base64>' string",
+    );
+  }
   const certType = certParts[0];
-  privKey.type = certType;
   const certBlob = Buffer.from(certParts[1], "base64");
 
-  // Replace the internal public SSH blob with the full certificate
+  // Graft cert type and blob onto the parsed private key
+  privKey.type = certType;
   const pubSSHSym = Object.getOwnPropertySymbols(privKey).find(
     (s) => String(s) === "Symbol(Public key SSH)",
   );
   if (!pubSSHSym) {
     throw new Error(
-      "Cannot find public SSH symbol on parsed key, ssh2 internals may have changed",
+      "Cannot find public SSH symbol on parsed key; ssh2 internals may have changed",
     );
   }
   privKey[pubSSHSym] = certBlob;
 
-  // Wrap sign() for ECDSA cert keys
+  // Wrap sign() for ECDSA cert keys (DER → SSH wire format)
   if (privKey.type.startsWith("ecdsa-")) {
     const origSign = privKey.sign.bind(privKey);
     privKey.sign = (data: Buffer, algo?: string) => {
@@ -78,36 +130,43 @@ export async function setupOPKSSHCertAuth(
 
   // Set up authHandler to bypass ssh2's cert type rejection
   let certAuthAttempted = false;
-  config.authHandler = (
+  const authHandler: AuthHandlerMiddleware = (
     methodsLeft: string[],
     _partialSuccess: boolean,
-    callback: (authInfo: any) => void,
+    callback,
   ) => {
+    const next = callback as OPKSSHNextAuthHandler;
     if (
       !certAuthAttempted &&
       (!methodsLeft || methodsLeft.includes("publickey"))
     ) {
       certAuthAttempted = true;
-      callback({ type: "publickey", username, key: privKey });
+      next({
+        type: "publickey",
+        username: (config as Record<string, unknown>).username as string,
+        key: privKey as unknown as PublicKeyAuthMethod["key"],
+      });
     } else {
-      callback(false);
+      next(false);
     }
   };
+  config.authHandler = authHandler;
 
   // Monkey-patch Protocol.authPK after connect() to fix the signature
   // wrapper algorithm for cert types.
   const baseAlgo = certType.replace(/-cert-v\d+@openssh\.com$/, "");
   const origConnect = client.connect.bind(client);
-  (client as any).connect = (cfg: any) => {
-    origConnect(cfg);
-    const proto = (client as any)._protocol;
-    if (!proto) return;
+  const patchedClient = client as OPKSSHClient;
+  patchedClient.connect = (cfg: ConnectConfig) => {
+    const connectedClient = origConnect(cfg);
+    const proto = patchedClient._protocol;
+    if (!proto) return connectedClient;
     const origAuthPK = proto.authPK.bind(proto);
     proto.authPK = (
       user: string,
-      pubKey: any,
+      pubKey: ParsedPrivateKey,
       keyAlgo: string | undefined,
-      cbSign?: Function,
+      cbSign?: SignCallback,
     ) => {
       const isCertAuth = !!cbSign && pubKey?.type?.includes("-cert-");
       if (!isCertAuth) {
@@ -232,5 +291,78 @@ export async function setupOPKSSHCertAuth(
         proto._cipher.encrypt(finalized);
       });
     };
+    return connectedClient;
   };
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Set up OPKSSH certificate authentication on an ssh2 Client.
+ * The OPKSSH private key is assumed to be unencrypted (no passphrase).
+ */
+export async function setupOPKSSHCertAuth(
+  config: ConnectConfig,
+  client: Client,
+  token: OPKSSHToken,
+  username: string,
+): Promise<void> {
+  const { createRequire } = await import("node:module");
+  const esmRequire = createRequire(import.meta.url);
+  const {
+    utils: { parseKey },
+  } = esmRequire("ssh2");
+
+  // Store username in config so the authHandler can access it
+  (config as Record<string, unknown>).username = username;
+
+  const parsed = parseKey(Buffer.from(token.privateKey));
+  if (parsed instanceof Error || !parsed) {
+    throw new Error("Failed to parse OPKSSH private key");
+  }
+  const privKey = (
+    Array.isArray(parsed) ? parsed[0] : parsed
+  ) as ParsedPrivateKey;
+
+  await _applyCertToConnection(config, client, privKey, token.sshCert);
+}
+
+/**
+ * Set up CA-signed certificate authentication on an ssh2 Client.
+ * Supports passphrase-protected private keys.
+ * The cert content is the full text of the -cert.pub file
+ * (e.g. "ssh-ed25519-cert-v01@openssh.com AAAA...").
+ */
+export async function setupCACertAuth(
+  config: ConnectConfig,
+  client: Client,
+  privateKey: Buffer | string,
+  certPublicKey: string,
+  username: string,
+  passphrase?: string,
+): Promise<void> {
+  const { createRequire } = await import("node:module");
+  const esmRequire = createRequire(import.meta.url);
+  const {
+    utils: { parseKey },
+  } = esmRequire("ssh2");
+
+  // Store username in config so the authHandler can access it
+  (config as Record<string, unknown>).username = username;
+
+  const keyBuf = Buffer.isBuffer(privateKey)
+    ? privateKey
+    : Buffer.from(privateKey, "utf8");
+
+  const parsed = passphrase ? parseKey(keyBuf, passphrase) : parseKey(keyBuf);
+
+  if (parsed instanceof Error || !parsed) {
+    const errMsg = parsed instanceof Error ? parsed.message : "unknown error";
+    throw new Error(`Failed to parse private key for CA cert auth: ${errMsg}`);
+  }
+  const privKey = (
+    Array.isArray(parsed) ? parsed[0] : parsed
+  ) as ParsedPrivateKey;
+
+  await _applyCertToConnection(config, client, privKey, certPublicKey);
 }

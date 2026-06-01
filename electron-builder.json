@@ -5,7 +5,13 @@
   "directories": {
     "output": "release"
   },
-  "asar": false,
+  "asar": true,
+  "asarUnpack": [
+    "dist/backend/**/*",
+    "node_modules/**/*",
+    "public/icons/**/*",
+    "public/icon.*"
+  ],
   "files": [
     "dist/**/*",
     "electron/**/*",
@@ -29,7 +35,8 @@
     "!public/icons/**/*"
   ],
   "extraMetadata": {
-    "main": "electron/main.cjs"
+    "main": "electron/main.cjs",
+    "type": "commonjs"
   },
   "buildDependenciesFromSource": false,
   "nodeGypRebuild": false,
@@ -83,8 +90,8 @@
     "desktop": {
       "entry": {
         "Name": "Termix",
-        "Comment": "A web-based server management platform",
-        "Keywords": "terminal;ssh;server;management;",
+        "Comment": "Self-hosted SSH and remote desktop management. ",
+        "Keywords": "docker;ssh;terminal;telnet;self-hosted;rdp;file-management;vnc;ssh-tunnel;server-stats;termix",
         "StartupWMClass": "termix"
       }
     }
@@ -116,8 +123,8 @@
     "type": "distribution",
     "minimumSystemVersion": "10.15",
     "mergeASARs": false,
-    "singleArchFiles": "**/*.node",
-    "x64ArchFiles": "**/*.node"
+    "singleArchFiles": "**/*.{node,bare}",
+    "x64ArchFiles": "**/*.{node,bare}"
   },
   "dmg": {
     "artifactName": "termix_macos_${arch}_dmg.${ext}",
@@ -130,7 +137,6 @@
     "entitlementsInherit": "build/entitlements.mas.inherit.plist",
     "hardenedRuntime": false,
     "gatekeeperAssess": false,
-    "asar": false,
     "type": "distribution",
     "category": "public.app-category.developer-tools",
     "artifactName": "termix_macos_${arch}_mas.${ext}",
