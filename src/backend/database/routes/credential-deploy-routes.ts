@@ -10,6 +10,11 @@ import { hosts, sshCredentials } from "../db/schema.js";
 
 const { Client } = ssh2Pkg;
 
+// The base64 portion of an SSH public key is restricted to the characters
+// below, so this regex is also used as a guard to keep the value from ever
+// reaching the shell with unexpected metacharacters.
+const SSH_KEY_BASE64_RE = /^[A-Za-z0-9+/=]+$/;
+
 async function deploySSHKeyToHost(
   hostConfig: Record<string, unknown>,
   credData: CredentialBackend,
@@ -85,6 +90,12 @@ async function deploySSHKeyToHost(
             }
 
             const keyPattern = keyParts[1];
+            if (!SSH_KEY_BASE64_RE.test(keyPattern)) {
+              clearTimeout(checkTimeout);
+              return rejectCheck(
+                new Error("Invalid public key encoding"),
+              );
+            }
 
             conn.exec(
               `if [ -f ~/.ssh/authorized_keys ]; then grep -F "${keyPattern}" ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?; else echo 1; fi`,
@@ -190,6 +201,10 @@ async function deploySSHKeyToHost(
             }
 
             const keyPattern = keyParts[1];
+            if (!SSH_KEY_BASE64_RE.test(keyPattern)) {
+              clearTimeout(verifyTimeout);
+              return rejectVerify(new Error("Invalid public key encoding"));
+            }
             conn.exec(
               `grep -F "${keyPattern}" ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?`,
               (err, stream) => {

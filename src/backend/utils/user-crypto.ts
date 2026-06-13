@@ -500,9 +500,22 @@ class UserCrypto {
     );
   }
 
+  private static oidcSystemSecretWarned = false;
+
   private deriveOIDCSystemKey(userId: string): Buffer {
-    const systemSecret =
-      process.env.OIDC_SYSTEM_SECRET || "termix-oidc-system-secret-default";
+    let systemSecret = process.env.OIDC_SYSTEM_SECRET;
+    if (!systemSecret) {
+      if (!UserCrypto.oidcSystemSecretWarned) {
+        UserCrypto.oidcSystemSecretWarned = true;
+        databaseLogger.warn(
+          "OIDC_SYSTEM_SECRET is not configured. Falling back to legacy default. This default is publicly known, so any attacker who can read the database can decrypt OIDC user data. Set OIDC_SYSTEM_SECRET to a long, random value (at least 32 characters) and rotate existing OIDC users.",
+          {
+            operation: "oidc_system_secret_missing",
+          },
+        );
+      }
+      systemSecret = "termix-oidc-system-secret-default";
+    }
     const salt = Buffer.from(userId, "utf8");
     return crypto.pbkdf2Sync(
       systemSecret,

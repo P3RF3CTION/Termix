@@ -45,6 +45,20 @@ function isNativeAppRequest(req: Request): boolean {
   );
 }
 
+const MIN_BCRYPT_ROUNDS = 10;
+const MAX_BCRYPT_ROUNDS = 15;
+
+export function getSecureSaltRounds(): number {
+  const raw = parseInt(process.env.SALT || "10", 10);
+  if (!Number.isFinite(raw) || raw < MIN_BCRYPT_ROUNDS) {
+    return MIN_BCRYPT_ROUNDS;
+  }
+  if (raw > MAX_BCRYPT_ROUNDS) {
+    return MAX_BCRYPT_ROUNDS;
+  }
+  return raw;
+}
+
 const authenticateJWT = authManager.createAuthMiddleware();
 const requireAdmin = authManager.createAdminMiddleware();
 
@@ -130,7 +144,7 @@ router.post("/create", async (req, res) => {
       return res.status(409).json({ error: "Username already exists" });
     }
 
-    const saltRounds = parseInt(process.env.SALT || "10", 10);
+    const saltRounds = getSecureSaltRounds();
     const password_hash = await bcrypt.hash(password, saltRounds);
     const id = nanoid();
 
@@ -2084,7 +2098,7 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Failed to update password and re-encrypt data." });
   }
 
-  const saltRounds = parseInt(process.env.SALT || "10", 10);
+  const saltRounds = getSecureSaltRounds();
   const password_hash = await bcrypt.hash(newPassword, saltRounds);
   await db
     .update(users)

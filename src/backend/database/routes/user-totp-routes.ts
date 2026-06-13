@@ -1,5 +1,6 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
+import crypto from "crypto";
 import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import QRCode from "qrcode";
@@ -21,6 +22,36 @@ interface UserTotpRoutesDeps {
   authenticateJWT: RequestHandler;
   authManager: AuthManager;
   isNativeAppRequest: NativeAppRequestChecker;
+}
+
+function generateSecureBackupCodes(count: number = 8): string[] {
+  const codes: string[] = [];
+  for (let i = 0; i < count; i++) {
+    codes.push(crypto.randomBytes(5).toString("hex").toUpperCase());
+  }
+  return codes;
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  try {
+    return crypto.timingSafeEqual(aBuf, bBuf);
+  } catch {
+    return false;
+  }
+}
+
+function findBackupCodeIndex(codes: string[], candidate: string): number {
+  let foundIndex = -1;
+  for (let i = 0; i < codes.length; i++) {
+    if (timingSafeStringEqual(codes[i], candidate) && foundIndex === -1) {
+      foundIndex = i;
+    }
+  }
+  return foundIndex;
 }
 
 export function registerUserTotpRoutes(
@@ -146,9 +177,7 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateSecureBackupCodes(8);
 
       await db
         .update(users)
@@ -347,9 +376,7 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateSecureBackupCodes(8);
 
       await db
         .update(users)
@@ -493,7 +520,7 @@ export function registerUserTotpRoutes(
           backupCodes = [];
         }
 
-        const backupIndex = backupCodes.indexOf(totp_code);
+        const backupIndex = findBackupCodeIndex(backupCodes, totp_code);
 
         if (backupIndex === -1) {
           authLogger.warn("TOTP verification failed - invalid code", {

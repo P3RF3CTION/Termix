@@ -20,6 +20,32 @@ import {
   snippets,
 } from "../db/schema.js";
 
+function timingSafeStringEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  try {
+    return crypto.timingSafeEqual(aBuf, bBuf);
+  } catch {
+    return false;
+  }
+}
+
+const MIN_BCRYPT_ROUNDS = 10;
+const MAX_BCRYPT_ROUNDS = 15;
+
+function getSecureSaltRounds(): number {
+  const raw = parseInt(process.env.SALT || "10", 10);
+  if (!Number.isFinite(raw) || raw < MIN_BCRYPT_ROUNDS) {
+    return MIN_BCRYPT_ROUNDS;
+  }
+  if (raw > MAX_BCRYPT_ROUNDS) {
+    return MAX_BCRYPT_ROUNDS;
+  }
+  return raw;
+}
+
 interface UserPasswordResetRoutesDeps {
   authManager: AuthManager;
 }
@@ -232,7 +258,7 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      if (!timingSafeStringEqual(resetData.code, resetCode)) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -333,7 +359,7 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      if (!timingSafeStringEqual(tempTokenData.token, tempToken)) {
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 
@@ -346,7 +372,7 @@ export function registerUserPasswordResetRoutes(
       }
       const userId = user[0].id;
 
-      const saltRounds = parseInt(process.env.SALT || "10", 10);
+      const saltRounds = getSecureSaltRounds();
       const password_hash = await bcrypt.hash(newPassword, saltRounds);
 
       let userIdFromJwt: string | null = null;
