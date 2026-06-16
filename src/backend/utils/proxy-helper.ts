@@ -6,16 +6,50 @@ import { sshLogger } from "./logger.js";
 import type { ProxyNode } from "../../types/index.js";
 
 function isBlockedAddress(ip: string): boolean {
-  if (ip === "0.0.0.0" || ip === "::1" || ip === "::") return true;
+  if (!ip) return true;
+  const normalized = ip.toLowerCase();
+  if (
+    normalized === "0.0.0.0" ||
+    normalized === "::" ||
+    normalized === "::1" ||
+    normalized === "[::]" ||
+    normalized === "[::1]"
+  ) {
+    return true;
+  }
+
+  // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — recurse on the embedded IPv4
+  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) {
+    return isBlockedAddress(mapped[1]);
+  }
 
   const parts = ip.split(".").map(Number);
-  if (parts.length !== 4) return false;
+  if (parts.length === 4 && parts.every((p) => Number.isInteger(p))) {
+    if (parts[0] === 127) return true;
+    if (parts[0] === 10) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    // CGNAT 100.64.0.0/10
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+    // Multicast / reserved
+    if (parts[0] >= 224) return true;
+    return false;
+  }
 
-  if (parts[0] === 127) return true;
-  if (parts[0] === 10) return true;
-  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-  if (parts[0] === 192 && parts[1] === 168) return true;
-  if (parts[0] === 169 && parts[1] === 254) return true;
+  // Basic IPv6 private range checks. Block link-local (fe80::/10),
+  // unique-local (fc00::/7), and loopback variants.
+  if (
+    normalized.startsWith("fe8") ||
+    normalized.startsWith("fe9") ||
+    normalized.startsWith("fea") ||
+    normalized.startsWith("feb") ||
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd")
+  ) {
+    return true;
+  }
 
   return false;
 }

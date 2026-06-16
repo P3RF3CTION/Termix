@@ -114,7 +114,9 @@ function scheduleSessionCleanup(sessionId: string) {
 }
 
 function verifySessionOwnership(session: SSHSession, userId: string): boolean {
-  return !session.userId || session.userId === userId;
+  if (!session || !userId) return false;
+  if (!session.userId) return false;
+  return session.userId === userId;
 }
 
 function resolveBrowseHostId(

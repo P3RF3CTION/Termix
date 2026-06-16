@@ -3,6 +3,17 @@ import { logger } from "../utils/logger.js";
 
 const sshLogger = logger;
 
+// Docker container IDs are hex strings; container names allow
+// alphanumerics, underscores, dots, and hyphens. The leading character must
+// not be a hyphen to avoid argument-parsing surprises. We deliberately reject
+// anything else so attacker-controlled input cannot inject extra shell tokens
+// into the docker commands constructed below.
+const CONTAINER_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/;
+
+function isValidContainerId(id: unknown): id is string {
+  return typeof id === "string" && CONTAINER_ID_RE.test(id);
+}
+
 type DockerSession = {
   isConnected: boolean;
   lastActive: number;
@@ -168,6 +179,9 @@ export function registerDockerContainerRoutes(
    */
   app.get("/docker/containers/:sessionId/:containerId", async (req, res) => {
     const { sessionId, containerId } = req.params;
+    if (!isValidContainerId(containerId)) {
+      return res.status(400).json({ error: "Invalid container id" });
+    }
     const userId = getRequestUserId(req);
 
     if (!userId) {
@@ -263,6 +277,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/start",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const userId = getRequestUserId(req);
 
       if (!userId) {
@@ -363,6 +380,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/stop",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const userId = getRequestUserId(req);
 
       if (!userId) {
@@ -463,6 +483,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/restart",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const userId = getRequestUserId(req);
 
       if (!userId) {
@@ -563,6 +586,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/pause",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const userId = getRequestUserId(req);
 
       if (!userId) {
@@ -663,6 +689,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/unpause",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const userId = getRequestUserId(req);
 
       if (!userId) {
@@ -767,6 +796,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/remove",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const force = req.query.force === "true";
       const userId = getRequestUserId(req);
 
@@ -894,6 +926,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/logs",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const tail = req.query.tail ? parseInt(req.query.tail as string) : 100;
       const timestamps = req.query.timestamps === "true";
       const since = req.query.since as string;
@@ -1008,6 +1043,9 @@ export function registerDockerContainerRoutes(
     "/docker/containers/:sessionId/:containerId/stats",
     async (req, res) => {
       const { sessionId, containerId } = req.params;
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
       const userId = getRequestUserId(req);
 
       if (!userId) {
