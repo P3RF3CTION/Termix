@@ -291,8 +291,14 @@ class DatabaseFileEncryption {
           throw new Error("v1 encrypted file missing required salt field");
         }
         const salt = Buffer.from(metadata.salt, "hex");
-        const fixedSeed =
-          process.env.DB_FILE_KEY || "termix-database-file-encryption-seed-v1";
+        const fixedSeed = process.env.DB_FILE_KEY;
+        if (!fixedSeed || fixedSeed.length < 16) {
+          throw new Error(
+            "DB_FILE_KEY environment variable is required to decrypt legacy v1 database file. " +
+              "Set DB_FILE_KEY to the value used when this file was encrypted (the historical default was " +
+              "'termix-database-file-encryption-seed-v1'), then upgrade to v2 encryption to remove this requirement.",
+          );
+        }
         key = crypto.pbkdf2Sync(fixedSeed, salt, 100000, 32, "sha256");
       } else {
         throw new Error(`Unsupported encryption version: ${metadata.version}`);

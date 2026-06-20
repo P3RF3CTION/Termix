@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { Client as SSHClient } from "ssh2";
 import { SSH_ALGORITHMS } from "../utils/ssh-algorithms.js";
 import { WebSocketServer, WebSocket } from "ws";
@@ -303,7 +304,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
   }
 
   const userId = payload.userId;
-  const sessionId = `docker-console-${Date.now()}-${Math.random()}`;
+  const sessionId = `docker-console-${Date.now()}-${crypto.randomBytes(12).toString("hex")}`;
   sshLogger.info("Docker console WebSocket connected", {
     operation: "docker_console_connect",
     sessionId,

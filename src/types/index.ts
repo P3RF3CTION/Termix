@@ -41,6 +41,13 @@ export interface LDAPProviderConfig {
   host: string;
   port: number;
   useTLS: boolean;
+  /**
+   * When TLS is enabled, controls whether the LDAP server's certificate is
+   * verified against trusted CAs. Defaults to true (secure). Set to false
+   * only for development or when intentionally targeting a self-signed
+   * LDAP server in a trusted network segment.
+   */
+  tlsRejectUnauthorized?: boolean;
   bindDN: string;
   bindPassword: string;
   userSearchBase: string;

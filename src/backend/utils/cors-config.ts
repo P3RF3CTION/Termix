@@ -1,9 +1,12 @@
 import cors from "cors";
 import type { Request, Response, NextFunction } from "express";
 import { getRequestOrigin } from "./request-origin.js";
+import { systemLogger } from "./logger.js";
 
 const DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
 const ELECTRON_FILE_ORIGIN = "file://";
+
+let warnedAboutWildcardWithCredentials = false;
 
 function getAllowedOrigins(): string[] {
   const envOrigins = process.env.CORS_ALLOWED_ORIGINS;
@@ -53,8 +56,22 @@ export function createCorsMiddleware(
           return callback(null, true);
 
         const configured = getAllowedOrigins();
-        if (configured.includes("*") || configured.includes(origin))
-          return callback(null, true);
+        if (configured.includes(origin)) return callback(null, true);
+        if (configured.includes("*")) {
+          // Wildcard origin with credentials is incompatible with browser
+          // security rules and would silently downgrade auth. Reject and log
+          // a one-time warning to alert operators to misconfiguration.
+          if (!warnedAboutWildcardWithCredentials) {
+            warnedAboutWildcardWithCredentials = true;
+            systemLogger.warn(
+              "CORS_ALLOWED_ORIGINS contains '*' but credentials are enabled. " +
+                "Wildcard origins are ignored to prevent credential exposure. " +
+                "List explicit allowed origins instead.",
+              { operation: "cors_wildcard_with_credentials" },
+            );
+          }
+          // fall through to same-origin / final-deny path
+        }
 
         const sameOrigin = getRequestOrigin(req);
         if (origin === sameOrigin) return callback(null, true);

@@ -32,6 +32,14 @@ export function registerUserAdminRoutes(
    */
   router.get("/list", authenticateJWT, async (req, res) => {
     try {
+      const requesterId = (req as AuthenticatedRequest).userId;
+      const requester = await db
+        .select({ id: users.id, isAdmin: users.isAdmin })
+        .from(users)
+        .where(eq(users.id, requesterId))
+        .limit(1);
+      const isAdminRequester = !!requester[0]?.isAdmin;
+
       const allUsers = await db
         .select({
           id: users.id,
@@ -42,14 +50,24 @@ export function registerUserAdminRoutes(
         })
         .from(users);
 
+      // Non-admin callers (used by sharing dialogs) only get a minimal view
+      // - usernames + ids - so that admin status and auth provider are not
+      // leaked to every authenticated user.
       res.json({
-        users: allUsers.map((u) => ({
-          userId: u.id,
-          username: u.username,
-          is_admin: u.isAdmin,
-          is_oidc: u.isOidc,
-          password_hash: u.passwordHash ? "set" : null,
-        })),
+        users: allUsers.map((u) =>
+          isAdminRequester
+            ? {
+                userId: u.id,
+                username: u.username,
+                is_admin: u.isAdmin,
+                is_oidc: u.isOidc,
+                password_hash: u.passwordHash ? "set" : null,
+              }
+            : {
+                userId: u.id,
+                username: u.username,
+              },
+        ),
       });
     } catch (err) {
       authLogger.error("Failed to list users", err);

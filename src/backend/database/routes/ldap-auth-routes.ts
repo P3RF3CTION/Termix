@@ -7,6 +7,7 @@ import { nanoid } from "nanoid";
 import { authLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { parseUserAgent } from "../../utils/user-agent-parser.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { isOIDCUserAllowed, loadProviderConfig } from "./user-oidc-utils.js";
 import ldap from "ldapjs";
 
@@ -23,12 +24,28 @@ function createLDAPClient(
   host: string,
   port: number,
   useTLS: boolean,
+  rejectUnauthorized: boolean = true,
 ): ldap.Client {
   const url = `${useTLS ? "ldaps" : "ldap"}://${host}:${port}`;
   return ldap.createClient({
     url,
-    tlsOptions: useTLS ? { rejectUnauthorized: false } : undefined,
+    tlsOptions: useTLS ? { rejectUnauthorized } : undefined,
   });
+}
+
+function getClientIp(req: {
+  headers: Record<string, string | string[] | undefined>;
+  ip?: string;
+  socket?: { remoteAddress?: string };
+}): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.length > 0) {
+    return forwarded.split(",")[0].trim();
+  }
+  if (Array.isArray(forwarded) && forwarded.length > 0) {
+    return String(forwarded[0]).split(",")[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown";
 }
 
 function ldapBind(
@@ -119,6 +136,21 @@ export function registerLDAPAuthRoutes(router: Router): void {
         .json({ error: "providerId, username, and password are required" });
     }
 
+    const clientIp = getClientIp(req);
+    const lockStatus = loginRateLimiter.isLocked(clientIp, username);
+    if (lockStatus.locked) {
+      authLogger.warn("LDAP login blocked due to rate limiting", {
+        operation: "ldap_login_blocked",
+        username,
+        ip: clientIp,
+        remainingTime: lockStatus.remainingTime,
+      });
+      return res.status(429).json({
+        error: "Too many login attempts. Please try again later.",
+        remainingTime: lockStatus.remainingTime,
+      });
+    }
+
     try {
       const rows = await db
         .select()
@@ -148,10 +180,12 @@ export function registerLDAPAuthRoutes(router: Router): void {
       return res.status(500).json({ error: "LDAP provider is misconfigured" });
     }
 
+    const tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
     const serviceClient = createLDAPClient(
       config.host,
       config.port || 389,
       config.useTLS || false,
+      tlsRejectUnauthorized,
     );
     try {
       await ldapBind(serviceClient, config.bindDN, config.bindPassword);
@@ -174,9 +208,11 @@ export function registerLDAPAuthRoutes(router: Router): void {
       );
 
       if (entries.length === 0) {
+        loginRateLimiter.recordFailedAttempt(clientIp, username);
         authLogger.warn("LDAP user not found", {
           operation: "ldap_login",
           username,
+          ip: clientIp,
         });
         return res.status(401).json({ error: "Invalid username or password" });
       }
@@ -220,18 +256,23 @@ export function registerLDAPAuthRoutes(router: Router): void {
         config.host,
         config.port || 389,
         config.useTLS || false,
+        tlsRejectUnauthorized,
       );
       try {
         await ldapBind(userClient, userDN, password);
       } catch {
+        loginRateLimiter.recordFailedAttempt(clientIp, username);
         authLogger.warn("LDAP bind failed - wrong password", {
           operation: "ldap_login",
           ldapIdentifier,
+          ip: clientIp,
         });
         return res.status(401).json({ error: "Invalid username or password" });
       } finally {
         ldapUnbind(userClient);
       }
+
+      loginRateLimiter.resetAttempts(clientIp, username);
 
       // Admin group check
       let isAdmin = false;

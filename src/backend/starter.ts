@@ -113,6 +113,24 @@ import {
       operation: "backend_init_db",
     });
 
+    try {
+      const { db } = await import("./database/db/index.js");
+      const { users } = await import("./database/db/schema.js");
+      const { ne } = await import("drizzle-orm");
+      const oidcUserRows = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(ne(users.isOidc, false))
+        .limit(1);
+      await systemCrypto.initializeOIDCSystemSecret(oidcUserRows.length > 0);
+    } catch (err) {
+      systemLogger.error(
+        "Failed to initialize OIDC system secret - OIDC users may be unable to log in",
+        err,
+        { operation: "oidc_system_secret_init_failed" },
+      );
+    }
+
     const authManager = AuthManager.getInstance();
     await authManager.initialize();
     DataCrypto.initialize();

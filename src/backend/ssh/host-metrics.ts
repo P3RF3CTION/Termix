@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "crypto";
 import net from "net";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import cookieParser from "cookie-parser";
@@ -1165,7 +1166,7 @@ function createSshFactory(host: SSHHostWithCredentials): () => Promise<Client> {
           );
 
           if (totpPromptIndex !== -1) {
-            const sessionId = `totp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const sessionId = `totp-${Date.now()}-${crypto.randomBytes(9).toString("hex")}`;
 
             pendingTOTPSessions[sessionId] = {
               client,
@@ -1961,7 +1962,7 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
           );
 
           if (totpPromptIndex !== -1) {
-            const sessionId = `totp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const sessionId = `totp-${Date.now()}-${crypto.randomBytes(9).toString("hex")}`;
 
             pendingTOTPSessions[sessionId] = {
               client,
@@ -2042,7 +2043,7 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
           };
           scheduleMetricsSessionCleanup(sessionKey);
 
-          const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          const viewerSessionId = `viewer-${Date.now()}-${crypto.randomBytes(9).toString("hex")}`;
           pollingManager.registerViewer(host.id, viewerSessionId, userId);
 
           resolve({ success: true, viewerSessionId });
@@ -2465,7 +2466,7 @@ app.post("/metrics/connect-totp", async (req, res) => {
 
     delete pendingTOTPSessions[sessionId];
 
-    const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const viewerSessionId = `viewer-${Date.now()}-${crypto.randomBytes(9).toString("hex")}`;
     pollingManager.registerViewer(session.hostId, viewerSessionId, userId);
 
     res.json({ success: true, viewerSessionId });
