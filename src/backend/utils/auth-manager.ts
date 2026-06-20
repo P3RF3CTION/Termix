@@ -746,6 +746,17 @@ class AuthManager {
         );
 
       if (candidates.length === 0) {
+        // Perform a dummy bcrypt comparison so that latency between
+        // unknown-prefix and known-prefix requests does not leak which
+        // prefixes correspond to real keys.
+        try {
+          await bcrypt.compare(
+            token,
+            "$2b$10$CwTycUXWue0Thq9StjUM0uJ8nB2WnYIcz4t0wTpY6mYsmGZJ0R9oW",
+          );
+        } catch {
+          /* dummy bcrypt failure is irrelevant */
+        }
         res.status(401).json({ error: "Invalid API key" });
         return;
       }

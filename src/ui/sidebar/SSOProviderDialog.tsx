@@ -59,6 +59,7 @@ function emptyLdap(): LDAPProviderConfig {
     host: "",
     port: 389,
     useTLS: false,
+    tlsRejectUnauthorized: true,
     bindDN: "",
     bindPassword: "",
     userSearchBase: "",
@@ -90,6 +91,7 @@ type LDAPFields = {
   host: string;
   port: string;
   useTLS: boolean;
+  tlsRejectUnauthorized: boolean;
   bindDN: string;
   bindPassword: string;
   userSearchBase: string;
@@ -120,7 +122,11 @@ export function SSOProviderDialog({
   );
   const [ldap, setLdap] = useState<LDAPFields>(() => {
     const d = emptyLdap();
-    return { ...d, port: String(d.port) };
+    return {
+      ...d,
+      port: String(d.port),
+      tlsRejectUnauthorized: d.tlsRejectUnauthorized ?? true,
+    } as LDAPFields;
   });
 
   useEffect(() => {
@@ -145,6 +151,8 @@ export function SSOProviderDialog({
           host: (config.host as string) ?? d.host,
           port: String((config.port as number) ?? d.port),
           useTLS: (config.useTLS as boolean) ?? d.useTLS,
+          tlsRejectUnauthorized:
+            (config.tlsRejectUnauthorized as boolean) ?? true,
           bindDN: (config.bindDN as string) ?? d.bindDN,
           bindPassword: (config.bindPassword as string) ?? "",
           userSearchBase: (config.userSearchBase as string) ?? d.userSearchBase,
@@ -183,7 +191,11 @@ export function SSOProviderDialog({
       setEnabled(true);
       setOidc({ ...emptyOidc() } as OIDCFields);
       const d = emptyLdap();
-      setLdap({ ...d, port: String(d.port) });
+      setLdap({
+        ...d,
+        port: String(d.port),
+        tlsRejectUnauthorized: d.tlsRejectUnauthorized ?? true,
+      } as LDAPFields);
     }
   }, [open, provider]);
 
@@ -207,6 +219,7 @@ export function SSOProviderDialog({
         host: ldap.host,
         port: parseInt(ldap.port, 10) || 389,
         useTLS: ldap.useTLS,
+        tlsRejectUnauthorized: ldap.tlsRejectUnauthorized,
         bindDN: ldap.bindDN,
         bindPassword: ldap.bindPassword,
         userSearchBase: ldap.userSearchBase,
@@ -592,6 +605,24 @@ function LDAPConfigFields({
           </div>
         </div>
       </div>
+      {ldap.useTLS && (
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              setLdapField("tlsRejectUnauthorized", !ldap.tlsRejectUnauthorized)
+            }
+            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center border-2 transition-colors ${ldap.tlsRejectUnauthorized ? "bg-accent-brand border-accent-brand" : "bg-muted border-border"}`}
+          >
+            <span
+              className={`pointer-events-none inline-block h-3 w-3 bg-background shadow-sm transition-transform ${ldap.tlsRejectUnauthorized ? "translate-x-4" : "translate-x-0.5"}`}
+            />
+          </button>
+          <span className="text-[10px] text-muted-foreground">
+            Verify LDAP server TLS certificate (recommended)
+          </span>
+        </div>
+      )}
       <Field label={t("admin.ldapBindDn")} required>
         <Input
           value={ldap.bindDN}

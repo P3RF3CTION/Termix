@@ -501,8 +501,12 @@ class UserCrypto {
   }
 
   private deriveOIDCSystemKey(userId: string): Buffer {
-    const systemSecret =
-      process.env.OIDC_SYSTEM_SECRET || "termix-oidc-system-secret-default";
+    const systemSecret = process.env.OIDC_SYSTEM_SECRET;
+    if (!systemSecret || systemSecret.length < 32) {
+      throw new Error(
+        "OIDC_SYSTEM_SECRET is not configured. SystemCrypto.initializeOIDCSystemSecret() must complete before deriving OIDC keys.",
+      );
+    }
     const salt = Buffer.from(userId, "utf8");
     return crypto.pbkdf2Sync(
       systemSecret,

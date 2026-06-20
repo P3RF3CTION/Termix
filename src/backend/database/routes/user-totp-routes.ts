@@ -1,6 +1,7 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
 import { and, eq, ne } from "drizzle-orm";
+import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import QRCode from "qrcode";
 import speakeasy from "speakeasy";
@@ -14,6 +15,36 @@ import {
 } from "../../utils/user-agent-parser.js";
 import { db } from "../db/index.js";
 import { sessions, trustedDevices, users } from "../db/schema.js";
+
+function generateBackupCodes(count: number = 8): string[] {
+  return Array.from({ length: count }, () => {
+    const raw = crypto.randomBytes(5).toString("hex").toUpperCase();
+    return `${raw.substring(0, 5)}-${raw.substring(5, 10)}`;
+  });
+}
+
+function findBackupCodeIndexConstantTime(
+  backupCodes: unknown[],
+  candidate: string,
+): number {
+  let matchIndex = -1;
+  const candidateBuf = Buffer.from(candidate, "utf8");
+  for (let i = 0; i < backupCodes.length; i++) {
+    const entry = String(backupCodes[i] ?? "");
+    const entryBuf = Buffer.from(entry, "utf8");
+    let equal: boolean;
+    if (entryBuf.length !== candidateBuf.length) {
+      crypto.timingSafeEqual(entryBuf, entryBuf);
+      equal = false;
+    } else {
+      equal = crypto.timingSafeEqual(entryBuf, candidateBuf);
+    }
+    if (equal && matchIndex === -1) {
+      matchIndex = i;
+    }
+  }
+  return matchIndex;
+}
 
 type NativeAppRequestChecker = (req: Request) => boolean;
 
@@ -60,7 +91,10 @@ export async function verifyTotpReauth(
     backupCodes = [];
   }
   if (Array.isArray(backupCodes)) {
-    const backupIndex = backupCodes.indexOf(credential);
+    const backupIndex = findBackupCodeIndexConstantTime(
+      backupCodes,
+      credential,
+    );
     if (backupIndex !== -1) {
       backupCodes.splice(backupIndex, 1);
       await db
@@ -198,9 +232,7 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateBackupCodes();
 
       await db
         .update(users)
@@ -385,9 +417,7 @@ export function registerUserTotpRoutes(
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateBackupCodes();
 
       await db
         .update(users)
@@ -531,7 +561,10 @@ export function registerUserTotpRoutes(
           backupCodes = [];
         }
 
-        const backupIndex = backupCodes.indexOf(totp_code);
+        const backupIndex = findBackupCodeIndexConstantTime(
+          backupCodes,
+          totp_code,
+        );
 
         if (backupIndex === -1) {
           authLogger.warn("TOTP verification failed - invalid code", {

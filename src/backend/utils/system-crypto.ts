@@ -10,6 +10,7 @@ class SystemCrypto {
   private encryptionKey: Buffer | null = null;
   private internalAuthToken: string | null = null;
   private credentialSharingKey: Buffer | null = null;
+  private oidcSystemSecret: string | null = null;
 
   private constructor() {}
 
@@ -240,6 +241,82 @@ class SystemCrypto {
       await this.initializeCredentialSharingKey();
     }
     return this.credentialSharingKey!;
+  }
+
+  async initializeOIDCSystemSecret(
+    hasLegacyEncryptedData: boolean = false,
+  ): Promise<void> {
+    try {
+      const envSecret = process.env.OIDC_SYSTEM_SECRET;
+      if (envSecret && envSecret.length >= 32) {
+        this.oidcSystemSecret = envSecret;
+        return;
+      }
+
+      const dataDir = process.env.DATA_DIR || "./db/data";
+      const envPath = path.join(dataDir, ".env");
+
+      try {
+        const envContent = await fs.readFile(envPath, "utf8");
+        const secretMatch = envContent.match(/^OIDC_SYSTEM_SECRET=(.+)$/m);
+        if (secretMatch && secretMatch[1] && secretMatch[1].length >= 32) {
+          this.oidcSystemSecret = secretMatch[1];
+          process.env.OIDC_SYSTEM_SECRET = secretMatch[1];
+          return;
+        }
+      } catch {
+        // expected - env file may not exist
+      }
+
+      await this.generateAndGuideOIDCSystemSecret(hasLegacyEncryptedData);
+    } catch (error) {
+      databaseLogger.error("Failed to initialize OIDC system secret", error, {
+        operation: "oidc_system_secret_init_failed",
+      });
+      throw new Error("OIDC system secret initialization failed", {
+        cause: error,
+      });
+    }
+  }
+
+  async getOIDCSystemSecret(): Promise<string> {
+    if (!this.oidcSystemSecret) {
+      await this.initializeOIDCSystemSecret();
+    }
+    return this.oidcSystemSecret!;
+  }
+
+  private async generateAndGuideOIDCSystemSecret(
+    hasLegacyEncryptedData: boolean,
+  ): Promise<void> {
+    if (hasLegacyEncryptedData) {
+      const legacyDefault = "termix-oidc-system-secret-default";
+      this.oidcSystemSecret = legacyDefault;
+      await this.updateEnvFile("OIDC_SYSTEM_SECRET", legacyDefault);
+      databaseLogger.error(
+        "CRITICAL: OIDC_SYSTEM_SECRET was not configured but existing OIDC user data was detected. " +
+          "The known legacy default has been persisted to .env to preserve access to existing data. " +
+          "You MUST rotate this secret by setting a strong random value and re-encrypting OIDC user data.",
+        null,
+        {
+          operation: "oidc_system_secret_legacy_persisted",
+          action_required: "rotate_OIDC_SYSTEM_SECRET",
+        },
+      );
+      return;
+    }
+
+    const newSecret = crypto.randomBytes(48).toString("hex");
+    this.oidcSystemSecret = newSecret;
+    await this.updateEnvFile("OIDC_SYSTEM_SECRET", newSecret);
+    databaseLogger.success(
+      "OIDC system secret auto-generated and saved to .env",
+      {
+        operation: "oidc_system_secret_auto_generated",
+        envVarName: "OIDC_SYSTEM_SECRET",
+        note: "Used to derive encryption keys for OIDC-only users",
+      },
+    );
   }
 
   private async generateAndGuideUser(): Promise<void> {

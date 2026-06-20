@@ -43,6 +43,12 @@ function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
 }
 
+// Precomputed bcrypt hash of a value that will never match real input. Used to
+// equalize timing on user-not-found login paths so attackers cannot enumerate
+// valid usernames by measuring response latency.
+const ACCOUNT_ENUMERATION_DUMMY_HASH =
+  "$2b$10$CwTycUXWue0Thq9StjUM0uJ8nB2WnYIcz4t0wTpY6mYsmGZJ0R9oW";
+
 function isNativeAppRequest(req: Request): boolean {
   return (
     (req.get("User-Agent") || "").startsWith("Termix-Mobile/") ||
@@ -599,7 +605,15 @@ router.get("/oidc/authorize", async (req, res) => {
     const referer = req.get("Referer");
     let frontendOrigin;
     if (desktopCallbackPort) {
-      frontendOrigin = `http://127.0.0.1:${desktopCallbackPort}/oidc-callback`;
+      const portStr = String(desktopCallbackPort);
+      if (!/^\d{1,5}$/.test(portStr)) {
+        return res.status(400).json({ error: "Invalid desktop callback port" });
+      }
+      const portNum = parseInt(portStr, 10);
+      if (portNum < 1 || portNum > 65535) {
+        return res.status(400).json({ error: "Invalid desktop callback port" });
+      }
+      frontendOrigin = `http://127.0.0.1:${portNum}/oidc-callback`;
     } else if (typeof appCallbackUrl === "string" && appCallbackUrl) {
       let callbackUrl: URL;
       try {
@@ -612,8 +626,29 @@ router.get("/oidc/authorize", async (req, res) => {
       }
       frontendOrigin = callbackUrl.toString();
     } else if (referer) {
-      const refererUrl = new URL(referer);
-      frontendOrigin = `${refererUrl.protocol}//${refererUrl.host}`;
+      // Restrict the post-OIDC redirect target to either the request's own
+      // origin or an explicit allowlist (CORS_ALLOWED_ORIGINS). Without this,
+      // a Referer header from an attacker-controlled page could trick the
+      // backend into delivering the freshly-minted JWT to a third-party
+      // origin via the success redirect.
+      let refererUrl: URL;
+      try {
+        refererUrl = new URL(referer);
+      } catch {
+        return res.status(400).json({ error: "Invalid Referer" });
+      }
+      const refererOrigin = `${refererUrl.protocol}//${refererUrl.host}`;
+      const allowedOrigins = new Set<string>([origin]);
+      const envOrigins = (process.env.CORS_ALLOWED_ORIGINS || "")
+        .split(",")
+        .map((o) => o.trim())
+        .filter((o) => o && o !== "*");
+      for (const o of envOrigins) allowedOrigins.add(o);
+      if (allowedOrigins.has(refererOrigin)) {
+        frontendOrigin = refererOrigin;
+      } else {
+        frontendOrigin = origin;
+      }
     } else {
       frontendOrigin = origin;
     }
@@ -1528,6 +1563,14 @@ router.post("/login", async (req, res) => {
       .where(eq(users.username, username));
 
     if (!user || user.length === 0) {
+      // Equalize bcrypt timing with the user-found path so that response
+      // latency does not reveal whether an account exists.
+      try {
+        await bcrypt.compare(password, ACCOUNT_ENUMERATION_DUMMY_HASH);
+      } catch {
+        // bcrypt comparisons against the dummy never throw in practice, but
+        // even if they did we still want a constant-time-looking failure.
+      }
       loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn(`Login failed: user not found`, {
         operation: "user_login",
