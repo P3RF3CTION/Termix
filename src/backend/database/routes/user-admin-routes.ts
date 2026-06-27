@@ -481,7 +481,7 @@ export function registerUserAdminRoutes(
         return res.status(409).json({ error: "Username already exists" });
       }
 
-      const password_hash = await bcrypt.hash(password, 10);
+      const password_hash = await bcrypt.hash(password, 12);
       const id = nanoid();
 
       db.$client.transaction(() => {

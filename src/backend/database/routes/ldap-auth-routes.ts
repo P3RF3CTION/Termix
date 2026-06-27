@@ -25,9 +25,24 @@ function createLDAPClient(
   useTLS: boolean,
 ): ldap.Client {
   const url = `${useTLS ? "ldaps" : "ldap"}://${host}:${port}`;
+  // Default to validating LDAPS certificates. Operators can explicitly opt out
+  // via LDAP_TLS_REJECT_UNAUTHORIZED=false for self-signed test environments,
+  // but production deployments must keep validation enabled to prevent MITM.
+  const rejectUnauthorized =
+    process.env.LDAP_TLS_REJECT_UNAUTHORIZED !== "false";
+  if (useTLS && !rejectUnauthorized) {
+    authLogger.warn(
+      "LDAP TLS certificate verification is disabled via LDAP_TLS_REJECT_UNAUTHORIZED=false",
+      {
+        operation: "ldap_tls_insecure",
+        host,
+        port,
+      },
+    );
+  }
   return ldap.createClient({
     url,
-    tlsOptions: useTLS ? { rejectUnauthorized: false } : undefined,
+    tlsOptions: useTLS ? { rejectUnauthorized } : undefined,
   });
 }
 

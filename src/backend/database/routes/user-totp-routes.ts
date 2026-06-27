@@ -1,9 +1,15 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
 import { and, eq, ne } from "drizzle-orm";
+import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import QRCode from "qrcode";
 import speakeasy from "speakeasy";
+
+function generateBackupCode(): string {
+  // 5 bytes -> 10 hex chars; 2^40 ≈ 1.1 trillion combinations per code.
+  return crypto.randomBytes(5).toString("hex").toUpperCase();
+}
 import { AuthManager } from "../../utils/auth-manager.js";
 import { FieldCrypto } from "../../utils/field-crypto.js";
 import { LazyFieldEncryption } from "../../utils/lazy-field-encryption.js";
@@ -253,9 +259,7 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = Array.from({ length: 8 }, () => generateBackupCode());
 
       const backupCodesJson = JSON.stringify(backupCodes);
       const storedBackupCodes = userDataKey
@@ -460,9 +464,7 @@ export function registerUserTotpRoutes(
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = Array.from({ length: 8 }, () => generateBackupCode());
 
       const backupCodesJson = JSON.stringify(backupCodes);
       const storedBackupCodes = userDataKey

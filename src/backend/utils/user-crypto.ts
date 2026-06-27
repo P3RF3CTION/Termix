@@ -3,6 +3,7 @@ import { getDb } from "../database/db/index.js";
 import { settings } from "../database/db/schema.js";
 import { eq } from "drizzle-orm";
 import { databaseLogger } from "./logger.js";
+import { SystemCrypto } from "./system-crypto.js";
 
 interface KEKSalt {
   salt: string;
@@ -501,8 +502,7 @@ class UserCrypto {
   }
 
   private deriveOIDCSystemKey(userId: string): Buffer {
-    const systemSecret =
-      process.env.OIDC_SYSTEM_SECRET || "termix-oidc-system-secret-default";
+    const systemSecret = SystemCrypto.getInstance().getOIDCSystemSecretSync();
     const salt = Buffer.from(userId, "utf8");
     return crypto.pbkdf2Sync(
       systemSecret,

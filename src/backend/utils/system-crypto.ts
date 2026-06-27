@@ -10,6 +10,7 @@ class SystemCrypto {
   private encryptionKey: Buffer | null = null;
   private internalAuthToken: string | null = null;
   private credentialSharingKey: Buffer | null = null;
+  private oidcSystemSecret: string | null = null;
 
   private constructor() {}
 
@@ -240,6 +241,75 @@ class SystemCrypto {
       await this.initializeCredentialSharingKey();
     }
     return this.credentialSharingKey!;
+  }
+
+  async initializeOIDCSystemSecret(): Promise<void> {
+    try {
+      const envSecret = process.env.OIDC_SYSTEM_SECRET;
+      if (envSecret && envSecret.length >= 32) {
+        this.oidcSystemSecret = envSecret;
+        return;
+      }
+
+      const dataDir = process.env.DATA_DIR || "./db/data";
+      const envPath = path.join(dataDir, ".env");
+
+      try {
+        const envContent = await fs.readFile(envPath, "utf8");
+        const match = envContent.match(/^OIDC_SYSTEM_SECRET=(.+)$/m);
+        if (match && match[1] && match[1].length >= 32) {
+          this.oidcSystemSecret = match[1];
+          process.env.OIDC_SYSTEM_SECRET = match[1];
+          return;
+        }
+      } catch {
+        // expected - env file may not exist
+      }
+
+      await this.generateAndGuideOIDCSystemSecret();
+    } catch (error) {
+      databaseLogger.error("Failed to initialize OIDC system secret", error, {
+        operation: "oidc_system_secret_init_failed",
+      });
+      throw new Error("OIDC system secret initialization failed", {
+        cause: error,
+      });
+    }
+  }
+
+  async getOIDCSystemSecret(): Promise<string> {
+    if (!this.oidcSystemSecret) {
+      await this.initializeOIDCSystemSecret();
+    }
+    return this.oidcSystemSecret!;
+  }
+
+  getOIDCSystemSecretSync(): string {
+    if (!this.oidcSystemSecret) {
+      throw new Error(
+        "OIDC system secret accessed before initialization. Call initializeOIDCSystemSecret() at startup.",
+      );
+    }
+    return this.oidcSystemSecret;
+  }
+
+  private async generateAndGuideOIDCSystemSecret(): Promise<void> {
+    const newSecret = crypto.randomBytes(32).toString("hex");
+    const instanceId = crypto.randomBytes(8).toString("hex");
+
+    this.oidcSystemSecret = newSecret;
+
+    await this.updateEnvFile("OIDC_SYSTEM_SECRET", newSecret);
+
+    databaseLogger.success(
+      "OIDC system secret auto-generated and saved to .env",
+      {
+        operation: "oidc_system_secret_auto_generated",
+        instanceId,
+        envVarName: "OIDC_SYSTEM_SECRET",
+        note: "Used to derive OIDC user data keys - no restart required",
+      },
+    );
   }
 
   private async generateAndGuideUser(): Promise<void> {

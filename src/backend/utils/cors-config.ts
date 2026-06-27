@@ -53,8 +53,10 @@ export function createCorsMiddleware(
           return callback(null, true);
 
         const configured = getAllowedOrigins();
-        if (configured.includes("*") || configured.includes(origin))
-          return callback(null, true);
+        // Wildcard "*" is intentionally NOT supported because this CORS handler
+        // sets `credentials: true`; the combination is unsafe (and rejected by
+        // modern browsers). Operators must list each origin explicitly.
+        if (configured.includes(origin)) return callback(null, true);
 
         const sameOrigin = getRequestOrigin(req);
         if (origin === sameOrigin) return callback(null, true);

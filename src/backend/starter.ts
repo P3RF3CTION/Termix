@@ -100,6 +100,7 @@ import {
     await systemCrypto.initializeDatabaseKey();
     await systemCrypto.initializeEncryptionKey();
     await systemCrypto.initializeInternalAuthToken();
+    await systemCrypto.initializeOIDCSystemSecret();
 
     await AutoSSLSetup.initialize();
     systemLogger.success("SSL setup completed", {
