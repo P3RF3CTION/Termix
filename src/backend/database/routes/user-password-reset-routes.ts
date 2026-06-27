@@ -28,6 +28,22 @@ function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
 }
 
+function constantTimeEquals(expected: string, actual: string): boolean {
+  if (typeof expected !== "string" || typeof actual !== "string") return false;
+  const expectedBuf = Buffer.from(expected, "utf8");
+  const actualBuf = Buffer.from(actual, "utf8");
+  // Pad the shorter buffer so timingSafeEqual doesn't throw on mismatched
+  // lengths; combine with an explicit length check so unequal-length inputs
+  // never compare equal.
+  const len = Math.max(expectedBuf.length, actualBuf.length);
+  const a = Buffer.alloc(len);
+  const b = Buffer.alloc(len);
+  expectedBuf.copy(a);
+  actualBuf.copy(b);
+  const equalLength = expectedBuf.length === actualBuf.length;
+  return crypto.timingSafeEqual(a, b) && equalLength;
+}
+
 export function registerUserPasswordResetRoutes(
   router: Router,
   { authManager }: UserPasswordResetRoutesDeps,
@@ -116,7 +132,11 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      const resetCode = crypto.randomInt(100000, 1000000).toString();
+      // 8-digit numeric code (~100M space) keeps the code human-readable for
+      // out-of-band relay while widening the brute-force search space.
+      // Rate limiting plus the constant-time comparison below provide the
+      // primary defenses.
+      const resetCode = crypto.randomInt(10000000, 100000000).toString();
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
       db.$client
@@ -239,7 +259,7 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      if (!constantTimeEquals(String(resetData.code), String(resetCode))) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -340,7 +360,9 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      if (
+        !constantTimeEquals(String(tempTokenData.token), String(tempToken))
+      ) {
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 
@@ -353,7 +375,7 @@ export function registerUserPasswordResetRoutes(
       }
       const userId = user[0].id;
 
-      const password_hash = await bcrypt.hash(newPassword, 10);
+      const password_hash = await bcrypt.hash(newPassword, 12);
 
       let userIdFromJwt: string | null = null;
       const cookie = req.cookies?.jwt;

@@ -352,6 +352,7 @@ class AuthManager {
 
       const token = jwt.sign(payload, jwtSecret, {
         expiresIn,
+        algorithm: "HS256",
       } as jwt.SignOptions);
 
       const expirationMs = this.parseExpiresIn(expiresIn);
@@ -397,7 +398,10 @@ class AuthManager {
     }
 
     await this.addWrappedDataKey(payload);
-    return jwt.sign(payload, jwtSecret, { expiresIn } as jwt.SignOptions);
+    return jwt.sign(payload, jwtSecret, {
+      expiresIn,
+      algorithm: "HS256",
+    } as jwt.SignOptions);
   }
 
   private parseExpiresIn(expiresIn: string): number {
@@ -425,7 +429,9 @@ class AuthManager {
     try {
       const jwtSecret = await this.systemCrypto.getJWTSecret();
 
-      const payload = jwt.verify(token, jwtSecret) as JWTPayload;
+      const payload = jwt.verify(token, jwtSecret, {
+        algorithms: ["HS256"],
+      }) as JWTPayload;
 
       if (payload.sessionId) {
         try {
@@ -498,6 +504,7 @@ class AuthManager {
 
     const token = jwt.sign(payload, await this.systemCrypto.getJWTSecret(), {
       expiresIn: Math.ceil(maxAge / 1000),
+      algorithm: "HS256",
     } as jwt.SignOptions);
 
     await db
