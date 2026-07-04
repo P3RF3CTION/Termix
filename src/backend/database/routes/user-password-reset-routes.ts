@@ -3,6 +3,13 @@ import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
 import { eq } from "drizzle-orm";
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
 import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
@@ -93,6 +100,20 @@ export function registerUserPasswordResetRoutes(
       return res.status(400).json({ error: "Username is required" });
     }
 
+    // Rate-limit reset initiation per IP + username. Without this, an
+    // attacker can loop, silently overwriting the pending reset code and
+    // amplifying log volume for username enumeration.
+    const ip = String(req.ip || req.socket?.remoteAddress || "");
+    const lockStatus = loginRateLimiter.isLocked(ip, username);
+    if (lockStatus.locked) {
+      return res.status(429).json({
+        error: `Too many password reset attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
+        remainingTime: lockStatus.remainingTime,
+        code: "RESET_INITIATE_RATE_LIMITED",
+      });
+    }
+    loginRateLimiter.recordFailedAttempt(ip, username);
+
     try {
       const user = await db
         .select()
@@ -129,8 +150,18 @@ export function registerUserPasswordResetRoutes(
           }),
         );
 
+      // NOTE: The reset code is deliberately not written to the log to avoid
+      // leaking a plaintext account-recovery secret to anyone with log access
+      // (SRE, log aggregators, misconfigured stdout redirects). It is still
+      // stored in the settings table so it can be retrieved manually by an
+      // admin via a controlled path if needed.
       authLogger.info(
-        `Password reset code generated for user ${username}: ${resetCode} (expires at ${expiresAt.toLocaleString()})`,
+        `Password reset code generated for user ${username} (expires at ${expiresAt.toLocaleString()})`,
+        {
+          operation: "password_reset_code_generated",
+          username,
+          expiresAt: expiresAt.toISOString(),
+        },
       );
 
       res.json({
@@ -239,7 +270,7 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      if (!timingSafeStringEqual(String(resetData.code), String(resetCode))) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -340,7 +371,9 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      if (
+        !timingSafeStringEqual(String(tempTokenData.token), String(tempToken))
+      ) {
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 
@@ -349,11 +382,13 @@ export function registerUserPasswordResetRoutes(
         .from(users)
         .where(eq(users.username, username));
       if (!user || user.length === 0) {
-        return res.status(404).json({ error: "User not found" });
+        // Same response as an invalid temp token to avoid confirming account
+        // existence to callers who guessed a valid temp token.
+        return res.status(400).json({ error: "Invalid temporary token" });
       }
       const userId = user[0].id;
 
-      const password_hash = await bcrypt.hash(newPassword, 10);
+      const password_hash = await bcrypt.hash(newPassword, 12);
 
       let userIdFromJwt: string | null = null;
       const cookie = req.cookies?.jwt;

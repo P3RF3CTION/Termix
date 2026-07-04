@@ -1,5 +1,5 @@
 import type { Client } from "ssh2";
-import { execCommand } from "../widgets/common-utils.js";
+import { execCommand, execCommandWithStdin } from "../widgets/common-utils.js";
 
 export type ElevationErrorCode = "SUDO_REQUIRED" | "SUDO_FAILED" | "NOT_SUDOER";
 
@@ -66,20 +66,18 @@ export function shellSingleQuote(value: string): string {
 
 /**
  * Build the elevated command string:
- *   echo '<pw>' | sudo -S -p '' sh -c 'echo __TX_SUDO_OK__; <command>'
+ *   sudo -S -p '' sh -c 'echo __TX_SUDO_OK__; <command>'
  *
+ * The sudo password is fed on stdin (see {@link execCommandWithStdin}) so it
+ * never appears in the target host's argv / process list / audit trail.
  * `-p ''` suppresses the prompt. stderr is NOT merged into stdout, so the
  * command's own output stays clean and sudo's auth errors stay on stderr. The
- * marker is echoed by the inner shell once sudo authenticates, letting us tell a
- * genuine auth failure from command output that merely contains scary words.
+ * marker is echoed by the inner shell once sudo authenticates, letting us tell
+ * a genuine auth failure from command output that merely contains scary words.
  */
-export function buildSudoCommand(
-  command: string,
-  sudoPassword: string,
-): string {
-  const pw = shellSingleQuote(sudoPassword);
+export function buildSudoCommand(command: string): string {
   const inner = shellSingleQuote(`echo ${SUDO_OK_MARKER}; ${command}`);
-  return `echo ${pw} | sudo -S -p '' sh -c ${inner}`;
+  return `sudo -S -p '' sh -c ${inner}`;
 }
 
 function includesAny(text: string, needles: string[]): boolean {
@@ -132,8 +130,13 @@ export async function execElevated(
     );
   }
 
-  const sudoCmd = buildSudoCommand(command, sudoPassword as string);
-  const result = await execCommand(client, sudoCmd, timeoutMs);
+  const sudoCmd = buildSudoCommand(command);
+  const result = await execCommandWithStdin(
+    client,
+    sudoCmd,
+    `${sudoPassword as string}\n`,
+    timeoutMs,
+  );
   const authenticated = result.stdout.includes(SUDO_OK_MARKER);
 
   if (!authenticated) {

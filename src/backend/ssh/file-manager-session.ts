@@ -78,13 +78,27 @@ export function execWithSudoBuffer(
   sudoPassword: string,
 ): Promise<{ stdout: Buffer; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    const escapedPassword = sudoPassword.replace(/'/g, "'\"'\"'");
-    const sudoCommand = `echo '${escapedPassword}' | sudo -S ${command} 2>&1`;
+    // Pipe the sudo password over stdin instead of embedding it in the argv
+    // of an `echo` wrapper. With `echo`, the password shows up in the target
+    // host's process list, in bash history if a shell were logging it, and
+    // in any execve-audit trail. `sudo -S` reads the password from stdin
+    // directly, so we can hand it in without ever putting it on a command
+    // line.
+    const sudoCommand = `sudo -S -p "" ${command} 2>&1`;
 
     execChannel(session, sudoCommand, (err, stream) => {
       if (err) {
         resolve({ stdout: Buffer.alloc(0), stderr: err.message, code: 1 });
         return;
+      }
+
+      // Send the password over stdin exactly once and then close writes.
+      try {
+        stream.write(`${sudoPassword}\n`);
+        stream.end();
+      } catch {
+        // best effort - some ssh2 versions may not expose write on the
+        // exec stream if the channel dropped between exec and write
       }
 
       const stdoutChunks: Buffer[] = [];

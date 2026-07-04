@@ -544,13 +544,23 @@ class SharedCredentialManager {
         recordId.toString(),
         fieldName,
       );
-    } catch {
-      databaseLogger.warn("Field decryption failed, returning as-is", {
-        operation: "decrypt_field",
-        fieldName,
-        recordId,
-      });
-      return encryptedValue;
+    } catch (error) {
+      // Do not silently return the ciphertext blob as if it were plaintext.
+      // A caller that treats this value as a password or SSH key would try
+      // to authenticate with the raw JSON encryption envelope, and the
+      // value could end up in downstream logs. Fail loudly instead.
+      databaseLogger.error(
+        "Field decryption failed - refusing to return ciphertext as plaintext",
+        error,
+        {
+          operation: "decrypt_field_failed",
+          fieldName,
+          recordId,
+        },
+      );
+      throw new Error(
+        `Failed to decrypt ${fieldName} for record ${recordId}`,
+      );
     }
   }
 

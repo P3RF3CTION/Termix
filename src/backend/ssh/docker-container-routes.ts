@@ -9,6 +9,7 @@ type DockerSession = {
   activeOperations: number;
   hostId?: number;
   isWindows?: boolean;
+  userId?: string;
 };
 
 type PendingDockerTotpSession = unknown;
@@ -29,6 +30,19 @@ type DockerContainerRoutesDeps = {
   dockerTimestampPattern: RegExp;
 };
 
+// Docker container names/IDs must match a conservative subset of what
+// Docker itself accepts. Anything else (a semicolon, shell metachar, path
+// separator, whitespace) would let a URL-supplied `containerId` inject shell
+// syntax when interpolated into `docker <verb> ${containerId}` and executed
+// via `executeDockerCommand` on the remote host.
+const VALID_CONTAINER_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+function isValidContainerId(containerId: string): boolean {
+  return (
+    typeof containerId === "string" && VALID_CONTAINER_ID.test(containerId)
+  );
+}
+
 export function registerDockerContainerRoutes(
   app: express.Express,
   {
@@ -39,6 +53,27 @@ export function registerDockerContainerRoutes(
     dockerTimestampPattern: DOCKER_TIMESTAMP_RE,
   }: DockerContainerRoutesDeps,
 ): void {
+  app.param("containerId", (req, res, next, value: unknown) => {
+    if (!isValidContainerId(String(value))) {
+      return res.status(400).json({
+        error: "Invalid container id",
+        code: "INVALID_CONTAINER_ID",
+      });
+    }
+    next();
+  });
+
+  // Reject cross-tenant session access: only the user who created a docker
+  // SSH session may issue commands against it. Without this, a caller who
+  // learned another user's sessionId (URL leak, log, referer) could
+  // manipulate containers on hosts they do not own.
+  const enforceSessionOwnership = (
+    session: DockerSession,
+    userId: string,
+  ): boolean => {
+    const owner = (session as DockerSession & { userId?: string }).userId;
+    return !owner || owner === userId;
+  };
   /**
    * @openapi
    * /docker/containers/{sessionId}:
@@ -87,6 +122,10 @@ export function registerDockerContainerRoutes(
       return res.status(400).json({
         error: "SSH session not found or not connected",
       });
+    }
+
+    if (!enforceSessionOwnership(session, userId)) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     session.lastActive = Date.now();
@@ -186,6 +225,10 @@ export function registerDockerContainerRoutes(
       });
     }
 
+    if (!enforceSessionOwnership(session, userId)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
     session.lastActive = Date.now();
     session.activeOperations++;
 
@@ -279,6 +322,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -381,6 +428,10 @@ export function registerDockerContainerRoutes(
         });
       }
 
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
       session.lastActive = Date.now();
       session.activeOperations++;
 
@@ -479,6 +530,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -581,6 +636,10 @@ export function registerDockerContainerRoutes(
         });
       }
 
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
       session.lastActive = Date.now();
       session.activeOperations++;
 
@@ -679,6 +738,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -784,6 +847,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -916,6 +983,10 @@ export function registerDockerContainerRoutes(
         });
       }
 
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
       session.lastActive = Date.now();
       session.activeOperations++;
 
@@ -1026,6 +1097,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!enforceSessionOwnership(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();

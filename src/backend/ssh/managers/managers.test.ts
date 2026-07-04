@@ -44,16 +44,22 @@ describe("exec-elevated", () => {
     expect(shellSingleQuote("abc")).toBe("'abc'");
     expect(shellSingleQuote("a'b")).toBe(`'a'"'"'b'`);
   });
-  it("builds the sudo -S pipeline wrapping the command in sh -c with a success marker", () => {
-    expect(buildSudoCommand("systemctl restart nginx", "pw")).toBe(
-      `echo 'pw' | sudo -S -p '' sh -c 'echo __TX_SUDO_OK__; systemctl restart nginx'`,
+  it("builds the sudo -S command wrapping the command in sh -c with a success marker", () => {
+    expect(buildSudoCommand("systemctl restart nginx")).toBe(
+      `sudo -S -p '' sh -c 'echo __TX_SUDO_OK__; systemctl restart nginx'`,
     );
   });
-  it("does not merge stderr into stdout (no 2>&1)", () => {
-    expect(buildSudoCommand("id", "pw")).not.toContain("2>&1");
+  it("does not embed a password pipe in argv (fed via stdin instead)", () => {
+    // The command must not include a shell pipe that would embed the
+    // password; the caller pipes it into stdin via execCommandWithStdin.
+    // Only the harmless `echo __TX_SUDO_OK__;` marker line remains.
+    const cmd = buildSudoCommand("id");
+    expect(cmd).not.toContain("|");
+    expect(cmd).toContain("sudo -S -p ''");
+    expect(cmd).toContain("__TX_SUDO_OK__");
   });
-  it("escapes a password containing a quote", () => {
-    expect(buildSudoCommand("id", "p'w")).toContain(`echo 'p'"'"'w'`);
+  it("does not merge stderr into stdout (no 2>&1)", () => {
+    expect(buildSudoCommand("id")).not.toContain("2>&1");
   });
 });
 

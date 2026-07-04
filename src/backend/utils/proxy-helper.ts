@@ -5,18 +5,44 @@ import dns from "dns/promises";
 import { sshLogger } from "./logger.js";
 import type { ProxyNode } from "../../types/index.js";
 
-function isBlockedAddress(ip: string): boolean {
-  if (ip === "0.0.0.0" || ip === "::1" || ip === "::") return true;
-
+function isBlockedIPv4(ip: string): boolean {
   const parts = ip.split(".").map(Number);
-  if (parts.length !== 4) return false;
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return false;
 
+  if (ip === "0.0.0.0") return true;
   if (parts[0] === 127) return true;
   if (parts[0] === 10) return true;
   if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
   if (parts[0] === 192 && parts[1] === 168) return true;
   if (parts[0] === 169 && parts[1] === 254) return true;
+  if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true; // CGNAT
+  if (parts[0] >= 224) return true; // multicast / reserved
 
+  return false;
+}
+
+function isBlockedIPv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  if (lower === "::" || lower === "::1") return true;
+  // Loopback and unspecified in expanded form
+  if (lower.startsWith("::ffff:")) {
+    // IPv4-mapped IPv6 -> apply IPv4 rules
+    const mapped = lower.slice(7);
+    return isBlockedIPv4(mapped);
+  }
+  if (lower.startsWith("fe80:")) return true; // link-local
+  const firstByte = parseInt(lower.split(":")[0], 16);
+  if (!Number.isNaN(firstByte)) {
+    if ((firstByte & 0xfe00) === 0xfc00) return true; // unique-local fc00::/7
+    if ((firstByte & 0xff00) === 0xff00) return true; // multicast ff00::/8
+  }
+  return false;
+}
+
+function isBlockedAddress(ip: string): boolean {
+  const family = net.isIP(ip);
+  if (family === 4) return isBlockedIPv4(ip);
+  if (family === 6) return isBlockedIPv6(ip);
   return false;
 }
 
@@ -28,9 +54,13 @@ async function validateHost(host: string): Promise<void> {
     return;
   }
 
-  const { address } = await dns.lookup(host);
-  if (isBlockedAddress(address)) {
-    throw new Error("Proxy target address is not allowed");
+  // Resolve both A and AAAA so we cannot be tricked into contacting a
+  // blocked destination via a dual-stack DNS response.
+  const results = await dns.lookup(host, { all: true });
+  for (const entry of results) {
+    if (isBlockedAddress(entry.address)) {
+      throw new Error("Proxy target address is not allowed");
+    }
   }
 }
 

@@ -14,15 +14,6 @@ function getAllowedOrigins(): string[] {
     .filter(Boolean);
 }
 
-function isLocalRequest(req: Request): boolean {
-  const remoteAddr = req.socket?.remoteAddress || req.ip || "";
-  return (
-    remoteAddr === "127.0.0.1" ||
-    remoteAddr === "::1" ||
-    remoteAddr === "::ffff:127.0.0.1"
-  );
-}
-
 export function createCorsMiddleware(
   methods: string[] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   extraHeaders: string[] = [],
@@ -45,16 +36,25 @@ export function createCorsMiddleware(
         // No origin = same-origin or non-browser request (curl, internal service calls)
         if (!origin) return callback(null, true);
 
-        // Requests coming from localhost (nginx proxy, internal service calls)
-        if (isLocalRequest(req)) return callback(null, true);
-
         if (DEV_ORIGINS.includes(origin)) return callback(null, true);
         if (origin.startsWith(ELECTRON_FILE_ORIGIN))
           return callback(null, true);
 
         const configured = getAllowedOrigins();
-        if (configured.includes("*") || configured.includes(origin))
-          return callback(null, true);
+        // Never combine wildcard with credentials - the spec forbids it and
+        // most browsers reject the response anyway. If an operator sets "*"
+        // we allow the specific origin explicitly instead.
+        if (configured.includes(origin)) return callback(null, true);
+        if (configured.includes("*")) {
+          // Reflect only when the operator has explicitly opted in via
+          // CORS_ALLOW_ANY_ORIGIN=true. This makes the security tradeoff
+          // deliberate rather than implicit.
+          if (
+            (process.env.CORS_ALLOW_ANY_ORIGIN || "").toLowerCase() === "true"
+          ) {
+            return callback(null, true);
+          }
+        }
 
         const sameOrigin = getRequestOrigin(req);
         if (origin === sameOrigin) return callback(null, true);

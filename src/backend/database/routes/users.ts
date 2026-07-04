@@ -166,7 +166,7 @@ router.post("/create", async (req, res) => {
       return res.status(409).json({ error: "Username already exists" });
     }
 
-    const password_hash = await bcrypt.hash(password, 10);
+    const password_hash = await bcrypt.hash(password, 12);
     const id = nanoid();
 
     const isFirstUser = db.$client.transaction(() => {
@@ -1082,24 +1082,36 @@ router.get("/oidc/callback", async (req, res) => {
 
     if (tokenData.id_token) {
       try {
-        userInfo = await verifyOIDCToken(
+        const verifiedPayload = await verifyOIDCToken(
           tokenData.id_token as string,
           config.issuer_url,
           config.client_id,
           caCert,
         );
-      } catch {
-        try {
-          const parts = (tokenData.id_token as string).split(".");
-          if (parts.length === 3) {
-            const payload = JSON.parse(
-              Buffer.from(parts[1], "base64").toString(),
-            );
-            userInfo = payload;
-          }
-        } catch (decodeError) {
-          authLogger.error("Failed to decode ID token payload:", decodeError);
+
+        const storedNonceValue = (storedNonce as Record<string, unknown>)
+          .value as string | undefined;
+        if (
+          storedNonceValue &&
+          verifiedPayload.nonce &&
+          verifiedPayload.nonce !== storedNonceValue
+        ) {
+          authLogger.error("OIDC id_token nonce mismatch", {
+            operation: "oidc_nonce_mismatch",
+          });
+          return res
+            .status(400)
+            .json({ error: "OIDC nonce verification failed" });
         }
+
+        userInfo = verifiedPayload;
+      } catch (verifyError) {
+        authLogger.error("OIDC id_token verification failed", verifyError, {
+          operation: "oidc_id_token_verify_failed",
+        });
+        return res
+          .status(401)
+          .json({ error: "OIDC id_token verification failed" });
       }
     }
 
@@ -1588,9 +1600,12 @@ router.post("/login", async (req, res) => {
         username,
         userId: userRecord.id,
       });
+      // Match the "unknown user" and "wrong password" response to avoid
+      // leaking which usernames are OIDC-only vs unknown vs bad-password.
+      loginRateLimiter.recordFailedAttempt(clientIp, username);
       return res
-        .status(403)
-        .json({ error: "This user uses external authentication" });
+        .status(401)
+        .json({ error: "Invalid username or password" });
     }
 
     const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
@@ -2480,7 +2495,7 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Failed to update password and re-encrypt data." });
   }
 
-  const password_hash = await bcrypt.hash(newPassword, 10);
+  const password_hash = await bcrypt.hash(newPassword, 12);
   await db
     .update(users)
     .set({ passwordHash: password_hash })

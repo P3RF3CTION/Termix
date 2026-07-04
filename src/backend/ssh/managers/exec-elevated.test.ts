@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const execCommand = vi.fn();
+const execCommandWithStdin = vi.fn();
 vi.mock("../widgets/common-utils.js", () => ({
   execCommand: (...args: unknown[]) => execCommand(...args),
+  execCommandWithStdin: (...args: unknown[]) =>
+    execCommandWithStdin(...args),
 }));
 
 import { execElevated, ElevationError } from "./exec-elevated.js";
@@ -16,6 +19,7 @@ function result(stdout: string, stderr = "", code: number | null = 0) {
 
 beforeEach(() => {
   execCommand.mockReset();
+  execCommandWithStdin.mockReset();
 });
 
 describe("execElevated (no force)", () => {
@@ -39,13 +43,20 @@ describe("execElevated (no force)", () => {
   });
 
   it("escalates when stderr indicates a permission problem", async () => {
-    execCommand
-      .mockResolvedValueOnce(result("", "Permission denied", 1))
-      .mockResolvedValueOnce(result("__TX_SUDO_OK__\nelevated output", "", 0));
+    execCommand.mockResolvedValueOnce(result("", "Permission denied", 1));
+    execCommandWithStdin.mockResolvedValueOnce(
+      result("__TX_SUDO_OK__\nelevated output", "", 0),
+    );
     const r = await execElevated(fakeClient, "cat /etc/shadow", "pw");
     expect(r.usedSudo).toBe(true);
     expect(r.stdout).toBe("elevated output");
-    expect(execCommand).toHaveBeenCalledTimes(2);
+    expect(execCommand).toHaveBeenCalledTimes(1);
+    expect(execCommandWithStdin).toHaveBeenCalledTimes(1);
+    // Password must be sent on stdin, not embedded in argv
+    const stdin = execCommandWithStdin.mock.calls[0][2];
+    expect(stdin).toBe("pw\n");
+    const cmdArg = execCommandWithStdin.mock.calls[0][1];
+    expect(cmdArg).not.toContain("pw");
   });
 
   it("throws SUDO_REQUIRED when elevation is needed but no password is set", async () => {
@@ -58,7 +69,7 @@ describe("execElevated (no force)", () => {
 
 describe("execElevated (forced)", () => {
   it("strips the success marker from stdout", async () => {
-    execCommand.mockResolvedValueOnce(
+    execCommandWithStdin.mockResolvedValueOnce(
       result("__TX_SUDO_OK__\nthe real output\n", "", 0),
     );
     const r = await execElevated(fakeClient, "id", "pw", { forceSudo: true });
@@ -67,7 +78,7 @@ describe("execElevated (forced)", () => {
   });
 
   it("does NOT throw when command output contains 'incorrect password' but sudo authenticated", async () => {
-    execCommand.mockResolvedValueOnce(
+    execCommandWithStdin.mockResolvedValueOnce(
       result(
         "__TX_SUDO_OK__\nUser entered an incorrect password earlier",
         "",
@@ -82,7 +93,7 @@ describe("execElevated (forced)", () => {
   });
 
   it("throws SUDO_FAILED on a real wrong-password (no marker, sudo stderr)", async () => {
-    execCommand.mockResolvedValueOnce(
+    execCommandWithStdin.mockResolvedValueOnce(
       result("", "sudo: 1 incorrect password attempt", 1),
     );
     await expect(
@@ -91,7 +102,7 @@ describe("execElevated (forced)", () => {
   });
 
   it("throws NOT_SUDOER when the user is not in sudoers", async () => {
-    execCommand.mockResolvedValueOnce(
+    execCommandWithStdin.mockResolvedValueOnce(
       result("", "deploy is not in the sudoers file.", 1),
     );
     await expect(
@@ -104,5 +115,6 @@ describe("execElevated (forced)", () => {
       execElevated(fakeClient, "id", undefined, { forceSudo: true }),
     ).rejects.toBeInstanceOf(ElevationError);
     expect(execCommand).not.toHaveBeenCalled();
+    expect(execCommandWithStdin).not.toHaveBeenCalled();
   });
 });

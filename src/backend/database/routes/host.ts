@@ -44,7 +44,16 @@ import { logAudit, getRequestMeta } from "../../utils/audit-logger.js";
 
 const router = express.Router();
 
-const upload = multer({ storage: multer.memoryStorage() });
+// SSH private keys fit comfortably in a few kilobytes. Cap the upload so a
+// malicious client cannot exhaust server memory by streaming a huge "key".
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 512 * 1024,
+    files: 1,
+    fields: 100,
+  },
+});
 
 const STATS_SERVER_URL = "http://localhost:30005";
 

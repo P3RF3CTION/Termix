@@ -10,6 +10,7 @@ class SystemCrypto {
   private encryptionKey: Buffer | null = null;
   private internalAuthToken: string | null = null;
   private credentialSharingKey: Buffer | null = null;
+  private oidcSystemSecret: string | null = null;
 
   private constructor() {}
 
@@ -40,7 +41,6 @@ class SystemCrypto {
           databaseLogger.success("JWT secret loaded from .env file", {
             operation: "jwt_init_from_file_success",
             secretLength: jwtMatch[1].length,
-            secretPrefix: jwtMatch[1].substring(0, 8) + "...",
           });
           return;
         } else {
@@ -242,6 +242,56 @@ class SystemCrypto {
     return this.credentialSharingKey!;
   }
 
+  async initializeOIDCSystemSecret(): Promise<void> {
+    try {
+      const envSecret = process.env.OIDC_SYSTEM_SECRET;
+      if (envSecret && envSecret.length >= 32) {
+        this.oidcSystemSecret = envSecret;
+        return;
+      }
+
+      const dataDir = process.env.DATA_DIR || "./db/data";
+      const envPath = path.join(dataDir, ".env");
+
+      try {
+        const envContent = await fs.readFile(envPath, "utf8");
+        const secretMatch = envContent.match(/^OIDC_SYSTEM_SECRET=(.+)$/m);
+        if (secretMatch && secretMatch[1] && secretMatch[1].length >= 32) {
+          this.oidcSystemSecret = secretMatch[1];
+          process.env.OIDC_SYSTEM_SECRET = secretMatch[1];
+          return;
+        }
+      } catch {
+        // expected - env file may not exist
+      }
+
+      const newSecret = crypto.randomBytes(32).toString("hex");
+      this.oidcSystemSecret = newSecret;
+      await this.updateEnvFile("OIDC_SYSTEM_SECRET", newSecret);
+      databaseLogger.success(
+        "OIDC system secret auto-generated and saved to .env",
+        {
+          operation: "oidc_system_secret_auto_generated",
+          envVarName: "OIDC_SYSTEM_SECRET",
+        },
+      );
+    } catch (error) {
+      databaseLogger.error("Failed to initialize OIDC system secret", error, {
+        operation: "oidc_system_secret_init_failed",
+      });
+      throw new Error("OIDC system secret initialization failed", {
+        cause: error,
+      });
+    }
+  }
+
+  async getOIDCSystemSecret(): Promise<string> {
+    if (!this.oidcSystemSecret) {
+      await this.initializeOIDCSystemSecret();
+    }
+    return this.oidcSystemSecret!;
+  }
+
   private async generateAndGuideUser(): Promise<void> {
     const newSecret = crypto.randomBytes(32).toString("hex");
     const instanceId = crypto.randomBytes(8).toString("hex");
@@ -376,7 +426,12 @@ class SystemCrypto {
     const envPath = path.join(dataDir, ".env");
 
     try {
-      await fs.mkdir(dataDir, { recursive: true });
+      await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
+      try {
+        await fs.chmod(dataDir, 0o700);
+      } catch {
+        // best effort - dataDir permissions may fail on non-POSIX filesystems
+      }
 
       let envContent = "";
 
@@ -397,7 +452,12 @@ class SystemCrypto {
         envContent += `${key}=${value}\n`;
       }
 
-      await fs.writeFile(envPath, envContent);
+      await fs.writeFile(envPath, envContent, { mode: 0o600 });
+      try {
+        await fs.chmod(envPath, 0o600);
+      } catch {
+        // best effort - some filesystems don't support chmod
+      }
 
       process.env[key] = value;
     } catch (error) {

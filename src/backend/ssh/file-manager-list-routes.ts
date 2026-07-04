@@ -337,14 +337,24 @@ export function registerFileListingRoutes(
     const tryWithSudo = () => {
       try {
         const escapedPath = sshPath.replace(/'/g, "'\"'\"'");
-        const escapedPassword = sshConn.sudoPassword!.replace(/'/g, "'\"'\"'");
-        const sudoCommand = `echo '${escapedPassword}' | sudo -S /bin/ls -la --color=never '${escapedPath}' 2>&1`;
+        // Do not embed the sudo password on the shell command line - it
+        // would show up in `ps` on the remote host and in any audit trail
+        // that captures argv. Feed it via stdin (`sudo -S`) instead.
+        const sudoCommand = `sudo -S -p "" /bin/ls -la --color=never '${escapedPath}' 2>&1`;
+        const sudoPassword = sshConn.sudoPassword!;
 
         execChannel(sshConn, sudoCommand, (err, stream) => {
           if (err) {
             sshConn.activeOperations--;
             fileLogger.error("SSH sudo listFiles error:", err);
             return res.status(500).json({ error: err.message });
+          }
+
+          try {
+            stream.write(`${sudoPassword}\n`);
+            stream.end();
+          } catch {
+            // best effort - see execWithSudoBuffer for context
           }
 
           let data = "";

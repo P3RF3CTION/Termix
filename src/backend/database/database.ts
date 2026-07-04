@@ -60,7 +60,25 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-app.set("trust proxy", true);
+// Only trust X-Forwarded-* headers from known proxies. Trusting arbitrary
+// clients would let attackers spoof `req.ip` (bypass IP-based rate limits)
+// and poison audit logs. Operators can override via TRUST_PROXY env var.
+const trustProxyEnv = (process.env.TRUST_PROXY || "").trim();
+if (trustProxyEnv) {
+  // Numeric hop count is common (e.g. "1" behind a single reverse proxy)
+  const asNum = Number(trustProxyEnv);
+  if (Number.isFinite(asNum) && Number.isInteger(asNum) && asNum >= 0) {
+    app.set("trust proxy", asNum);
+  } else if (trustProxyEnv.toLowerCase() === "true") {
+    app.set("trust proxy", true);
+  } else if (trustProxyEnv.toLowerCase() === "false") {
+    app.set("trust proxy", false);
+  } else {
+    app.set("trust proxy", trustProxyEnv);
+  }
+} else {
+  app.set("trust proxy", ["loopback", "linklocal", "uniquelocal"]);
+}
 
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -74,8 +92,15 @@ const storage = multer.diskStorage({
     cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
+    // Sanitize client-supplied filename: strip path components and any
+    // character outside a conservative allowlist, then bound the length.
+    // This prevents traversal (../..) and creation of files with weird
+    // names that later tools may misinterpret.
+    const rawName = path.basename(file.originalname || "upload");
+    const safeName =
+      rawName.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 100) || "upload";
     const timestamp = Date.now();
-    cb(null, `${timestamp}-${file.originalname}`);
+    cb(null, `${timestamp}-${safeName}`);
   },
 });
 
@@ -83,6 +108,7 @@ const upload = multer({
   storage: storage,
   limits: {
     fileSize: 1024 * 1024 * 1024,
+    files: 1,
   },
   fileFilter: (req, file, cb) => {
     if (
@@ -206,12 +232,38 @@ async function fetchGitHubAPI<T>(
   }
 }
 
-app.use(bodyParser.json({ limit: "1gb" }));
-app.use(bodyParser.urlencoded({ limit: "1gb", extended: true }));
-app.use(bodyParser.raw({ limit: "5gb", type: "application/octet-stream" }));
+// Body-parser limits. Historical values (1GB / 5GB) allowed a single request
+// to exhaust server memory. Cap JSON/urlencoded to a sensible size for API
+// traffic and octet-stream to what real uploads/backups actually need.
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "25mb";
+const URLENCODED_BODY_LIMIT = process.env.URLENCODED_BODY_LIMIT || "25mb";
+const RAW_BODY_LIMIT = process.env.RAW_BODY_LIMIT || "1gb";
+app.use(bodyParser.json({ limit: JSON_BODY_LIMIT }));
+app.use(
+  bodyParser.urlencoded({ limit: URLENCODED_BODY_LIMIT, extended: true }),
+);
+app.use(
+  bodyParser.raw({ limit: RAW_BODY_LIMIT, type: "application/octet-stream" }),
+);
 app.use(cookieParser());
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
+  // Baseline security headers. These are defense-in-depth; the frontend
+  // already runs from the same origin so a strict CSP is safe. Frame-Options
+  // and Referrer-Policy defend against clickjacking and token leakage in
+  // Referer headers.
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  if (process.env.ENABLE_SSL === "true") {
+    res.setHeader(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    );
+  }
   next();
 });
 

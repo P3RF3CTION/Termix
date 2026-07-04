@@ -66,7 +66,14 @@ export class SSHHostKeyVerifier {
     return (hostkey: Buffer, verify: (valid: boolean) => void): void => {
       (async () => {
         try {
-          const fingerprint = hostkey.toString("hex");
+          // Store the SHA-256 hash of the host key rather than the raw key
+          // bytes. This matches what `ssh-keygen -E sha256 -lf` reports and
+          // lets users compare fingerprints visually.
+          const crypto = await import("crypto");
+          const fingerprint = crypto
+            .createHash("sha256")
+            .update(hostkey)
+            .digest("hex");
           const keyType = this.getKeyType(hostkey);
           const algorithm = "sha256";
 
@@ -215,24 +222,49 @@ export class SSHHostKeyVerifier {
           });
 
           if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
+            // A changed jump-host key could indicate an active MITM against
+            // the whole SSH chain. Reject and require explicit user action
+            // through the primary host's terminal to re-approve. Auto-
+            // accepting here would silently trust an attacker in the middle.
+            if (
+              (process.env.SSH_JUMP_HOST_TRUST_ON_CHANGE || "").toLowerCase() ===
+              "true"
+            ) {
+              await this.updateHostKey(
+                hostId,
+                fingerprint,
+                keyType,
+                algorithm,
+                host.hostKeyChangedCount || 0,
+              );
+              sshLogger.warn("Jump host key changed - auto-accepted (opt-in)", {
+                operation: "host_key_updated",
+                hostId,
+                ip,
+                port,
+                fingerprint,
+                keyType,
+                userId,
+                isJumpHost: true,
+              });
+              verify(true);
+              return;
+            }
+            sshLogger.error(
+              "Jump host key changed - refusing to auto-accept",
+              {
+                operation: "host_key_jump_changed_reject",
+                hostId,
+                ip,
+                port,
+                oldFingerprint: host.hostKeyFingerprint,
+                newFingerprint: fingerprint,
+                userId,
+                message:
+                  "SSH jump host key has changed. Please reconnect via the primary host terminal to review the new fingerprint, or set SSH_JUMP_HOST_TRUST_ON_CHANGE=true to preserve the previous behaviour.",
+              },
             );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
+            verify(false);
             return;
           }
 

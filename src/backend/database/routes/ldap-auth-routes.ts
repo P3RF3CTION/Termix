@@ -23,11 +23,25 @@ function createLDAPClient(
   host: string,
   port: number,
   useTLS: boolean,
+  caCert?: string,
 ): ldap.Client {
   const url = `${useTLS ? "ldaps" : "ldap"}://${host}:${port}`;
+  // TLS certificate verification is enabled by default. Operators who need to
+  // trust a private CA can pass a caCert on the provider config, or set
+  // LDAP_INSECURE_TLS=true to explicitly opt into the previous behaviour.
+  // Silently skipping verification would let an attacker on the network
+  // intercept bind credentials.
+  const insecure =
+    (process.env.LDAP_INSECURE_TLS || "").toLowerCase() === "true";
+  const tlsOptions = useTLS
+    ? {
+        rejectUnauthorized: !insecure,
+        ...(caCert ? { ca: caCert } : {}),
+      }
+    : undefined;
   return ldap.createClient({
     url,
-    tlsOptions: useTLS ? { rejectUnauthorized: false } : undefined,
+    tlsOptions,
   });
 }
 
@@ -152,6 +166,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
       config.host,
       config.port || 389,
       config.useTLS || false,
+      (config as { caCert?: string }).caCert,
     );
     try {
       await ldapBind(serviceClient, config.bindDN, config.bindPassword);
@@ -220,6 +235,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
         config.host,
         config.port || 389,
         config.useTLS || false,
+        (config as { caCert?: string }).caCert,
       );
       try {
         await ldapBind(userClient, userDN, password);

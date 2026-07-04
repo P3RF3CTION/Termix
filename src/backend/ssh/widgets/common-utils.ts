@@ -1,5 +1,96 @@
 import type { Client, ClientChannel } from "ssh2";
 
+/**
+ * Like {@link execCommand} but writes `stdinData` on the channel's stdin
+ * immediately after exec succeeds, and closes stdin. Use for feeding a
+ * secret (e.g. sudo password) that must not appear on the argv of the
+ * remote command.
+ */
+export function execCommandWithStdin(
+  client: Client,
+  command: string,
+  stdinData: string,
+  timeoutMs = 30000,
+): Promise<{
+  stdout: string;
+  stderr: string;
+  code: number | null;
+}> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stream: ClientChannel | null = null;
+
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(new Error(`Command timeout after ${timeoutMs}ms: ${command}`));
+      }
+    }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (stream) {
+        try {
+          stream.removeAllListeners();
+          if (stream.stderr) {
+            stream.stderr.removeAllListeners();
+          }
+          stream.destroy();
+        } catch {
+          // expected
+        }
+      }
+    };
+
+    client.exec(command, { pty: false }, (err, _stream) => {
+      if (err) {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(err);
+        }
+        return;
+      }
+
+      stream = _stream;
+      let stdout = "";
+      let stderr = "";
+      let exitCode: number | null = null;
+
+      try {
+        stream.write(stdinData);
+        stream.end();
+      } catch {
+        // best effort
+      }
+
+      stream
+        .on("close", (code: number | undefined) => {
+          if (!settled) {
+            settled = true;
+            exitCode = typeof code === "number" ? code : null;
+            cleanup();
+            resolve({ stdout, stderr, code: exitCode });
+          }
+        })
+        .on("data", (data: Buffer) => {
+          stdout += data.toString("utf8");
+        })
+        .on("error", (streamErr: Error) => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(streamErr);
+          }
+        })
+        .stderr.on("data", (data: Buffer) => {
+          stderr += data.toString("utf8");
+        });
+    });
+  });
+}
+
 export function execCommand(
   client: Client,
   command: string,

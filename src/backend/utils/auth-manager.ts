@@ -425,7 +425,9 @@ class AuthManager {
     try {
       const jwtSecret = await this.systemCrypto.getJWTSecret();
 
-      const payload = jwt.verify(token, jwtSecret) as JWTPayload;
+      const payload = jwt.verify(token, jwtSecret, {
+        algorithms: ["HS256"],
+      }) as JWTPayload;
 
       if (payload.sessionId) {
         try {

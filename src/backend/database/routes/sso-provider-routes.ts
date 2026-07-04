@@ -3,20 +3,54 @@ import type {
   OIDCProviderConfig,
 } from "../../../types/index.js";
 import type { Router } from "express";
+import crypto from "crypto";
 import { db } from "../db/index.js";
 import { ssoProviders } from "../db/schema.js";
 import { eq, asc } from "drizzle-orm";
 import { authLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { SystemCrypto } from "../../utils/system-crypto.js";
 import type { SSOProviderType } from "../../../types/index.js";
 import { getOIDCConfigFromEnv } from "./user-oidc-utils.js";
 
 const authManager = AuthManager.getInstance();
+const SYS_PREFIX = "sys:v1:";
+const LEGACY_PREFIX = "encoded:";
 
-function decryptProviderConfig(
+async function encryptWithSystemKey(plaintext: string): Promise<string> {
+  const systemCrypto = SystemCrypto.getInstance();
+  const key = await systemCrypto.getEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(Buffer.from(plaintext, "utf8")),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  const payload = Buffer.concat([iv, tag, encrypted]).toString("base64");
+  return `${SYS_PREFIX}${payload}`;
+}
+
+async function decryptWithSystemKey(ciphertext: string): Promise<string> {
+  const systemCrypto = SystemCrypto.getInstance();
+  const key = await systemCrypto.getEncryptionKey();
+  const raw = Buffer.from(ciphertext.substring(SYS_PREFIX.length), "base64");
+  if (raw.length < 12 + 16 + 1) {
+    throw new Error("Ciphertext too short");
+  }
+  const iv = raw.subarray(0, 12);
+  const tag = raw.subarray(12, 28);
+  const data = raw.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
+  return decrypted.toString("utf8");
+}
+
+async function decryptProviderConfig(
   configJson: string,
   _userId: string,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   let config: Record<string, unknown>;
   try {
     config = JSON.parse(configJson);
@@ -26,11 +60,25 @@ function decryptProviderConfig(
 
   for (const field of ["client_secret", "bindPassword"] as const) {
     const val = config[field] as string | undefined;
-    if (val?.startsWith("encoded:")) {
+    if (val?.startsWith(SYS_PREFIX)) {
       try {
-        config[field] = Buffer.from(val.substring(8), "base64").toString(
-          "utf8",
-        );
+        config[field] = await decryptWithSystemKey(val);
+      } catch (err) {
+        authLogger.error(`Failed to decrypt ${field}`, err, {
+          operation: "sso_config_decrypt_failed",
+          field,
+        });
+        config[field] = "";
+      }
+    } else if (val?.startsWith(LEGACY_PREFIX)) {
+      // Legacy base64 "encoded:" format. Still readable so existing installs
+      // keep working, but the value is *not* encrypted at rest. It will be
+      // upgraded to real AES-GCM the next time the config is saved.
+      try {
+        config[field] = Buffer.from(
+          val.substring(LEGACY_PREFIX.length),
+          "base64",
+        ).toString("utf8");
       } catch {
         config[field] = "[ENCODING ERROR]";
       }
@@ -39,23 +87,30 @@ function decryptProviderConfig(
   return config;
 }
 
-function encryptProviderConfig(
+async function encryptProviderConfig(
   config: Record<string, unknown>,
   _userId: string,
   _providerId: string,
-): string {
+): Promise<string> {
   const encoded: Record<string, unknown> = { ...config };
-  if (
-    typeof config.client_secret === "string" &&
-    !config.client_secret.startsWith("encoded:")
-  ) {
-    encoded.client_secret = `encoded:${Buffer.from(config.client_secret).toString("base64")}`;
-  }
-  if (
-    typeof config.bindPassword === "string" &&
-    !config.bindPassword.startsWith("encoded:")
-  ) {
-    encoded.bindPassword = `encoded:${Buffer.from(config.bindPassword).toString("base64")}`;
+  for (const field of ["client_secret", "bindPassword"] as const) {
+    const val = config[field];
+    if (typeof val !== "string" || val === "") continue;
+    if (val.startsWith(SYS_PREFIX)) continue;
+    // Accept previously-legacy-encoded values transparently
+    if (val.startsWith(LEGACY_PREFIX)) {
+      try {
+        const plaintext = Buffer.from(
+          val.substring(LEGACY_PREFIX.length),
+          "base64",
+        ).toString("utf8");
+        encoded[field] = await encryptWithSystemKey(plaintext);
+      } catch {
+        encoded[field] = await encryptWithSystemKey(val);
+      }
+      continue;
+    }
+    encoded[field] = await encryptWithSystemKey(val);
   }
   return JSON.stringify(encoded);
 }
@@ -155,10 +210,12 @@ export function registerSSOProviderRoutes(router: Router): void {
         .from(ssoProviders)
         .orderBy(asc(ssoProviders.displayOrder), asc(ssoProviders.id));
 
-      const result = rows.map((row) => ({
-        ...row,
-        config: decryptProviderConfig(row.config, userId),
-      }));
+      const result = await Promise.all(
+        rows.map(async (row) => ({
+          ...row,
+          config: await decryptProviderConfig(row.config, userId),
+        })),
+      );
       res.json(result);
     } catch (err) {
       authLogger.error("Failed to list SSO providers (admin)", err);
@@ -267,7 +324,7 @@ export function registerSSOProviderRoutes(router: Router): void {
       }
 
       const tempId = `new-${Date.now()}`;
-      const encryptedConfig = encryptProviderConfig(
+      const encryptedConfig = await encryptProviderConfig(
         configWithDefaults as Record<string, unknown>,
         userId,
         tempId,
@@ -292,7 +349,7 @@ export function registerSSOProviderRoutes(router: Router): void {
       });
       res.status(201).json({
         ...inserted,
-        config: decryptProviderConfig(inserted.config, userId),
+        config: await decryptProviderConfig(inserted.config, userId),
       });
     } catch (err) {
       authLogger.error("Failed to create SSO provider", err);
@@ -352,7 +409,7 @@ export function registerSSOProviderRoutes(router: Router): void {
 
       let encryptedConfig = existing[0].config;
       if (rawConfig !== undefined) {
-        const existingDecrypted = decryptProviderConfig(
+        const existingDecrypted = await decryptProviderConfig(
           existing[0].config,
           userId,
         );
@@ -362,7 +419,7 @@ export function registerSSOProviderRoutes(router: Router): void {
           ),
           ...rawConfig,
         };
-        encryptedConfig = encryptProviderConfig(
+        encryptedConfig = await encryptProviderConfig(
           mergedConfig,
           userId,
           String(providerId),
@@ -389,7 +446,7 @@ export function registerSSOProviderRoutes(router: Router): void {
       });
       res.json({
         ...updated,
-        config: decryptProviderConfig(updated.config, userId),
+        config: await decryptProviderConfig(updated.config, userId),
       });
     } catch (err) {
       authLogger.error("Failed to update SSO provider", err);

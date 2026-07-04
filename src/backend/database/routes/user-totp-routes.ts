@@ -2,6 +2,7 @@ import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
 import { and, eq, ne } from "drizzle-orm";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import QRCode from "qrcode";
 import speakeasy from "speakeasy";
 import { AuthManager } from "../../utils/auth-manager.js";
@@ -25,6 +26,19 @@ interface UserTotpRoutesDeps {
 }
 
 type TotpUserRecord = typeof users.$inferSelect;
+
+// Backup codes must be unpredictable. Math.random() is a non-CSPRNG and its
+// state can be recovered from a handful of observed outputs, letting an
+// attacker predict future codes and bypass 2FA. Use crypto.randomBytes.
+function generateBackupCodes(count = 8, length = 10): string[] {
+  const codes: string[] = [];
+  for (let i = 0; i < count; i++) {
+    codes.push(
+      crypto.randomBytes(length).toString("base64url").slice(0, length).toUpperCase(),
+    );
+  }
+  return codes;
+}
 
 export async function verifyTotpReauth(
   userRecord: TotpUserRecord,
@@ -253,9 +267,7 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateBackupCodes();
 
       const backupCodesJson = JSON.stringify(backupCodes);
       const storedBackupCodes = userDataKey
@@ -460,9 +472,7 @@ export function registerUserTotpRoutes(
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateBackupCodes();
 
       const backupCodesJson = JSON.stringify(backupCodes);
       const storedBackupCodes = userDataKey
@@ -603,11 +613,19 @@ export function registerUserTotpRoutes(
       });
 
       if (!verified) {
-        let backupCodes = [];
+        // Decrypt backup codes when the stored value is a lazy-encrypted blob.
+        const rawBackupCodes = userRecord.totpBackupCodes
+          ? LazyFieldEncryption.safeGetFieldValue(
+              userRecord.totpBackupCodes,
+              userDataKey,
+              userRecord.id,
+              "totpBackupCodes",
+            )
+          : null;
+
+        let backupCodes: string[] = [];
         try {
-          backupCodes = userRecord.totpBackupCodes
-            ? JSON.parse(userRecord.totpBackupCodes)
-            : [];
+          backupCodes = rawBackupCodes ? JSON.parse(rawBackupCodes) : [];
         } catch {
           backupCodes = [];
         }
@@ -635,9 +653,20 @@ export function registerUserTotpRoutes(
         }
 
         backupCodes.splice(backupIndex, 1);
+        // Re-encrypt the surviving backup codes with the user's data key
+        // instead of writing them back in plaintext.
+        const updatedBackupJson = JSON.stringify(backupCodes);
+        const storedBackupCodes = userDataKey
+          ? FieldCrypto.encryptField(
+              updatedBackupJson,
+              userDataKey,
+              userRecord.id,
+              "totpBackupCodes",
+            )
+          : updatedBackupJson;
         await db
           .update(users)
-          .set({ totpBackupCodes: JSON.stringify(backupCodes) })
+          .set({ totpBackupCodes: storedBackupCodes })
           .where(eq(users.id, userRecord.id));
       }
 

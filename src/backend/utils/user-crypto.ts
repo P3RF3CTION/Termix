@@ -30,7 +30,12 @@ class UserCrypto {
   private userSessions: Map<string, UserSession> = new Map();
   private sessionExpiredCallback?: (userId: string) => void;
 
-  private static readonly PBKDF2_ITERATIONS = 100000;
+  // OWASP 2023 recommends >=600,000 PBKDF2-SHA256 iterations. New KEK salts
+  // are generated at this cost; existing users continue to use the iteration
+  // count that was baked into their stored salt to preserve backward
+  // compatibility. On password change/reset we naturally roll to the new
+  // count via `generateKEKSalt()`.
+  private static readonly PBKDF2_ITERATIONS = 600000;
   private static readonly KEK_LENGTH = 32;
   private static readonly DEK_LENGTH = 32;
 
@@ -173,8 +178,12 @@ class UserCrypto {
 
       if (oidcEncryptedDEK) {
         const systemKey = this.deriveOIDCSystemKey(userId);
-        const DEK = this.decryptDEK(oidcEncryptedDEK, systemKey);
-        systemKey.fill(0);
+        let DEK: Buffer;
+        try {
+          DEK = this.decryptDEK(oidcEncryptedDEK, systemKey);
+        } finally {
+          systemKey.fill(0);
+        }
 
         if (!DEK || DEK.length === 0) {
           databaseLogger.error(
@@ -211,12 +220,32 @@ class UserCrypto {
       }
 
       const systemKey = this.deriveOIDCSystemKey(userId);
-      const DEK = this.decryptDEK(encryptedDEK, systemKey);
+      let DEK: Buffer;
+      try {
+        DEK = this.decryptDEK(encryptedDEK, systemKey);
+      } catch (decryptError) {
+        databaseLogger.error(
+          "OIDC DEK decryption failed - refusing to regenerate DEK (would destroy existing encrypted data)",
+          decryptError,
+          {
+            operation: "oidc_auth_decrypt_failed",
+            userId,
+          },
+        );
+        systemKey.fill(0);
+        return false;
+      }
       systemKey.fill(0);
 
       if (!DEK || DEK.length === 0) {
-        await this.setupOIDCUserEncryption(userId, sessionDurationMs);
-        return true;
+        databaseLogger.error(
+          "OIDC decrypted DEK is empty - refusing to regenerate",
+          {
+            operation: "oidc_auth_empty_dek",
+            userId,
+          },
+        );
+        return false;
       }
 
       const now = Date.now();
@@ -240,8 +269,7 @@ class UserCrypto {
         userId,
         error: error instanceof Error ? error.message : "Unknown",
       });
-      await this.setupOIDCUserEncryption(userId, sessionDurationMs);
-      return true;
+      return false;
     }
   }
 
@@ -501,8 +529,12 @@ class UserCrypto {
   }
 
   private deriveOIDCSystemKey(userId: string): Buffer {
-    const systemSecret =
-      process.env.OIDC_SYSTEM_SECRET || "termix-oidc-system-secret-default";
+    const systemSecret = process.env.OIDC_SYSTEM_SECRET;
+    if (!systemSecret || systemSecret.length < 32) {
+      throw new Error(
+        "OIDC_SYSTEM_SECRET is missing or too short. Refusing to derive OIDC KEK to prevent use of a predictable default. Please restart the server so the secret can be auto-generated, or set OIDC_SYSTEM_SECRET manually (>=32 chars).",
+      );
+    }
     const salt = Buffer.from(userId, "utf8");
     return crypto.pbkdf2Sync(
       systemSecret,

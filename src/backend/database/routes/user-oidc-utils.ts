@@ -3,7 +3,9 @@ import type { SSOProviderType } from "../../../types/index.js";
 import { db } from "../db/index.js";
 import { ssoProviders } from "../db/schema.js";
 import { eq } from "drizzle-orm";
+import crypto from "crypto";
 import { DataCrypto } from "../../utils/data-crypto.js";
+import { SystemCrypto } from "../../utils/system-crypto.js";
 import { Agent } from "undici";
 
 export type OIDCConfig = {
@@ -227,6 +229,7 @@ export async function verifyOIDCToken(
   const { payload } = await jwtVerify(idToken, key, {
     issuer: possibleIssuers,
     audience: clientId,
+    algorithms: ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256"],
   });
 
   return payload;
@@ -275,22 +278,45 @@ function applyProviderDefaults(
   };
 }
 
-function decryptConfigSecret(
+async function decryptSystemKeyValue(value: string): Promise<string> {
+  const systemCrypto = SystemCrypto.getInstance();
+  const key = await systemCrypto.getEncryptionKey();
+  const raw = Buffer.from(value.substring("sys:v1:".length), "base64");
+  const iv = raw.subarray(0, 12);
+  const tag = raw.subarray(12, 28);
+  const data = raw.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([decipher.update(data), decipher.final()]);
+  return plaintext.toString("utf8");
+}
+
+async function decryptConfigSecret(
   config: Record<string, unknown>,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   const out = { ...config };
   for (const field of ["client_secret", "bindPassword"] as const) {
     const val = out[field] as string | undefined;
-    if (val?.startsWith("encoded:")) {
+    if (val?.startsWith("sys:v1:")) {
+      try {
+        out[field] = await decryptSystemKeyValue(val);
+      } catch (err) {
+        authLogger.error(`Failed to decrypt ${field} (sys key)`, err, {
+          operation: "sso_config_sys_decrypt_failed",
+          field,
+        });
+        out[field] = "";
+      }
+    } else if (val?.startsWith("encoded:")) {
       try {
         out[field] = Buffer.from(val.substring(8), "base64").toString("utf8");
       } catch {
         // leave as-is
       }
     } else if (val?.startsWith("encrypted:")) {
-      // encrypted: prefix means it was encrypted with DataCrypto; without a
-      // userId/dataKey here we cannot decrypt it. The caller should use the
-      // full admin decrypt path when possible. Fall back to stripping prefix.
+      // Legacy DataCrypto envelope without a user context. Best-effort strip
+      // the prefix so downstream code doesn't send the raw envelope over the
+      // wire. The recommended upgrade path is to re-save the provider.
       try {
         out[field] = Buffer.from(val.substring(10), "base64").toString("utf8");
       } catch {
@@ -336,10 +362,10 @@ export async function loadProviderConfig(
               );
             }
           } catch {
-            parsed = decryptConfigSecret(parsed);
+            parsed = await decryptConfigSecret(parsed);
           }
         } else {
-          parsed = decryptConfigSecret(parsed);
+          parsed = await decryptConfigSecret(parsed);
         }
         const providerType = row.type as SSOProviderType;
         const config = applyProviderDefaults(
@@ -382,7 +408,7 @@ export async function loadProviderConfig(
       } catch {
         parsed = {};
       }
-      parsed = decryptConfigSecret(parsed);
+      parsed = await decryptConfigSecret(parsed);
       const oidcProviderType = oidcRow.type as SSOProviderType;
       return {
         config: applyProviderDefaults(
@@ -404,7 +430,7 @@ export async function loadProviderConfig(
       .get() as { value: string } | undefined;
     if (legacyRow) {
       let config = JSON.parse(legacyRow.value) as Record<string, unknown>;
-      config = decryptConfigSecret(config);
+      config = await decryptConfigSecret(config);
       return {
         config: config as unknown as OIDCConfig,
         providerType: "oidc",
