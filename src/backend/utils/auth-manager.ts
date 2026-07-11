@@ -425,7 +425,9 @@ class AuthManager {
     try {
       const jwtSecret = await this.systemCrypto.getJWTSecret();
 
-      const payload = jwt.verify(token, jwtSecret) as JWTPayload;
+      const payload = jwt.verify(token, jwtSecret, {
+        algorithms: ["HS256"],
+      }) as JWTPayload;
 
       if (payload.sessionId) {
         try {
@@ -713,7 +715,7 @@ class AuthManager {
     return {
       httpOnly: true,
       secure: req.secure || req.headers["x-forwarded-proto"] === "https",
-      sameSite: "lax" as const,
+      sameSite: "strict" as const,
       maxAge: maxAge,
       path: "/",
     };
@@ -723,7 +725,7 @@ class AuthManager {
     return {
       httpOnly: true,
       secure: req.secure || req.headers["x-forwarded-proto"] === "https",
-      sameSite: "lax" as const,
+      sameSite: "strict" as const,
       path: "/",
     };
   }

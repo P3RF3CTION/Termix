@@ -31,6 +31,7 @@ import { DataCrypto } from "../utils/data-crypto.js";
 import { createSocks5Connection } from "../utils/socks5-helper.js";
 import { AuthManager } from "../utils/auth-manager.js";
 import { PermissionManager } from "../utils/permission-manager.js";
+import { wsVerifyClient } from "../utils/ws-origin.js";
 import { withConnection } from "./ssh-connection-pool.js";
 import {
   applyAuthOptions,
@@ -2362,6 +2363,7 @@ const server = createServer(app);
 const c2sRelayWss = new WebSocketServer({
   server,
   path: "/ssh/tunnel/c2s/stream",
+  verifyClient: wsVerifyClient,
 });
 
 c2sRelayWss.on("connection", (ws, req) => {

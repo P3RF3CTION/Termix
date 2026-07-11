@@ -75,7 +75,13 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     const timestamp = Date.now();
-    cb(null, `${timestamp}-${file.originalname}`);
+    // Strip any directory components from the client-supplied filename to
+    // prevent path traversal (e.g. "../../etc/passwd") and keep only a safe
+    // basename made of ASCII letters, digits, dot, underscore and dash.
+    const safeBase = path
+      .basename(file.originalname)
+      .replace(/[^A-Za-z0-9._-]/g, "_");
+    cb(null, `${timestamp}-${safeBase}`);
   },
 });
 
@@ -85,9 +91,10 @@ const upload = multer({
     fileSize: 1024 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
+    const safeBase = path.basename(file.originalname);
     if (
-      file.originalname.endsWith(".termix-export.sqlite") ||
-      file.originalname.endsWith(".sqlite")
+      safeBase.endsWith(".termix-export.sqlite") ||
+      safeBase.endsWith(".sqlite")
     ) {
       cb(null, true);
     } else {

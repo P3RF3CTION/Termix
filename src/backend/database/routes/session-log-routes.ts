@@ -16,6 +16,15 @@ const DATA_DIR = process.env.DATA_DIR ?? "./db/data";
 // Delete session log files and DB rows older than this many days
 const LOG_RETENTION_DAYS = 30;
 
+function isInside(base: string, target: string): boolean {
+  const relative = path.relative(base, target);
+  return (
+    relative !== "" &&
+    !relative.startsWith("..") &&
+    !path.isAbsolute(relative)
+  );
+}
+
 async function pruneOldLogs(): Promise<void> {
   try {
     const cutoff = new Date(
@@ -34,7 +43,7 @@ async function pruneOldLogs(): Promise<void> {
       if (row.recordingPath) {
         const resolved = path.resolve(row.recordingPath);
         const allowed = path.resolve(DATA_DIR, "session_logs");
-        if (resolved.startsWith(allowed) && fs.existsSync(resolved)) {
+        if (isInside(allowed, resolved) && fs.existsSync(resolved)) {
           await fs.promises.unlink(resolved).catch(() => {});
         }
       }
@@ -225,7 +234,7 @@ router.get(
 
       const resolvedPath = path.resolve(filePath);
       const allowedBase = path.resolve(DATA_DIR, "session_logs");
-      if (!resolvedPath.startsWith(allowedBase)) {
+      if (!isInside(allowedBase, resolvedPath)) {
         return res.status(403).json({ error: "Forbidden" });
       }
 
@@ -297,7 +306,7 @@ router.delete("/:id", authenticateJWT, async (req: Request, res: Response) => {
     if (filePath) {
       const resolvedPath = path.resolve(filePath);
       const allowedBase = path.resolve(DATA_DIR, "session_logs");
-      if (resolvedPath.startsWith(allowedBase) && fs.existsSync(resolvedPath)) {
+      if (isInside(allowedBase, resolvedPath) && fs.existsSync(resolvedPath)) {
         await fs.promises.unlink(resolvedPath).catch(() => {});
       }
     }

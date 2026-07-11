@@ -1,5 +1,6 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
+import crypto from "crypto";
 import { and, eq, ne } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import QRCode from "qrcode";
@@ -56,7 +57,7 @@ export async function verifyTotpReauth(
         secret: totpSecret,
         encoding: "base32",
         token: credential,
-        window: 2,
+        window: 1,
       });
       if (totpMatch) {
         return true;
@@ -246,7 +247,7 @@ export function registerUserTotpRoutes(
         secret: totpSecret,
         encoding: "base32",
         token: totp_code,
-        window: 2,
+        window: 1,
       });
 
       if (!verified) {
@@ -254,7 +255,7 @@ export function registerUserTotpRoutes(
       }
 
       const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
+        crypto.randomBytes(6).toString("base64url").slice(0, 10).toUpperCase(),
       );
 
       const backupCodesJson = JSON.stringify(backupCodes);
@@ -461,7 +462,7 @@ export function registerUserTotpRoutes(
       }
 
       const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
+        crypto.randomBytes(6).toString("base64url").slice(0, 10).toUpperCase(),
       );
 
       const backupCodesJson = JSON.stringify(backupCodes);
@@ -599,20 +600,27 @@ export function registerUserTotpRoutes(
         secret: totpSecret,
         encoding: "base32",
         token: totp_code,
-        window: 2,
+        window: 1,
       });
 
       if (!verified) {
-        let backupCodes = [];
+        let backupCodes: string[] = [];
         try {
-          backupCodes = userRecord.totpBackupCodes
-            ? JSON.parse(userRecord.totpBackupCodes)
-            : [];
+          const raw = userRecord.totpBackupCodes
+            ? LazyFieldEncryption.safeGetFieldValue(
+                userRecord.totpBackupCodes,
+                userDataKey,
+                userRecord.id,
+                "totpBackupCodes",
+              )
+            : null;
+          const parsed = raw ? JSON.parse(raw) : [];
+          if (Array.isArray(parsed)) {
+            backupCodes = parsed.filter(
+              (v): v is string => typeof v === "string",
+            );
+          }
         } catch {
-          backupCodes = [];
-        }
-
-        if (!Array.isArray(backupCodes)) {
           backupCodes = [];
         }
 
@@ -635,9 +643,18 @@ export function registerUserTotpRoutes(
         }
 
         backupCodes.splice(backupIndex, 1);
+        const updatedJson = JSON.stringify(backupCodes);
+        const storedBackupCodes = userDataKey
+          ? FieldCrypto.encryptField(
+              updatedJson,
+              userDataKey,
+              userRecord.id,
+              "totpBackupCodes",
+            )
+          : updatedJson;
         await db
           .update(users)
-          .set({ totpBackupCodes: JSON.stringify(backupCodes) })
+          .set({ totpBackupCodes: storedBackupCodes })
           .where(eq(users.id, userRecord.id));
       }
 

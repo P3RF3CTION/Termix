@@ -3,13 +3,26 @@ import { logger } from "../utils/logger.js";
 
 const sshLogger = logger;
 
+// Docker enforces container name rules: [a-zA-Z0-9][a-zA-Z0-9_.-]+
+// IDs are hex only. Both are safe subsets of what we need to shell-escape.
+const CONTAINER_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
+function isValidContainerId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 253 && CONTAINER_ID_RE.test(id);
+}
+
 type DockerSession = {
   isConnected: boolean;
   lastActive: number;
   activeOperations: number;
   hostId?: number;
   isWindows?: boolean;
+  userId?: string;
 };
+
+function ownsSession(session: DockerSession | undefined, userId: string): boolean {
+  return !!session && session.userId === userId;
+}
 
 type PendingDockerTotpSession = unknown;
 
@@ -87,6 +100,10 @@ export function registerDockerContainerRoutes(
       return res.status(400).json({
         error: "SSH session not found or not connected",
       });
+    }
+
+    if (!ownsSession(session, userId)) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     session.lastActive = Date.now();
@@ -178,12 +195,20 @@ export function registerDockerContainerRoutes(
       return res.status(401).json({ error: "Authentication required" });
     }
 
+    if (!isValidContainerId(containerId)) {
+      return res.status(400).json({ error: "Invalid container id" });
+    }
+
     const session = sshSessions[sessionId];
 
     if (!session || !session.isConnected) {
       return res.status(400).json({
         error: "SSH session not found or not connected",
       });
+    }
+
+    if (!ownsSession(session, userId)) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     session.lastActive = Date.now();
@@ -273,12 +298,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -373,12 +406,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -473,12 +514,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -573,12 +622,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -673,12 +730,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -778,12 +843,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -908,12 +981,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();
@@ -1020,12 +1101,20 @@ export function registerDockerContainerRoutes(
         return res.status(401).json({ error: "Authentication required" });
       }
 
+      if (!isValidContainerId(containerId)) {
+        return res.status(400).json({ error: "Invalid container id" });
+      }
+
       const session = sshSessions[sessionId];
 
       if (!session || !session.isConnected) {
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (!ownsSession(session, userId)) {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       session.lastActive = Date.now();

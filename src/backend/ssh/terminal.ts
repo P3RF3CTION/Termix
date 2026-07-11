@@ -22,6 +22,7 @@ import {
 import { SSHAuthManager } from "./auth-manager.js";
 import type { ProxyNode } from "../../types/index.js";
 import { SSHHostKeyVerifier } from "./host-key-verifier.js";
+import { wsVerifyClient } from "../utils/ws-origin.js";
 import { createJumpHostChain } from "./terminal-jump-hosts.js";
 import { sessionManager } from "./terminal-session-manager.js";
 import {
@@ -98,6 +99,7 @@ const userConnections = new Map<string, Set<WebSocket>>();
 
 const wss = new WebSocketServer({
   port: 30002,
+  verifyClient: wsVerifyClient,
 });
 
 wss.on("connection", async (ws: WebSocket, req) => {

@@ -1088,18 +1088,14 @@ router.get("/oidc/callback", async (req, res) => {
           config.client_id,
           caCert,
         );
-      } catch {
-        try {
-          const parts = (tokenData.id_token as string).split(".");
-          if (parts.length === 3) {
-            const payload = JSON.parse(
-              Buffer.from(parts[1], "base64").toString(),
-            );
-            userInfo = payload;
-          }
-        } catch (decodeError) {
-          authLogger.error("Failed to decode ID token payload:", decodeError);
-        }
+      } catch (verifyError) {
+        // NEVER fall back to the unverified payload. Doing so lets any party
+        // that can inject a JWT (unsigned, or signed with a key we don't
+        // control) authenticate as an arbitrary subject. Fail closed and let
+        // the caller retry after fixing the OIDC config / JWKS reachability.
+        authLogger.error("OIDC id_token verification failed", verifyError, {
+          operation: "oidc_id_token_verify_failed",
+        });
       }
     }
 
@@ -2480,7 +2476,7 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Failed to update password and re-encrypt data." });
   }
 
-  const password_hash = await bcrypt.hash(newPassword, 10);
+  const password_hash = await bcrypt.hash(newPassword, 12);
   await db
     .update(users)
     .set({ passwordHash: password_hash })

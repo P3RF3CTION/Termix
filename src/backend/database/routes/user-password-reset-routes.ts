@@ -28,6 +28,22 @@ function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
 }
 
+// Number of failed verification attempts before the reset code is destroyed.
+// Below the per-window rate-limit ceiling so the code is invalidated before
+// the raw guess ceiling is reached, further shrinking the online attack.
+const RESET_CODE_MAX_FAILURES = 5;
+
+function hashToken(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
 export function registerUserPasswordResetRoutes(
   router: Router,
   { authManager }: UserPasswordResetRoutesDeps,
@@ -129,9 +145,19 @@ export function registerUserPasswordResetRoutes(
           }),
         );
 
-      authLogger.info(
-        `Password reset code generated for user ${username}: ${resetCode} (expires at ${expiresAt.toLocaleString()})`,
+      // Emit the code to the process stdout only (bypassing the structured
+      // logger's context redactor by design: this is the intentional
+      // out-of-band recovery channel for a self-hosted deployment). Kept out
+      // of the logger's message field so shipping/aggregators that persist
+      // structured logs never store the code alongside other diagnostics.
+      process.stdout.write(
+        `[termix-reset] user=${username} code=${resetCode} expires=${expiresAt.toISOString()}\n`,
       );
+      authLogger.info("Password reset code generated", {
+        operation: "password_reset_code_generated",
+        username,
+        expiresAt: expiresAt.toISOString(),
+      });
 
       res.json({
         message:
@@ -219,6 +245,9 @@ export function registerUserPasswordResetRoutes(
       const resetData = JSON.parse(
         (resetDataRow as Record<string, unknown>).value as string,
       );
+      if (typeof resetData.failures !== "number") {
+        resetData.failures = 0;
+      }
       const now = new Date();
       const expiresAt = new Date(resetData.expiresAt);
 
@@ -239,10 +268,28 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      if (
+        typeof resetData.code !== "string" ||
+        !timingSafeEqualStrings(resetData.code, resetCode)
+      ) {
+        resetData.failures += 1;
+        if (resetData.failures >= RESET_CODE_MAX_FAILURES) {
+          // Destroy the code entirely once it has been guessed too often.
+          // Without this, only the per-window rate-limit gates guesses; here
+          // we make sure a repeated wrong-guess campaign burns the code even
+          // if the attacker paces themselves across rate-limit windows.
+          db.$client
+            .prepare("DELETE FROM settings WHERE key = ?")
+            .run(`reset_code_${username}`);
+        } else {
+          db.$client
+            .prepare("UPDATE settings SET value = ? WHERE key = ?")
+            .run(JSON.stringify(resetData), `reset_code_${username}`);
+        }
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
+          failures: resetData.failures,
           remainingAttempts:
             loginRateLimiter.getRemainingResetCodeAttempts(username),
         });
@@ -253,6 +300,10 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
+      // Successful verification: consume the code so it cannot be replayed.
+      db.$client
+        .prepare("DELETE FROM settings WHERE key = ?")
+        .run(`reset_code_${username}`);
       loginRateLimiter.resetResetCodeAttempts(username);
 
       const tempToken = nanoid();
@@ -263,7 +314,10 @@ export function registerUserPasswordResetRoutes(
         .run(
           `temp_reset_token_${username}`,
           JSON.stringify({
-            token: tempToken,
+            // Store only the hash of the temp token so DB read access alone
+            // cannot complete a reset. The plaintext leaves via HTTPS to the
+            // legitimate user's client and never persists on disk.
+            tokenHash: hashToken(tempToken),
             expiresAt: tempTokenExpiry.toISOString(),
           }),
         );
@@ -340,7 +394,14 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      const submittedHash = hashToken(tempToken);
+      const storedHash =
+        typeof tempTokenData.tokenHash === "string"
+          ? tempTokenData.tokenHash
+          : typeof tempTokenData.token === "string"
+            ? hashToken(tempTokenData.token) // legacy plaintext record
+            : "";
+      if (!storedHash || !timingSafeEqualStrings(storedHash, submittedHash)) {
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 
@@ -353,7 +414,7 @@ export function registerUserPasswordResetRoutes(
       }
       const userId = user[0].id;
 
-      const password_hash = await bcrypt.hash(newPassword, 10);
+      const password_hash = await bcrypt.hash(newPassword, 12);
 
       let userIdFromJwt: string | null = null;
       const cookie = req.cookies?.jwt;

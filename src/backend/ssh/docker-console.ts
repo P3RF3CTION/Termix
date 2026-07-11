@@ -7,6 +7,7 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../database/db/index.js";
 import { SimpleDBOps } from "../utils/simple-db-ops.js";
 import { systemLogger } from "../utils/logger.js";
+import { wsVerifyClient } from "../utils/ws-origin.js";
 import type { SSHHost } from "../../types/index.js";
 
 const sshLogger = systemLogger;
@@ -25,6 +26,7 @@ const activeSessions = new Map<string, SSHSession>();
 const wss = new WebSocketServer({
   host: "0.0.0.0",
   port: 30009,
+  verifyClient: wsVerifyClient,
 });
 
 async function detectShell(

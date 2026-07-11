@@ -3,6 +3,7 @@ import { getDb } from "../database/db/index.js";
 import { settings } from "../database/db/schema.js";
 import { eq } from "drizzle-orm";
 import { databaseLogger } from "./logger.js";
+import { SystemCrypto } from "./system-crypto.js";
 
 interface KEKSalt {
   salt: string;
@@ -31,6 +32,11 @@ class UserCrypto {
   private sessionExpiredCallback?: (userId: string) => void;
 
   private static readonly PBKDF2_ITERATIONS = 100000;
+  // Fixed per-user OIDC KEK iterations. Stored KEK salts embed their own
+  // iteration count, but the OIDC derivation is stateless (keyed off userId
+  // alone), so changing this value would strand existing OIDC users. Do NOT
+  // change without a data migration.
+  private static readonly OIDC_PBKDF2_ITERATIONS = 100000;
   private static readonly KEK_LENGTH = 32;
   private static readonly DEK_LENGTH = 32;
 
@@ -501,13 +507,16 @@ class UserCrypto {
   }
 
   private deriveOIDCSystemKey(userId: string): Buffer {
-    const systemSecret =
-      process.env.OIDC_SYSTEM_SECRET || "termix-oidc-system-secret-default";
+    // Never fall back to a hardcoded default: with a known secret every OIDC
+    // user's data key becomes decryptable from the database file alone.
+    // SystemCrypto.initializeOIDCSystemSecret() runs at boot and auto-persists
+    // a random 32-byte hex value on first launch.
+    const systemSecret = SystemCrypto.getInstance().getOIDCSystemSecretSync();
     const salt = Buffer.from(userId, "utf8");
     return crypto.pbkdf2Sync(
       systemSecret,
       salt,
-      100000,
+      UserCrypto.OIDC_PBKDF2_ITERATIONS,
       UserCrypto.KEK_LENGTH,
       "sha256",
     );

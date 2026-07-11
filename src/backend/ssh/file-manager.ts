@@ -49,9 +49,13 @@ const app = express();
 
 app.use(createCorsMiddleware(["GET", "POST", "PUT", "DELETE", "OPTIONS"]));
 app.use(cookieParser());
-app.use(express.json({ limit: "1gb" }));
-app.use(express.urlencoded({ limit: "1gb", extended: true }));
-app.use(express.raw({ limit: "5gb", type: "application/octet-stream" }));
+// JSON/urlencoded bodies are metadata payloads only; large file uploads flow
+// through the streaming multipart endpoints, not through the JSON parser.
+// Previously 1GB / 5GB, which let any authenticated user allocate that much
+// memory just by posting a body.
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(express.raw({ limit: "512mb", type: "application/octet-stream" }));
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
