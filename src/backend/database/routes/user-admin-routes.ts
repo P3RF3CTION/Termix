@@ -35,6 +35,19 @@ export function registerUserAdminRoutes(
    */
   router.get("/list", authenticateJWT, async (req, res) => {
     try {
+      // Only admins may enumerate the user directory. Prior to this check,
+      // any authenticated (incl. non-admin, non-OIDC) user could read every
+      // account's username, admin flag, OIDC flag and password-hash presence.
+      const callerId = (req as AuthenticatedRequest).userId;
+      const callerRecord = await db
+        .select({ isAdmin: users.isAdmin })
+        .from(users)
+        .where(eq(users.id, callerId))
+        .limit(1);
+      if (!callerRecord[0]?.isAdmin) {
+        return res.status(403).json({ error: "Not authorized" });
+      }
+
       const allUsers = await db
         .select({
           id: users.id,

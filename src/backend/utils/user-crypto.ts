@@ -30,7 +30,11 @@ class UserCrypto {
   private userSessions: Map<string, UserSession> = new Map();
   private sessionExpiredCallback?: (userId: string) => void;
 
-  private static readonly PBKDF2_ITERATIONS = 100000;
+  // OWASP 2023 baseline for PBKDF2-SHA256 is 600,000 rounds. Old records that
+  // were derived with 100,000 rounds still decrypt because the per-record
+  // iteration count is stored in KEKSalt; new records upgrade on next
+  // password change / OIDC re-auth.
+  private static readonly PBKDF2_ITERATIONS = 600000;
   private static readonly KEK_LENGTH = 32;
   private static readonly DEK_LENGTH = 32;
 
@@ -501,13 +505,22 @@ class UserCrypto {
   }
 
   private deriveOIDCSystemKey(userId: string): Buffer {
-    const systemSecret =
-      process.env.OIDC_SYSTEM_SECRET || "termix-oidc-system-secret-default";
+    // The OIDC KEK wraps every OIDC user's DEK. A hardcoded fallback here
+    // would let anyone with source access + a stolen database decrypt every
+    // encrypted field. Refuse to derive a key if the operator has not set a
+    // strong OIDC_SYSTEM_SECRET.
+    const systemSecret = process.env.OIDC_SYSTEM_SECRET;
+    if (!systemSecret || systemSecret.length < 32) {
+      throw new Error(
+        "OIDC_SYSTEM_SECRET environment variable is not set or too short (min 32 chars). " +
+          "OIDC-encrypted user data cannot be unlocked. Set a strong random secret and restart.",
+      );
+    }
     const salt = Buffer.from(userId, "utf8");
     return crypto.pbkdf2Sync(
       systemSecret,
       salt,
-      100000,
+      UserCrypto.PBKDF2_ITERATIONS,
       UserCrypto.KEK_LENGTH,
       "sha256",
     );

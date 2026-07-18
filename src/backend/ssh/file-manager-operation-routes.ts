@@ -381,6 +381,14 @@ export function registerFileOperationRoutes(
       const winPath = itemPath
         .replace(/\//g, "\\")
         .replace(/^\\([A-Za-z]:\\)/, "$1");
+      // cmd.exe expands %VAR% and (with EnableDelayedExpansion) !VAR! even
+      // inside double-quoted arguments — refuse anything that could smuggle
+      // in expansion or command chaining. Also reject NUL / newline / CR.
+      if (/[%!\r\n\0&|<>]/.test(winPath)) {
+        return res.status(400).json({
+          error: "Path contains characters not allowed on Windows delete",
+        });
+      }
       const escapedWinPath = winPath.replace(/"/g, '""');
       deleteCommand = isDirectory
         ? `rd /s /q "${escapedWinPath}"`

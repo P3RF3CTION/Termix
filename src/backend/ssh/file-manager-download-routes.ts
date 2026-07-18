@@ -18,6 +18,13 @@ function escapeSingleQuotes(path: string): string {
   return path.replace(/'/g, "'\"'\"'");
 }
 
+// Hard cap on the size we'll buffer into memory in legacy-download mode.
+// Without this cap an attacker with an SSH host in scpLegacy mode could
+// request /dev/zero and exhaust the file-manager service's RAM, taking down
+// the shared process for every user. Streaming (downloadFileStream) has no
+// buffer and is not affected.
+const LEGACY_DOWNLOAD_MAX_BYTES = 200 * 1024 * 1024;
+
 function downloadViaExec(
   session: SSHSession,
   filePath: string,
@@ -27,12 +34,35 @@ function downloadViaExec(
     execChannel(session, `cat '${escaped}'`, (err, stream) => {
       if (err) return reject(err);
       const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let aborted = false;
       let stderr = "";
-      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("data", (chunk: Buffer) => {
+        if (aborted) return;
+        totalBytes += chunk.length;
+        if (totalBytes > LEGACY_DOWNLOAD_MAX_BYTES) {
+          aborted = true;
+          try {
+            stream.close?.();
+          } catch {
+            /* ignore */
+          }
+          reject(
+            new Error(
+              `File exceeds legacy download limit of ${
+                LEGACY_DOWNLOAD_MAX_BYTES / (1024 * 1024)
+              }MB. Use the streaming endpoint instead.`,
+            ),
+          );
+          return;
+        }
+        chunks.push(chunk);
+      });
       stream.stderr.on("data", (chunk: Buffer) => {
         stderr += chunk.toString();
       });
       stream.on("close", (code: number) => {
+        if (aborted) return;
         if (code !== 0) {
           return reject(
             new Error(stderr.trim() || `cat exited with code ${code}`),

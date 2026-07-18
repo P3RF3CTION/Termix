@@ -2,6 +2,14 @@ import type { Router } from "express";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
+
+function safeStringEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
 import { eq } from "drizzle-orm";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
@@ -129,13 +137,29 @@ export function registerUserPasswordResetRoutes(
           }),
         );
 
-      authLogger.info(
-        `Password reset code generated for user ${username}: ${resetCode} (expires at ${expiresAt.toLocaleString()})`,
-      );
+      // Never log the reset code itself — anyone with read on docker logs,
+      // journald, or the log aggregator could then hijack the account.
+      // Operators can enable code visibility (e.g. for standalone
+      // administrator delivery) by setting LOG_PASSWORD_RESET_CODES=true.
+      if (
+        (process.env.LOG_PASSWORD_RESET_CODES || "").toLowerCase() === "true"
+      ) {
+        authLogger.info(
+          `Password reset code generated for user ${username}: ${resetCode} (expires at ${expiresAt.toLocaleString()})`,
+        );
+      } else {
+        authLogger.info(
+          `Password reset code generated for user ${username} (expires at ${expiresAt.toLocaleString()})`,
+          {
+            operation: "password_reset_code_generated",
+            username,
+          },
+        );
+      }
 
       res.json({
         message:
-          "Password reset code has been generated and logged. Check docker logs for the code.",
+          "Password reset code has been generated. Retrieve it via the configured delivery channel.",
       });
     } catch (err) {
       authLogger.error("Failed to initiate password reset", err);
@@ -239,7 +263,7 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      if (!safeStringEqual(resetData.code, resetCode)) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -340,7 +364,7 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      if (!safeStringEqual(tempTokenData.token, tempToken)) {
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 

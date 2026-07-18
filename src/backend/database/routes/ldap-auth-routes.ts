@@ -7,10 +7,18 @@ import { nanoid } from "nanoid";
 import { authLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { parseUserAgent } from "../../utils/user-agent-parser.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { isOIDCUserAllowed, loadProviderConfig } from "./user-oidc-utils.js";
 import ldap from "ldapjs";
 
 const authManager = AuthManager.getInstance();
+
+// Certificate validation for LDAPS is on by default. Operators who terminate
+// TLS with a self-signed cert can opt out via LDAP_TLS_ALLOW_INSECURE=true —
+// disabled by default so that man-in-the-middle attackers cannot silently
+// steal LDAP bind credentials on the wire.
+const ALLOW_INSECURE_LDAPS =
+  (process.env.LDAP_TLS_ALLOW_INSECURE || "").trim().toLowerCase() === "true";
 
 function ldapEscapeFilter(value: string): string {
   return value.replace(
@@ -27,7 +35,9 @@ function createLDAPClient(
   const url = `${useTLS ? "ldaps" : "ldap"}://${host}:${port}`;
   return ldap.createClient({
     url,
-    tlsOptions: useTLS ? { rejectUnauthorized: false } : undefined,
+    tlsOptions: useTLS
+      ? { rejectUnauthorized: !ALLOW_INSECURE_LDAPS }
+      : undefined,
   });
 }
 
@@ -119,6 +129,25 @@ export function registerLDAPAuthRoutes(router: Router): void {
         .json({ error: "providerId, username, and password are required" });
     }
 
+    // Rate-limit LDAP logins the same way we rate-limit local logins.
+    // Without this, an attacker could unlimitedly brute-force LDAP passwords
+    // by hitting this endpoint.
+    const clientIp = req.ip || req.socket?.remoteAddress || "unknown";
+    const rateLimitKey = `ldap:${providerId}:${username}`;
+    const lockStatus = loginRateLimiter.isLocked(clientIp, rateLimitKey);
+    if (lockStatus.locked) {
+      authLogger.warn("LDAP login blocked due to rate limiting", {
+        operation: "ldap_login_rate_limited",
+        username,
+        providerId,
+        remainingTime: lockStatus.remainingTime,
+      });
+      return res.status(429).json({
+        error: `Too many failed attempts. Try again in ${lockStatus.remainingTime}s.`,
+        remainingTime: lockStatus.remainingTime,
+      });
+    }
+
     try {
       const rows = await db
         .select()
@@ -174,6 +203,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
       );
 
       if (entries.length === 0) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateLimitKey);
         authLogger.warn("LDAP user not found", {
           operation: "ldap_login",
           username,
@@ -224,6 +254,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
       try {
         await ldapBind(userClient, userDN, password);
       } catch {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateLimitKey);
         authLogger.warn("LDAP bind failed - wrong password", {
           operation: "ldap_login",
           ldapIdentifier,
@@ -232,6 +263,10 @@ export function registerLDAPAuthRoutes(router: Router): void {
       } finally {
         ldapUnbind(userClient);
       }
+
+      // Successful bind — clear the counter so a legitimate user isn't
+      // penalized for their earlier typos.
+      loginRateLimiter.resetAttempts(clientIp, rateLimitKey);
 
       // Admin group check
       let isAdmin = false;

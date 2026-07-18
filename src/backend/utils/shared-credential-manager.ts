@@ -544,13 +544,19 @@ class SharedCredentialManager {
         recordId.toString(),
         fieldName,
       );
-    } catch {
-      databaseLogger.warn("Field decryption failed, returning as-is", {
+    } catch (error) {
+      // Do NOT return the raw ciphertext envelope on failure — callers pass
+      // this into SSH authentication, which would then transmit the internal
+      // ciphertext to the remote host as if it were a password. Fail loudly
+      // so the outer route surfaces a 500 instead of leaking secret metadata.
+      databaseLogger.error("Field decryption failed", error, {
         operation: "decrypt_field",
         fieldName,
         recordId,
       });
-      return encryptedValue;
+      throw new Error(
+        `Failed to decrypt shared credential field '${fieldName}'`,
+      );
     }
   }
 

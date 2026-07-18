@@ -124,30 +124,12 @@ export class LazyFieldEncryption {
           }
         }
 
-        const sensitiveFields = [
-          "totpSecret",
-          "totpBackupCodes",
-          "password",
-          "key",
-          "keyPassword",
-          "sudoPassword",
-          "autostartPassword",
-          "autostartKey",
-          "autostartKeyPassword",
-          "socks5Password",
-          "rdpPassword",
-          "vncPassword",
-          "telnetPassword",
-          "privateKey",
-          "publicKey",
-          "clientSecret",
-          "oidcIdentifier",
-        ];
-
-        if (sensitiveFields.includes(fieldName)) {
-          return "";
-        }
-
+        // Do NOT silently return an empty string for sensitive fields on
+        // decrypt failure — downstream callers use these values directly for
+        // SSH / TOTP / OIDC authentication. An empty totpSecret would make
+        // TOTP verification silently succeed against a null secret; an empty
+        // password could get sent in-band. Fail loud so the outer route
+        // surfaces the error instead.
         databaseLogger.error("Failed to decrypt field", error, {
           operation: "lazy_encryption_decrypt_failed",
           recordId,

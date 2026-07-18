@@ -10,6 +10,14 @@ import { hosts, sshCredentials } from "../db/schema.js";
 
 const { Client } = ssh2Pkg;
 
+// POSIX-safe single-quote wrapper: transforms "foo'bar" -> "'foo'\''bar'".
+// Anything inside the produced string is treated as literal by the remote
+// shell, so untrusted content (public key material, credential name) cannot
+// break out of its argument boundary and execute code.
+function shellSingleQuote(input: string): string {
+  return `'${String(input).replace(/'/g, "'\\''")}'`;
+}
+
 async function deploySSHKeyToHost(
   hostConfig: Record<string, unknown>,
   credData: CredentialBackend,
@@ -85,9 +93,10 @@ async function deploySSHKeyToHost(
             }
 
             const keyPattern = keyParts[1];
+            const quotedPattern = shellSingleQuote(keyPattern);
 
             conn.exec(
-              `if [ -f ~/.ssh/authorized_keys ]; then grep -F "${keyPattern}" ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?; else echo 1; fi`,
+              `if [ -f ~/.ssh/authorized_keys ]; then grep -F -- ${quotedPattern} ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?; else echo 1; fi`,
               (err, stream) => {
                 if (err) {
                   clearTimeout(checkTimeout);
@@ -130,15 +139,25 @@ async function deploySSHKeyToHost(
             // Ignore parse errors
           }
 
-          const escapedKey = actualPublicKey
-            .replace(/\\/g, "\\\\")
-            .replace(/'/g, "'\\''");
-          const escapedName = credData.name
-            .replace(/\\/g, "\\\\")
-            .replace(/'/g, "'\\''");
+          // Refuse newlines / null bytes in credential material — these would
+          // let an attacker inject an extra authorized_keys line under their
+          // control (e.g. their own SSH key with `command=` restrictions).
+          if (
+            /[\r\n\0]/.test(actualPublicKey) ||
+            /[\r\n\0]/.test(credData.name)
+          ) {
+            clearTimeout(addTimeout);
+            return rejectAdd(
+              new Error(
+                "Public key or credential name contains illegal control characters",
+              ),
+            );
+          }
+          const authorizedLine = `${actualPublicKey} ${credData.name}@Termix`;
+          const quotedLine = shellSingleQuote(authorizedLine);
 
           conn.exec(
-            `printf '%s\n' '${escapedKey} ${escapedName}@Termix' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+            `printf '%s\n' ${quotedLine} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
             (err, stream) => {
               if (err) {
                 clearTimeout(addTimeout);
@@ -190,8 +209,9 @@ async function deploySSHKeyToHost(
             }
 
             const keyPattern = keyParts[1];
+            const quotedPattern = shellSingleQuote(keyPattern);
             conn.exec(
-              `grep -F "${keyPattern}" ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?`,
+              `grep -F -- ${quotedPattern} ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?`,
               (err, stream) => {
                 if (err) {
                   clearTimeout(verifyTimeout);

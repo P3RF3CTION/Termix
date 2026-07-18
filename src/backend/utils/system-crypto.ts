@@ -376,7 +376,9 @@ class SystemCrypto {
     const envPath = path.join(dataDir, ".env");
 
     try {
-      await fs.mkdir(dataDir, { recursive: true });
+      // 0700 on the data dir keeps peer OS users from reading the .env file.
+      // Best-effort — some Windows / Docker volumes ignore modes.
+      await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
 
       let envContent = "";
 
@@ -397,7 +399,13 @@ class SystemCrypto {
         envContent += `${key}=${value}\n`;
       }
 
-      await fs.writeFile(envPath, envContent);
+      // .env holds JWT/DB/OIDC secrets; keep it owner-only.
+      await fs.writeFile(envPath, envContent, { mode: 0o600 });
+      try {
+        await fs.chmod(envPath, 0o600);
+      } catch {
+        // best-effort on platforms without POSIX permissions
+      }
 
       process.env[key] = value;
     } catch (error) {

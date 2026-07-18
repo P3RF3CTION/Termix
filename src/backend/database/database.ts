@@ -20,6 +20,7 @@ import proxmoxRoutes from "./routes/proxmox.js";
 import { registerAuditLogRoutes } from "./routes/audit-log-routes.js";
 import { registerTailscaleRoutes } from "./routes/tailscale-routes.js";
 import { createCorsMiddleware } from "../utils/cors-config.js";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -60,7 +61,15 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-app.set("trust proxy", true);
+// Only trust the first proxy hop (typically nginx/caddy on the same host).
+// `true` would trust the entire X-Forwarded-For chain and let any client
+// spoof req.ip for rate limiting and audit logs.
+// Operators running behind multiple proxies can override via TRUST_PROXY_HOPS.
+const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? "1");
+app.set(
+  "trust proxy",
+  Number.isFinite(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1,
+);
 
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -69,13 +78,27 @@ app.use(createCorsMiddleware());
 
 const uploadsDir = path.join(process.env.DATA_DIR || "./db/data", "uploads");
 
+function sanitizeUploadFilename(original: string): string {
+  const base = path.basename(String(original || ""));
+  // Strip anything that isn't a safe filename character. Prevents path
+  // traversal (e.g. `../../etc/attacker.sqlite`) and null-byte tricks.
+  const safe = base.replace(/[^a-zA-Z0-9._-]/g, "_");
+  // Refuse dotfiles and empty results.
+  if (!safe || safe.startsWith(".")) {
+    return "upload.sqlite";
+  }
+  return safe.slice(0, 128);
+}
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
     const timestamp = Date.now();
-    cb(null, `${timestamp}-${file.originalname}`);
+    const safeName = sanitizeUploadFilename(file.originalname);
+    const uniq = crypto.randomBytes(6).toString("hex");
+    cb(null, `${timestamp}-${uniq}-${safeName}`);
   },
 });
 
@@ -85,9 +108,10 @@ const upload = multer({
     fileSize: 1024 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
+    const safeName = sanitizeUploadFilename(file.originalname);
     if (
-      file.originalname.endsWith(".termix-export.sqlite") ||
-      file.originalname.endsWith(".sqlite")
+      safeName.endsWith(".termix-export.sqlite") ||
+      safeName.endsWith(".sqlite")
     ) {
       cb(null, true);
     } else {

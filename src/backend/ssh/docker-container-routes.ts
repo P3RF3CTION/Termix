@@ -8,8 +8,14 @@ type DockerSession = {
   lastActive: number;
   activeOperations: number;
   hostId?: number;
+  userId?: string;
   isWindows?: boolean;
 };
+
+// Each Docker route takes a client-supplied sessionId. Without an ownership
+// check (session.userId === caller), any authenticated user could operate
+// on another user's SSH-backed docker session. Each handler enforces the
+// check inline right after `sshSessions[sessionId]` lookup.
 
 type PendingDockerTotpSession = unknown;
 
@@ -87,6 +93,10 @@ export function registerDockerContainerRoutes(
       return res.status(400).json({
         error: "SSH session not found or not connected",
       });
+    }
+
+    if (session.userId && session.userId !== userId) {
+      return res.status(403).json({ error: "Session access denied" });
     }
 
     session.lastActive = Date.now();
@@ -186,6 +196,10 @@ export function registerDockerContainerRoutes(
       });
     }
 
+    if (session.userId && session.userId !== userId) {
+      return res.status(403).json({ error: "Session access denied" });
+    }
+
     session.lastActive = Date.now();
     session.activeOperations++;
 
@@ -279,6 +293,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
       }
 
       session.lastActive = Date.now();
@@ -381,6 +399,10 @@ export function registerDockerContainerRoutes(
         });
       }
 
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
+      }
+
       session.lastActive = Date.now();
       session.activeOperations++;
 
@@ -479,6 +501,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
       }
 
       session.lastActive = Date.now();
@@ -581,6 +607,10 @@ export function registerDockerContainerRoutes(
         });
       }
 
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
+      }
+
       session.lastActive = Date.now();
       session.activeOperations++;
 
@@ -679,6 +709,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
       }
 
       session.lastActive = Date.now();
@@ -784,6 +818,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
       }
 
       session.lastActive = Date.now();
@@ -916,6 +954,10 @@ export function registerDockerContainerRoutes(
         });
       }
 
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
+      }
+
       session.lastActive = Date.now();
       session.activeOperations++;
 
@@ -1026,6 +1068,10 @@ export function registerDockerContainerRoutes(
         return res.status(400).json({
           error: "SSH session not found or not connected",
         });
+      }
+
+      if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: "Session access denied" });
       }
 
       session.lastActive = Date.now();

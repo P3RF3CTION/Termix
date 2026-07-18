@@ -1,6 +1,11 @@
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
+
+// Domain names per RFC 1035 (letters, digits, hyphens, dots, up to 253 chars).
+const DOMAIN_RE = /^(?=.{1,253}$)(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)+[A-Za-z]{2,63}$/;
+// RFC 5321-ish loose email check.
+const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$/;
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { RequestHandler, Router } from "express";
 import { eq } from "drizzle-orm";
@@ -35,7 +40,7 @@ function getCertInfo(): {
 } {
   const certFile = path.join(SSL_DIR, "termix.crt");
   try {
-    execSync(`openssl x509 -in "${certFile}" -noout 2>/dev/null`, {
+    execFileSync("openssl", ["x509", "-in", certFile, "-noout"], {
       stdio: "pipe",
     });
   } catch {
@@ -43,8 +48,9 @@ function getCertInfo(): {
   }
 
   try {
-    const endDateRaw = execSync(
-      `openssl x509 -in "${certFile}" -noout -enddate`,
+    const endDateRaw = execFileSync(
+      "openssl",
+      ["x509", "-in", certFile, "-noout", "-enddate"],
       { stdio: "pipe" },
     )
       .toString()
@@ -53,17 +59,21 @@ function getCertInfo(): {
     const expiresAt = new Date(endDateRaw).toISOString();
 
     try {
-      execSync(`openssl x509 -in "${certFile}" -checkend 0 -noout`, {
-        stdio: "pipe",
-      });
+      execFileSync(
+        "openssl",
+        ["x509", "-in", certFile, "-checkend", "0", "-noout"],
+        { stdio: "pipe" },
+      );
     } catch {
       return { status: "expired", expiresAt };
     }
 
     try {
-      execSync(`openssl x509 -in "${certFile}" -checkend 2592000 -noout`, {
-        stdio: "pipe",
-      });
+      execFileSync(
+        "openssl",
+        ["x509", "-in", certFile, "-checkend", "2592000", "-noout"],
+        { stdio: "pipe" },
+      );
       return { status: "valid", expiresAt };
     } catch {
       return { status: "expiring", expiresAt };
@@ -260,8 +270,19 @@ export function registerAcmeSSLRoutes(
         return res.status(400).json({ error: "Domain and email are required" });
       }
 
+      // Refuse anything that isn't a strictly valid domain / email. The
+      // values are ultimately handed to certbot via execFileSync (no shell),
+      // but validating up front also prevents malformed cert requests and
+      // stops attempts at shell-metacharacter tricks reaching disk logs.
+      if (typeof domain !== "string" || !DOMAIN_RE.test(domain)) {
+        return res.status(400).json({ error: "Invalid domain name" });
+      }
+      if (typeof email !== "string" || !EMAIL_RE.test(email)) {
+        return res.status(400).json({ error: "Invalid email address" });
+      }
+
       try {
-        execSync("certbot --version", { stdio: "pipe" });
+        execFileSync("certbot", ["--version"], { stdio: "pipe" });
       } catch {
         return res
           .status(500)
@@ -271,7 +292,7 @@ export function registerAcmeSSLRoutes(
       await fs.mkdir(SSL_DIR, { recursive: true });
       await fs.mkdir(ACME_WEBROOT, { recursive: true });
 
-      let certbotCmd: string;
+      let certbotArgs: string[];
 
       if (challengeType === "dns-cloudflare") {
         if (!cloudflareToken) {
@@ -289,38 +310,37 @@ export function registerAcmeSSLRoutes(
           { mode: 0o600 },
         );
 
-        certbotCmd = [
-          "certbot",
+        certbotArgs = [
           "certonly",
           "--non-interactive",
           "--agree-tos",
           "--dns-cloudflare",
-          `--dns-cloudflare-credentials "${CLOUDFLARE_CREDENTIALS_FILE}"`,
+          "--dns-cloudflare-credentials",
+          CLOUDFLARE_CREDENTIALS_FILE,
           "--dns-cloudflare-propagation-seconds",
           "30",
           "-d",
-          `"${domain}"`,
+          domain,
           "--email",
-          `"${email}"`,
+          email,
           "--cert-name",
           "termix",
-        ].join(" ");
+        ];
       } else {
-        certbotCmd = [
-          "certbot",
+        certbotArgs = [
           "certonly",
           "--non-interactive",
           "--agree-tos",
           "--webroot",
           "-w",
-          `"${ACME_WEBROOT}"`,
+          ACME_WEBROOT,
           "-d",
-          `"${domain}"`,
+          domain,
           "--email",
-          `"${email}"`,
+          email,
           "--cert-name",
           "termix",
-        ].join(" ");
+        ];
       }
 
       authLogger.info("Requesting Let's Encrypt certificate", {
@@ -329,7 +349,9 @@ export function registerAcmeSSLRoutes(
         operation: "acme_cert_request",
       });
 
-      execSync(certbotCmd, { stdio: "pipe", timeout: 120000 });
+      // execFileSync with an argv array — no shell interpretation, so
+      // domain/email cannot escape their argument boundary.
+      execFileSync("certbot", certbotArgs, { stdio: "pipe", timeout: 120000 });
 
       const liveDir = `/etc/letsencrypt/live/termix`;
       const fullchainSrc = path.join(liveDir, "fullchain.pem");

@@ -1,5 +1,6 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
+import crypto from "crypto";
 import { and, eq, ne } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import QRCode from "qrcode";
@@ -253,8 +254,11 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
+      // TOTP backup codes bypass the second factor entirely — they MUST be
+      // cryptographically unpredictable. Math.random() is a non-CSPRNG and
+      // recoverable from a handful of prior outputs.
       const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
+        crypto.randomBytes(5).toString("hex").toUpperCase(),
       );
 
       const backupCodesJson = JSON.stringify(backupCodes);
@@ -460,8 +464,11 @@ export function registerUserTotpRoutes(
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
 
+      // TOTP backup codes bypass the second factor entirely — they MUST be
+      // cryptographically unpredictable. Math.random() is a non-CSPRNG and
+      // recoverable from a handful of prior outputs.
       const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
+        crypto.randomBytes(5).toString("hex").toUpperCase(),
       );
 
       const backupCodesJson = JSON.stringify(backupCodes);

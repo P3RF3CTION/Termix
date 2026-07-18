@@ -14,15 +14,6 @@ function getAllowedOrigins(): string[] {
     .filter(Boolean);
 }
 
-function isLocalRequest(req: Request): boolean {
-  const remoteAddr = req.socket?.remoteAddress || req.ip || "";
-  return (
-    remoteAddr === "127.0.0.1" ||
-    remoteAddr === "::1" ||
-    remoteAddr === "::ffff:127.0.0.1"
-  );
-}
-
 export function createCorsMiddleware(
   methods: string[] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   extraHeaders: string[] = [],
@@ -42,22 +33,37 @@ export function createCorsMiddleware(
   return (req: Request, res: Response, next: NextFunction) => {
     const handler = cors({
       origin: (origin, callback) => {
-        // No origin = same-origin or non-browser request (curl, internal service calls)
+        // No origin = server-to-server or non-browser (curl, internal service calls).
+        // Do NOT enable `credentials` for these — the CORS lib will still allow the
+        // request without echoing Access-Control-Allow-Credentials, which is what
+        // we want (browsers with `credentials:'include'` always send an Origin).
         if (!origin) return callback(null, true);
-
-        // Requests coming from localhost (nginx proxy, internal service calls)
-        if (isLocalRequest(req)) return callback(null, true);
 
         if (DEV_ORIGINS.includes(origin)) return callback(null, true);
         if (origin.startsWith(ELECTRON_FILE_ORIGIN))
           return callback(null, true);
 
         const configured = getAllowedOrigins();
-        if (configured.includes("*") || configured.includes(origin))
-          return callback(null, true);
+        // Never allow a wildcard with credentials — that would let any web origin
+        // read authenticated responses. Treat "*" as "any origin present in list is fine",
+        // but require the explicit-origin path for credentialed CORS.
+        if (configured.includes(origin)) return callback(null, true);
 
-        const sameOrigin = getRequestOrigin(req);
-        if (origin === sameOrigin) return callback(null, true);
+        // Same-origin fallback: derive from a trusted PUBLIC_URL env var only.
+        // Do NOT trust X-Forwarded-Host for security decisions (an attacker
+        // controls it when the reverse proxy allows it through).
+        const publicUrl = process.env.PUBLIC_URL;
+        if (publicUrl && origin === publicUrl.replace(/\/+$/, "")) {
+          return callback(null, true);
+        }
+
+        // Only fall back to the request-derived origin when no PUBLIC_URL is set
+        // (dev deployments without a documented public URL). This still trusts
+        // X-Forwarded-Host, so operators are strongly encouraged to set PUBLIC_URL.
+        if (!publicUrl) {
+          const sameOrigin = getRequestOrigin(req);
+          if (origin === sameOrigin) return callback(null, true);
+        }
 
         callback(new Error("Not allowed by CORS"));
       },

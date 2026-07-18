@@ -65,21 +65,112 @@ router.use(authManager.createAuthMiddleware());
  *       500:
  *         description: Server error
  */
+// Allowlist of guacd options we forward from client input on the free-form
+// /token endpoint. Anything not in this list is dropped — prevents attacker-
+// controlled properties (including __proto__/constructor) or novel guacd
+// flags from being smuggled into the token.
+const GUAC_TOKEN_OPTION_ALLOWLIST = new Set([
+  // RDP
+  "security",
+  "ignore-cert",
+  "disable-auth",
+  "server-layout",
+  "color-depth",
+  "resize-method",
+  "console",
+  "console-audio",
+  "enable-drive",
+  "drive-name",
+  "drive-path",
+  "preconnection-id",
+  "preconnection-blob",
+  "enable-wallpaper",
+  "enable-theming",
+  "enable-font-smoothing",
+  "enable-full-window-drag",
+  "enable-desktop-composition",
+  "enable-menu-animations",
+  "disable-bitmap-caching",
+  "disable-offscreen-caching",
+  "disable-glyph-caching",
+  // VNC
+  "color-depth",
+  "cursor",
+  "read-only",
+  "swap-red-blue",
+  "encodings",
+  // Common
+  "width",
+  "height",
+  "dpi",
+  "audio-servername",
+  "recording-path",
+  "recording-name",
+  "create-recording-path",
+  "recording-exclude-output",
+  "recording-exclude-mouse",
+  "recording-include-keys",
+]);
+
+function filterGuacOptions(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  const options: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === "__proto__" || key === "constructor" || key === "prototype") {
+      continue;
+    }
+    if (!GUAC_TOKEN_OPTION_ALLOWLIST.has(key)) continue;
+    if (value === "auto") continue;
+    options[key] = value;
+  }
+  return options;
+}
+
+// Restrict free-form /token connections. Without this restriction any
+// authenticated user can point guacd at arbitrary internal hostnames
+// (169.254.169.254, 127.0.0.1:22, kube-apiserver, …) — a straightforward
+// SSRF pivot into the Termix container's network. Operators who need the
+// free-form endpoint (e.g. for custom integrations) can re-enable via
+// GUACAMOLE_ALLOW_FREE_FORM_TOKEN=true.
+const GUAC_FREE_FORM_ENABLED =
+  (process.env.GUACAMOLE_ALLOW_FREE_FORM_TOKEN || "").trim().toLowerCase() ===
+  "true";
+
 router.post("/token", async (req, res) => {
   try {
+    if (!GUAC_FREE_FORM_ENABLED) {
+      return res.status(403).json({
+        error:
+          "Free-form Guacamole tokens are disabled. Use /guacamole/connect-host/:hostId with a saved host.",
+      });
+    }
+
+    // Only admins may issue free-form connections when the endpoint is enabled.
+    const userIdCheck = (req as AuthenticatedRequest).userId;
+    if (userIdCheck) {
+      const perm = PermissionManager.getInstance();
+      const isAdmin = await perm.isAdmin(userIdCheck);
+      if (!isAdmin) {
+        return res.status(403).json({
+          error: "Free-form Guacamole tokens require administrator privileges.",
+        });
+      }
+    }
+
     const { type, hostname, port, username, password, domain, ...rawOptions } =
       req.body;
 
-    // Strip "auto" sentinel values before forwarding to guacd
-    const options: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(rawOptions)) {
-      if (value !== "auto") options[key] = value;
-    }
+    const options = filterGuacOptions(rawOptions);
 
     if (!type || !hostname) {
       return res
         .status(400)
         .json({ error: "Missing required fields: type and hostname" });
+    }
+
+    if (typeof hostname !== "string" || hostname.length > 255) {
+      return res.status(400).json({ error: "Invalid hostname" });
     }
 
     if (!["rdp", "vnc", "telnet"].includes(type)) {

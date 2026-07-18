@@ -92,8 +92,8 @@ export class SSHHostKeyVerifier {
               : await db.query.hosts.findFirst({ where: eq(hosts.id, hostId) });
 
           if (!host) {
-            sshLogger.warn(
-              "Host not found in database during key verification",
+            sshLogger.error(
+              "Host not found in database during key verification - refusing to connect",
               {
                 operation: "host_key_no_host",
                 hostId,
@@ -102,7 +102,9 @@ export class SSHHostKeyVerifier {
                 userId,
               },
             );
-            verify(true);
+            // Fail-closed: a race that deletes the host row mid-connect must
+            // not silently accept an unknown key.
+            verify(false);
             return;
           }
 
@@ -124,17 +126,19 @@ export class SSHHostKeyVerifier {
             }
 
             if (!ws) {
-              sshLogger.warn(
-                "No WebSocket available for host key verification prompt",
+              sshLogger.error(
+                "No WebSocket available for host key verification prompt - refusing to trust unknown key",
                 {
                   operation: "host_key_no_ws",
                   hostId,
                   ip,
                   port,
                   userId,
+                  message:
+                    "This host has no stored fingerprint yet. Please connect via Terminal once to verify and accept the host key before opening SFTP/tunnel connections.",
                 },
               );
-              verify(true);
+              verify(false);
               return;
             }
 
@@ -215,25 +219,38 @@ export class SSHHostKeyVerifier {
           });
 
           if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
+            // A silent auto-accept on jump-host key CHANGES defeats MITM
+            // protection for the whole chain. Fall through to the same
+            // prompt/reject path used for the target host.
+            sshLogger.error(
+              "Jump host key changed - requires explicit user confirmation",
+              {
+                operation: "host_key_jump_changed",
+                hostId,
+                ip,
+                port,
+                fingerprint,
+                keyType,
+                userId,
+                isJumpHost: true,
+              },
             );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
-            return;
+
+            if (!ws) {
+              sshLogger.error(
+                "Jump host key changed - please connect via Terminal to verify the new key",
+                {
+                  operation: "host_key_jump_no_ws_reject",
+                  hostId,
+                  ip,
+                  port,
+                  userId,
+                },
+              );
+              verify(false);
+              return;
+            }
+            // Fall through to the shared changed-key prompt below.
           }
 
           if (!ws) {

@@ -78,13 +78,27 @@ export function execWithSudoBuffer(
   sudoPassword: string,
 ): Promise<{ stdout: Buffer; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    const escapedPassword = sudoPassword.replace(/'/g, "'\"'\"'");
-    const sudoCommand = `echo '${escapedPassword}' | sudo -S ${command} 2>&1`;
+    // Write the sudo password to stdin instead of interpolating it into
+    // an `echo 'PASSWORD' | sudo -S …` shell string. The old form put the
+    // plaintext password on the remote host's process command line, visible
+    // to any local `ps auxww` and shell history for the duration of the
+    // command.
+    const sudoCommand = `sudo -S -p '' ${command} 2>&1`;
 
     execChannel(session, sudoCommand, (err, stream) => {
       if (err) {
         resolve({ stdout: Buffer.alloc(0), stderr: err.message, code: 1 });
         return;
+      }
+
+      // Feed the password once (plus newline) directly through stdin — sudo
+      // reads it, then the pipe closes so the remote command can continue
+      // reading from stdin normally.
+      try {
+        stream.stdin?.write(`${sudoPassword}\n`);
+        stream.stdin?.end();
+      } catch {
+        // stream may already be closed on error paths
       }
 
       const stdoutChunks: Buffer[] = [];

@@ -34,7 +34,10 @@ async function pruneOldLogs(): Promise<void> {
       if (row.recordingPath) {
         const resolved = path.resolve(row.recordingPath);
         const allowed = path.resolve(DATA_DIR, "session_logs");
-        if (resolved.startsWith(allowed) && fs.existsSync(resolved)) {
+        if (
+          (resolved === allowed || resolved.startsWith(allowed + path.sep)) &&
+          fs.existsSync(resolved)
+        ) {
           await fs.promises.unlink(resolved).catch(() => {});
         }
       }
@@ -225,7 +228,10 @@ router.get(
 
       const resolvedPath = path.resolve(filePath);
       const allowedBase = path.resolve(DATA_DIR, "session_logs");
-      if (!resolvedPath.startsWith(allowedBase)) {
+      if (
+        resolvedPath !== allowedBase &&
+        !resolvedPath.startsWith(allowedBase + path.sep)
+      ) {
         return res.status(403).json({ error: "Forbidden" });
       }
 
@@ -297,7 +303,11 @@ router.delete("/:id", authenticateJWT, async (req: Request, res: Response) => {
     if (filePath) {
       const resolvedPath = path.resolve(filePath);
       const allowedBase = path.resolve(DATA_DIR, "session_logs");
-      if (resolvedPath.startsWith(allowedBase) && fs.existsSync(resolvedPath)) {
+      if (
+        (resolvedPath === allowedBase ||
+          resolvedPath.startsWith(allowedBase + path.sep)) &&
+        fs.existsSync(resolvedPath)
+      ) {
         await fs.promises.unlink(resolvedPath).catch(() => {});
       }
     }

@@ -1,9 +1,18 @@
 import type { Request, Response, Router } from "express";
+import crypto from "crypto";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { SystemCrypto } from "../../utils/system-crypto.js";
 import { sshLogger } from "../../utils/logger.js";
 import { db } from "../db/index.js";
 import { hosts } from "../db/schema.js";
+
+function safeStringEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
 
 export function registerHostInternalRoutes(router: Router): void {
   /**
@@ -28,11 +37,11 @@ export function registerHostInternalRoutes(router: Router): void {
       const systemCrypto = SystemCrypto.getInstance();
       const expectedToken = await systemCrypto.getInternalAuthToken();
 
-      if (internalToken !== expectedToken) {
+      if (!safeStringEqual(internalToken, expectedToken)) {
         sshLogger.warn(
           "Unauthorized attempt to access internal SSH host endpoint",
           {
-            source: req.ip,
+            source: req.socket?.remoteAddress || req.ip,
             userAgent: req.headers["user-agent"],
             providedToken: internalToken ? "present" : "missing",
           },
@@ -128,7 +137,7 @@ export function registerHostInternalRoutes(router: Router): void {
       const systemCrypto = SystemCrypto.getInstance();
       const expectedToken = await systemCrypto.getInternalAuthToken();
 
-      if (internalToken !== expectedToken) {
+      if (!safeStringEqual(internalToken, expectedToken)) {
         return res
           .status(401)
           .json({ error: "Invalid internal authentication token" });
