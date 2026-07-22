@@ -15,7 +15,7 @@ export interface Role {
   displayName: string;
   description: string | null;
   isSystem: boolean;
-  permissions: string | null;
+  permissions: string[] | string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -40,7 +40,7 @@ export interface AccessRecord {
   roleDisplayName: string | null;
   grantedBy: string;
   grantedByUsername: string;
-  permissionLevel: "view";
+  permissionLevel: "connect" | "view" | "edit" | "manage";
   expiresAt: string | null;
   createdAt: string;
 }
@@ -170,6 +170,14 @@ export type ServerMetrics = {
     status?: "active" | "inactive" | "unknown";
     chains?: FirewallChain[];
   };
+  temperature?: {
+    source?: "sysfs" | "sensors" | "none";
+    highestCelsius?: number | null;
+    sensors?: Array<{
+      label: string;
+      celsius: number;
+    }>;
+  };
   lastChecked: string;
 };
 
@@ -180,7 +188,6 @@ export interface AuthResponse {
   userId?: string;
   is_oidc?: boolean;
   totp_enabled?: boolean;
-  data_unlocked?: boolean;
   requires_totp?: boolean;
   temp_token?: string;
   rememberMe?: boolean;
@@ -193,8 +200,9 @@ export interface UserInfo {
   username: string;
   is_admin: boolean;
   is_oidc: boolean;
-  data_unlocked: boolean;
   password_hash?: string;
+  data_unlocked?: boolean;
+  show_donation_modal?: boolean;
 }
 
 interface UserCount {
@@ -867,6 +875,9 @@ function initializeApiInstances() {
     getApiUrl("/tmux_monitor", 30010),
     "TMUX_MONITOR",
   );
+
+  // Homepage API (port 30012)
+  homepageApi = createApiInstance(getApiUrl("/homepage", 30012), "HOMEPAGE");
 }
 
 // Host Management API (port 30001) - supports SSH, RDP, VNC, Telnet
@@ -897,6 +908,9 @@ export let dockerApi: AxiosInstance;
 
 // Tmux Monitor API (port 30010) --- tmux-monitor ---
 export let tmuxMonitorApi: AxiosInstance;
+
+// Homepage API (port 30012)
+export let homepageApi: AxiosInstance;
 
 // Pre-initialize with default values to avoid undefined errors during early mounting
 initializeApiInstances();
@@ -1503,6 +1517,7 @@ export {
   bulkImportSSHHosts,
   importSSHConfigHosts,
   discoverProxmoxGuests,
+  syncProxmoxGuests,
   bulkUpdateSSHHosts,
   deleteSSHHost,
   getSSHHostById,
@@ -1701,7 +1716,6 @@ export async function loginUser(
       rememberMe: response.data.rememberMe,
       is_oidc: response.data.is_oidc,
       totp_enabled: response.data.totp_enabled,
-      data_unlocked: response.data.data_unlocked,
       token: response.data.token,
     };
   } catch (error) {
@@ -1762,6 +1776,14 @@ export async function getUserInfo(): Promise<UserInfo> {
     return response.data;
   } catch (error) {
     handleApiError(error, "fetch user info");
+  }
+}
+
+export async function dismissDonationModal(): Promise<void> {
+  try {
+    await authApi.post("/users/me/dismiss-donation-modal");
+  } catch (error) {
+    handleApiError(error, "dismiss donation modal");
   }
 }
 
@@ -1873,12 +1895,14 @@ export async function completePasswordReset(
   username: string,
   tempToken: string,
   newPassword: string,
+  confirmDataWipe = false,
 ): Promise<Record<string, unknown>> {
   try {
     const response = await authApi.post("/users/complete-reset", {
       username,
       tempToken,
       newPassword,
+      confirmDataWipe,
     });
     return response.data;
   } catch (error) {
@@ -1939,9 +1963,32 @@ export {
   disableOIDCConfig,
   getCommandHistoryEnabled,
   updateCommandHistoryEnabled,
+  adminResetUserPassword,
+  adminDisableUserTotp,
+  adminExportUserData,
   type ApiKey,
   type CreatedApiKey,
 } from "@/api/user-management-api";
+
+// ADMIN USER DATA MANAGEMENT
+// ============================================================================
+
+export {
+  adminGetUserHosts,
+  adminCreateUserHost,
+  adminUpdateUserHost,
+  adminDeleteUserHost,
+  adminGetHostPassword,
+  adminGetUserCredentials,
+  adminGetUserCredentialDetails,
+  adminCreateUserCredential,
+  adminUpdateUserCredential,
+  adminDeleteUserCredential,
+  adminGetUserSnippets,
+  adminCreateUserSnippet,
+  adminUpdateUserSnippet,
+  adminDeleteUserSnippet,
+} from "@/api/admin-user-data-api";
 
 export {
   setupTOTP,
@@ -1985,6 +2032,14 @@ export {
   generateKeyPair,
   deployCredentialToHost,
 } from "@/api/credentials-api";
+
+export {
+  getVaultProfiles,
+  createVaultProfile,
+  updateVaultProfile,
+  deleteVaultProfile,
+  type VaultProfilePayload,
+} from "@/api/vault-profiles-api";
 
 // ============================================================================
 // SNIPPETS API
@@ -2065,12 +2120,20 @@ export {
   assignRoleToUser,
   removeRoleFromUser,
   shareHost,
+  updateHostAccess,
   getHostAccess,
   revokeHostAccess,
+  getPermissionsCatalog,
+  getSharedHosts,
   shareSnippet,
   getSnippetAccess,
   revokeSnippetAccess,
   getSharedSnippets,
+} from "@/api/rbac-api";
+export type {
+  SharePermissionLevel,
+  ShareTarget,
+  PermissionCatalogEntry,
 } from "@/api/rbac-api";
 
 // ============================================================================
@@ -2113,3 +2176,31 @@ export {
   type ActiveSessionInfo,
   type UserPreferences,
 } from "@/api/open-tabs-api";
+
+// ============================================================================
+// TERMIX ID API
+// ============================================================================
+
+export {
+  getMyTermixId,
+  checkTermixIdHandle,
+  createTermixId,
+  updateTermixId,
+  deleteTermixId,
+  addTermixIdKey,
+  generateTermixIdKey,
+  setTermixIdKeyEnabled,
+  deleteTermixIdKey,
+  getMyCa,
+  createCa,
+  rotateCa,
+  deleteCa,
+  issueCertificate,
+  getLinkedCredentialIds,
+  type TermixIdentity,
+  type TermixIdentityKey,
+  type TermixIdMe,
+  type GeneratedKey,
+  type TermixIdCa,
+  type IssuedCertificate,
+} from "@/api/termix-id-api";

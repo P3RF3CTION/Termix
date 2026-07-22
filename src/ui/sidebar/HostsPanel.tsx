@@ -44,16 +44,11 @@ import {
 } from "@/main-axios";
 import type { SSHHostWithStatus } from "@/main-axios";
 import type { Host, HostFolder, TabType } from "@/types/ui-types";
-
-type SortKey =
-  | "default"
-  | "name-asc"
-  | "name-desc"
-  | "ip-asc"
-  | "ip-desc"
-  | "status-online"
-  | "status-offline"
-  | "pinned";
+import {
+  resolveHostSortPreferences,
+  sortHostTree,
+  type SortKey,
+} from "@/sidebar/host-sort";
 
 type FilterState = {
   status: ("online" | "offline" | "pinned")[];
@@ -125,43 +120,6 @@ function groupHosts(
       children: members,
     }));
   return { name: "root", children };
-}
-
-function sortHostTree(folder: HostFolder, key: SortKey): HostFolder {
-  if (key === "default") return folder;
-
-  const comparator = (a: Host | HostFolder, b: Host | HostFolder): number => {
-    const aIsFolder = isFolder(a);
-    const bIsFolder = isFolder(b);
-    if (aIsFolder && !bIsFolder) return -1;
-    if (!aIsFolder && bIsFolder) return 1;
-    if (aIsFolder && bIsFolder)
-      return (a as HostFolder).name.localeCompare((b as HostFolder).name);
-    const ha = a as Host,
-      hb = b as Host;
-    switch (key) {
-      case "name-asc":
-        return ha.name.localeCompare(hb.name);
-      case "name-desc":
-        return hb.name.localeCompare(ha.name);
-      case "ip-asc":
-        return ha.ip.localeCompare(hb.ip);
-      case "ip-desc":
-        return hb.ip.localeCompare(ha.ip);
-      case "status-online":
-        return (hb.online ? 1 : 0) - (ha.online ? 1 : 0);
-      case "status-offline":
-        return (ha.online ? 1 : 0) - (hb.online ? 1 : 0);
-      case "pinned":
-        return (hb.pin ? 1 : 0) - (ha.pin ? 1 : 0);
-    }
-    return 0;
-  };
-
-  const sortedChildren = [...folder.children]
-    .sort(comparator)
-    .map((child) => (isFolder(child) ? sortHostTree(child, key) : child));
-  return { ...folder, children: sortedChildren };
 }
 
 function hostPassesFilters(host: Host, filters: FilterState): boolean {
@@ -255,9 +213,18 @@ export function HostsPanel({
   const [proxmoxDefaultUsername, setProxmoxDefaultUsername] = useState<
     string | undefined
   >(undefined);
-  const [sortKey, setSortKey] = useState<SortKey>(
-    () => (localStorage.getItem("hostSortKey") as SortKey) ?? "default",
-  );
+  const [sortKey, setSortKey] = useState<SortKey>(() => {
+    return resolveHostSortPreferences(
+      localStorage.getItem("hostSortKey"),
+      localStorage.getItem("hostPinnedFirst"),
+    ).sortKey;
+  });
+  const [pinnedFirst, setPinnedFirst] = useState(() => {
+    return resolveHostSortPreferences(
+      localStorage.getItem("hostSortKey"),
+      localStorage.getItem("hostPinnedFirst"),
+    ).pinnedFirst;
+  });
   const [groupKey, setGroupKey] = useState<GroupKey>(
     () => (localStorage.getItem("hostGroupKey") as GroupKey) ?? "folder",
   );
@@ -278,6 +245,11 @@ export function HostsPanel({
   function handleSortChange(key: SortKey) {
     setSortKey(key);
     localStorage.setItem("hostSortKey", key);
+  }
+
+  function handlePinnedFirstChange(enabled: boolean) {
+    setPinnedFirst(enabled);
+    localStorage.setItem("hostPinnedFirst", String(enabled));
   }
 
   function handleGroupChange(key: GroupKey) {
@@ -320,9 +292,25 @@ export function HostsPanel({
   }
 
   useEffect(() => {
-    getSSHHosts()
-      .then(setRawHosts)
-      .catch(() => {});
+    let cancelled = false;
+    const load = () => {
+      getSSHHosts()
+        .then((hosts) => {
+          if (!cancelled) setRawHosts(hosts);
+        })
+        .catch(() => {});
+    };
+    load();
+    const onChanged = () => load();
+    window.addEventListener("ssh-hosts:changed", onChanged);
+    window.addEventListener("hosts:refresh", onChanged);
+    window.addEventListener("termix:hosts-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("ssh-hosts:changed", onChanged);
+      window.removeEventListener("hosts:refresh", onChanged);
+      window.removeEventListener("termix:hosts-changed", onChanged);
+    };
   }, []);
 
   function handleEditingChange(editing: boolean) {
@@ -347,20 +335,24 @@ export function HostsPanel({
     }
   }
 
-  async function handleExportHosts() {
+  async function handleExportHosts(share = false) {
     try {
-      const result = await exportAllSSHHosts();
+      const result = await exportAllSSHHosts(
+        share ? { share: true } : undefined,
+      );
       const data = JSON.stringify(result, null, 2);
       const blob = new Blob([data], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "termix-hosts.json";
+      a.download = share ? "termix-hosts-share.json" : "termix-hosts.json";
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast.success(t("hosts.hostsExported"));
+      toast.success(
+        t(share ? "hosts.hostsShareExported" : "hosts.hostsExported"),
+      );
     } catch {
       toast.error(t("hosts.exportFailed"));
     }
@@ -464,6 +456,10 @@ export function HostsPanel({
                 const hostsArray = Array.isArray(parsed)
                   ? parsed
                   : (parsed.hosts ?? []);
+                const credentialsArray =
+                  !Array.isArray(parsed) && Array.isArray(parsed.credentials)
+                    ? parsed.credentials
+                    : undefined;
                 if (!Array.isArray(hostsArray) || hostsArray.length === 0) {
                   toast.error("No hosts found in file");
                   return;
@@ -486,6 +482,7 @@ export function HostsPanel({
                 const result = await bulkImportSSHHosts(
                   normalized,
                   importOverwriteRef.current,
+                  credentialsArray,
                 );
                 const hosts = await getSSHHosts();
                 setRawHosts(hosts);
@@ -610,11 +607,18 @@ export function HostsPanel({
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
-                  onClick={handleExportHosts}
+                  onClick={() => handleExportHosts(false)}
                   disabled={rawHosts.length === 0}
                 >
                   <Download className="size-3.5 mr-2" />
                   {t("hosts.exportAll")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => handleExportHosts(true)}
+                  disabled={rawHosts.length === 0}
+                >
+                  <Download className="size-3.5 mr-2" />
+                  {t("hosts.exportForSharing")}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={handleDownloadSample}>
                   <Download className="size-3.5 mr-2" />
@@ -638,7 +642,7 @@ export function HostsPanel({
                 <Button
                   variant="ghost"
                   size="icon"
-                  className={`size-7 ${sortKey !== "default" ? "text-accent-brand" : "text-muted-foreground hover:text-foreground"}`}
+                  className={`size-7 ${sortKey !== "default" || pinnedFirst ? "text-accent-brand" : "text-muted-foreground hover:text-foreground"}`}
                   title={t("hosts.sortHosts")}
                 >
                   <ArrowUpDown className="size-3.5" />
@@ -692,28 +696,32 @@ export function HostsPanel({
                   </DropdownMenuItem>
                 ))}
                 <DropdownMenuSeparator />
-                {(["status-online", "status-offline", "pinned"] as const).map(
-                  (key) => (
-                    <DropdownMenuItem
-                      key={key}
-                      onClick={() => handleSortChange(key)}
-                      className="flex items-center gap-1.5"
-                    >
-                      {sortKey === key ? (
-                        <Check className="size-3 shrink-0 text-accent-brand" />
-                      ) : (
-                        <span className="size-3 shrink-0 inline-block" />
-                      )}
-                      {t(
-                        key === "status-online"
-                          ? "hosts.sortOnlineFirst"
-                          : key === "status-offline"
-                            ? "hosts.sortOfflineFirst"
-                            : "hosts.sortPinnedFirst",
-                      )}
-                    </DropdownMenuItem>
-                  ),
-                )}
+                {(["status-online", "status-offline"] as const).map((key) => (
+                  <DropdownMenuItem
+                    key={key}
+                    onClick={() => handleSortChange(key)}
+                    className="flex items-center gap-1.5"
+                  >
+                    {sortKey === key ? (
+                      <Check className="size-3 shrink-0 text-accent-brand" />
+                    ) : (
+                      <span className="size-3 shrink-0 inline-block" />
+                    )}
+                    {t(
+                      key === "status-online"
+                        ? "hosts.sortOnlineFirst"
+                        : "hosts.sortOfflineFirst",
+                    )}
+                  </DropdownMenuItem>
+                ))}
+                <DropdownMenuSeparator />
+                <DropdownMenuCheckboxItem
+                  checked={pinnedFirst}
+                  onCheckedChange={handlePinnedFirstChange}
+                  onSelect={(event) => event.preventDefault()}
+                >
+                  {t("hosts.sortPinnedFirst")}
+                </DropdownMenuCheckboxItem>
               </DropdownMenuContent>
             </DropdownMenu>
             <DropdownMenu>
@@ -959,11 +967,18 @@ export function HostsPanel({
                       {t("hosts.importSSHConfig")}
                     </DropdownMenuItem>
                     <DropdownMenuItem
-                      onClick={handleExportHosts}
+                      onClick={() => handleExportHosts(false)}
                       disabled={rawHosts.length === 0}
                     >
                       <Download className="size-3.5 mr-2" />
                       {t("hosts.exportAll")}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => handleExportHosts(true)}
+                      disabled={rawHosts.length === 0}
+                    >
+                      <Download className="size-3.5 mr-2" />
+                      {t("hosts.exportForSharing")}
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={handleDownloadSample}>
                       <Download className="size-3.5 mr-2" />
@@ -994,7 +1009,10 @@ export function HostsPanel({
           children={
             hostTree
               ? groupHosts(
-                  applyFilters(sortHostTree(hostTree, sortKey), filterState),
+                  applyFilters(
+                    sortHostTree(hostTree, sortKey, pinnedFirst),
+                    filterState,
+                  ),
                   groupKey,
                   groupLabel,
                 ).children

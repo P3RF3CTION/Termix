@@ -3,10 +3,9 @@ import type {
   CredentialBackend,
 } from "../../../types/index.js";
 import type { Request, RequestHandler, Response, Router } from "express";
-import { eq } from "drizzle-orm";
 import ssh2Pkg from "ssh2";
-import { db } from "../db/index.js";
-import { hosts, sshCredentials } from "../db/schema.js";
+import { createCurrentHostResolutionRepository } from "../repositories/factory.js";
+import { preparePrivateKeyForSSH2 } from "../../utils/ssh-key-utils.js";
 
 const { Client } = ssh2Pkg;
 
@@ -85,6 +84,10 @@ async function deploySSHKeyToHost(
             }
 
             const keyPattern = keyParts[1];
+            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(keyPattern)) {
+              clearTimeout(checkTimeout);
+              return rejectCheck(new Error("Invalid public key data"));
+            }
 
             conn.exec(
               `if [ -f ~/.ssh/authorized_keys ]; then grep -F "${keyPattern}" ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?; else echo 1; fi`,
@@ -190,6 +193,10 @@ async function deploySSHKeyToHost(
             }
 
             const keyPattern = keyParts[1];
+            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(keyPattern)) {
+              clearTimeout(verifyTimeout);
+              return rejectVerify(new Error("Invalid public key data"));
+            }
             conn.exec(
               `grep -F "${keyPattern}" ~/.ssh/authorized_keys >/dev/null 2>&1; echo $?`,
               (err, stream) => {
@@ -312,19 +319,10 @@ async function deploySSHKeyToHost(
       } else if (hostConfig.authType === "key" && hostConfig.privateKey) {
         try {
           const privateKey = hostConfig.privateKey as string;
-          if (
-            !privateKey.includes("-----BEGIN") ||
-            !privateKey.includes("-----END")
-          ) {
-            throw new Error("Invalid private key format");
-          }
-
-          const cleanKey = privateKey
-            .trim()
-            .replace(/\r\n/g, "\n")
-            .replace(/\r/g, "\n");
-
-          connectionConfig.privateKey = Buffer.from(cleanKey, "utf8");
+          connectionConfig.privateKey = preparePrivateKeyForSSH2(
+            privateKey,
+            hostConfig.keyPassword as string | undefined,
+          );
 
           if (hostConfig.keyPassword) {
             connectionConfig.passphrase = hostConfig.keyPassword;
@@ -422,25 +420,20 @@ export function registerCredentialDeployRoutes(
           });
         }
 
-        const { SimpleDBOps } = await import("../../utils/simple-db-ops.js");
-        const credential = await SimpleDBOps.select(
-          db
-            .select()
-            .from(sshCredentials)
-            .where(eq(sshCredentials.id, credentialId))
-            .limit(1),
-          "ssh_credentials",
+        const repository = createCurrentHostResolutionRepository();
+        const credential = await repository.findCredentialByIdForUser(
+          credentialId,
           userId,
         );
 
-        if (!credential || credential.length === 0) {
+        if (!credential) {
           return res.status(404).json({
             success: false,
             error: "Credential not found",
           });
         }
 
-        const credData = credential[0] as unknown as CredentialBackend;
+        const credData = credential as unknown as CredentialBackend;
 
         if (credData.authType !== "key") {
           return res.status(400).json({
@@ -456,20 +449,17 @@ export function registerCredentialDeployRoutes(
             error: "Public key is required for deployment",
           });
         }
-        const targetHost = await SimpleDBOps.select(
-          db.select().from(hosts).where(eq(hosts.id, targetHostId)).limit(1),
-          "ssh_data",
+        const hostData = await repository.findHostByIdForUser(
+          targetHostId,
           userId,
         );
 
-        if (!targetHost || targetHost.length === 0) {
+        if (!hostData) {
           return res.status(404).json({
             success: false,
             error: "Target host not found",
           });
         }
-
-        const hostData = targetHost[0];
 
         const hostConfig = {
           ip: hostData.ip,
@@ -491,29 +481,21 @@ export function registerCredentialDeployRoutes(
           }
 
           try {
-            const { SimpleDBOps } =
-              await import("../../utils/simple-db-ops.js");
-            const hostCredential = await SimpleDBOps.select(
-              db
-                .select()
-                .from(sshCredentials)
-                .where(eq(sshCredentials.id, hostData.credentialId as number))
-                .limit(1),
-              "ssh_credentials",
+            const hostCredential = await repository.findCredentialByIdForUser(
+              hostData.credentialId as number,
               userId,
             );
 
-            if (hostCredential && hostCredential.length > 0) {
-              const cred = hostCredential[0];
+            if (hostCredential) {
+              hostConfig.authType = hostCredential.authType;
+              hostConfig.username = hostCredential.username;
 
-              hostConfig.authType = cred.authType;
-              hostConfig.username = cred.username;
-
-              if (cred.authType === "password") {
-                hostConfig.password = cred.password;
-              } else if (cred.authType === "key") {
-                hostConfig.privateKey = cred.privateKey || cred.key;
-                hostConfig.keyPassword = cred.keyPassword;
+              if (hostCredential.authType === "password") {
+                hostConfig.password = hostCredential.password;
+              } else if (hostCredential.authType === "key") {
+                hostConfig.privateKey =
+                  hostCredential.privateKey || hostCredential.key;
+                hostConfig.keyPassword = hostCredential.keyPassword;
               }
             } else {
               return res.status(400).json({

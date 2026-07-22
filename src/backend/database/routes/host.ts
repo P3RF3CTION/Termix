@@ -1,34 +1,35 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import express from "express";
-import { db } from "../db/index.js";
-import {
-  hosts,
-  sshCredentials,
-  sshCredentialUsage,
-  fileManagerRecent,
-  fileManagerPinned,
-  fileManagerShortcuts,
-  transferRecent,
-  commandHistory,
-  recentActivity,
-  hostAccess,
-  userRoles,
-  sessionRecordings,
-} from "../db/schema.js";
-import { eq, and, or, isNull, gte, sql, inArray, desc } from "drizzle-orm";
 import type { Request, Response } from "express";
 import axios from "axios";
 import multer from "multer";
 import { sshLogger, databaseLogger } from "../../utils/logger.js";
-import { SimpleDBOps } from "../../utils/simple-db-ops.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
 import { parseSSHKey } from "../../utils/ssh-key-utils.js";
-import { pickResolvedUsername } from "../../ssh/credential-username.js";
+import {
+  pickResolvedPassword,
+  pickResolvedUsername,
+} from "../../hosts/credential-username.js";
+import {
+  createCurrentCommandHistoryRepository,
+  createCurrentFileManagerBookmarkRepository,
+  createCurrentOpksshTokenRepository,
+  createCurrentRecentActivityRepository,
+  createCurrentSshCredentialUsageRepository,
+  createCurrentSessionRecordingRepository,
+  createCurrentTransferRecentRepository,
+  createCurrentRbacAccessRepository,
+  createCurrentRoleRepository,
+  createCurrentHostResolutionRepository,
+  createCurrentHostRepository,
+  createCurrentUserRepository,
+} from "../repositories/factory.js";
 import {
   isNonEmptyString,
   isValidPort,
+  sanitizeHostForRecipient,
   stripSensitiveFields,
   transformHostResponse,
 } from "./host-normalizers.js";
@@ -40,6 +41,10 @@ import { registerHostAutostartRoutes } from "./host-autostart-routes.js";
 import { registerHostInternalRoutes } from "./host-internal-routes.js";
 import { registerHostNetworkRoutes } from "./host-network-routes.js";
 import { registerHostBulkRoutes } from "./host-bulk-routes.js";
+import {
+  applyHostEnrollmentDefaults,
+  requireHostEnrollmentAccessForPath,
+} from "./host-enrollment-auth.js";
 import { logAudit, getRequestMeta } from "../../utils/audit-logger.js";
 
 const router = express.Router();
@@ -47,6 +52,11 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 const STATS_SERVER_URL = "http://localhost:30005";
+
+async function getAuditUsername(userId: string): Promise<string> {
+  const actor = await createCurrentUserRepository().findById(userId);
+  return actor?.username ?? userId;
+}
 
 function notifyStatsHostUpdated(
   hostId: number,
@@ -98,9 +108,10 @@ registerHostInternalRoutes(router);
  *         description: Failed to save SSH data.
  */
 router.post(
-  "/db/host",
+  ["/db/host", "/enroll"],
   authenticateJWT,
   requireDataAccess,
+  requireHostEnrollmentAccessForPath,
   upload.single("key"),
   async (req: Request, res: Response) => {
     const userId = (req as AuthenticatedRequest).userId;
@@ -133,6 +144,10 @@ router.post(
       hostData = req.body;
     }
 
+    if (req.path === "/enroll") {
+      hostData = applyHostEnrollmentDefaults(hostData);
+    }
+
     const {
       connectionType,
       name,
@@ -146,6 +161,7 @@ router.post(
       authType,
       useWarpgate,
       credentialId,
+      vaultProfileId,
       key,
       keyPassword,
       keyType,
@@ -195,13 +211,19 @@ router.post(
       rdpPort,
       vncPort,
       telnetPort,
+      rdpAuthType,
+      rdpCredentialId,
       rdpUser,
       rdpPassword,
       rdpDomain,
       rdpSecurity,
       rdpIgnoreCert,
+      vncAuthType,
+      vncCredentialId,
       vncPassword,
       vncUser,
+      telnetAuthType,
+      telnetCredentialId,
       telnetUser,
       telnetPassword,
     } = hostData;
@@ -248,6 +270,7 @@ router.post(
       authType: effectiveAuthType,
       useWarpgate: useWarpgate ? 1 : 0,
       credentialId: credentialId || null,
+      vaultProfileId: vaultProfileId || null,
       overrideCredentialUsername: overrideCredentialUsername ? 1 : 0,
       pin: pin ? 1 : 0,
       enableTerminal: enableTerminal ? 1 : 0,
@@ -318,11 +341,26 @@ router.post(
       rdpPort: rdpPort || 3389,
       vncPort: vncPort || 5900,
       telnetPort: telnetPort || 23,
+      rdpAuthType: enableRdp ? rdpAuthType || null : null,
+      rdpCredentialId:
+        enableRdp && rdpAuthType === "credential" && rdpCredentialId
+          ? rdpCredentialId
+          : null,
       rdpUser: rdpUser || null,
       rdpDomain: rdpDomain || null,
       rdpSecurity: rdpSecurity || null,
       rdpIgnoreCert: rdpIgnoreCert ? 1 : 0,
+      vncAuthType: enableVnc ? vncAuthType || null : null,
+      vncCredentialId:
+        enableVnc && vncAuthType === "credential" && vncCredentialId
+          ? vncCredentialId
+          : null,
       vncUser: vncUser || null,
+      telnetAuthType: enableTelnet ? telnetAuthType || null : null,
+      telnetCredentialId:
+        enableTelnet && telnetAuthType === "credential" && telnetCredentialId
+          ? telnetCredentialId
+          : null,
       telnetUser: telnetUser || null,
     };
 
@@ -339,19 +377,6 @@ router.post(
       sshDataObj.keyType = null;
     } else if (effectiveAuthType === "key") {
       if (key && typeof key === "string") {
-        if (!key.includes("-----BEGIN") || !key.includes("-----END")) {
-          sshLogger.warn("Invalid SSH key format provided", {
-            operation: "host_create",
-            userId,
-            name,
-            ip,
-            port,
-          });
-          return res.status(400).json({
-            error: "Invalid SSH key format. Key must be in PEM format.",
-          });
-        }
-
         const keyValidation = parseSSHKey(
           key,
           typeof keyPassword === "string" ? keyPassword : undefined,
@@ -374,7 +399,17 @@ router.post(
       sshDataObj.key = key || null;
       sshDataObj.keyPassword = keyPassword || null;
       sshDataObj.keyType = keyType;
+      sshDataObj.password = password || null;
+    } else if (effectiveAuthType === "credential") {
+      sshDataObj.password = password || null;
+      sshDataObj.key = null;
+      sshDataObj.keyPassword = null;
+      sshDataObj.keyType = null;
+    } else if (effectiveAuthType === "agent") {
       sshDataObj.password = null;
+      sshDataObj.key = null;
+      sshDataObj.keyPassword = null;
+      sshDataObj.keyType = null;
     } else {
       sshDataObj.password = null;
       sshDataObj.key = null;
@@ -387,11 +422,9 @@ router.post(
     sshDataObj.telnetPassword = telnetPassword || null;
 
     try {
-      const result = await SimpleDBOps.insert(
-        hosts,
-        "ssh_data",
-        sshDataObj,
+      const result = await createCurrentHostRepository().createEncryptedForUser(
         userId,
+        sshDataObj,
       );
 
       if (!result) {
@@ -418,15 +451,9 @@ router.post(
       });
 
       const { ipAddress: chIp, userAgent: chUa } = getRequestMeta(req);
-      const { users: usersTable } = await import("../db/schema.js");
-      const chActor = await db
-        .select({ username: usersTable.username })
-        .from(usersTable)
-        .where(eq(usersTable.id, userId))
-        .limit(1);
       await logAudit({
         userId,
-        username: chActor[0]?.username ?? userId,
+        username: await getAuditUsername(userId),
         action: "create_host",
         resourceType: "host",
         resourceId: String(createdHost.id),
@@ -456,6 +483,67 @@ router.post(
   },
 );
 
+/**
+ * @openapi
+ * /host/enroll:
+ *   post:
+ *     summary: Enroll a host with an API key
+ *     description: Creates a host owned by the user assigned to the API key. The user's encrypted data must be unlocked by an active sign-in.
+ *     tags:
+ *       - Host Enrollment
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [ip]
+ *             properties:
+ *               name:
+ *                 type: string
+ *               ip:
+ *                 type: string
+ *               port:
+ *                 type: integer
+ *                 minimum: 1
+ *                 maximum: 65535
+ *                 default: 22
+ *               username:
+ *                 type: string
+ *               authType:
+ *                 type: string
+ *                 enum: [none, password, key, credential, agent]
+ *                 default: none
+ *               password:
+ *                 type: string
+ *               folder:
+ *                 type: string
+ *               tags:
+ *                 oneOf:
+ *                   - type: string
+ *                   - type: array
+ *                     items:
+ *                       type: string
+ *               enableTerminal:
+ *                 type: boolean
+ *               enableFileManager:
+ *                 type: boolean
+ *               enableTunnel:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Host enrolled successfully.
+ *       400:
+ *         description: Invalid host data.
+ *       401:
+ *         description: Missing or invalid API key.
+ *       423:
+ *         description: The API key user's encrypted data is locked.
+ *       500:
+ *         description: Failed to enroll the host.
+ */
 /**
  * @openapi
  * /host/quick-connect:
@@ -558,27 +646,19 @@ router.post(
       let resolvedUsername = username;
 
       if (authType === "credential" && credentialId) {
-        const credentials = await SimpleDBOps.select(
-          db
-            .select()
-            .from(sshCredentials)
-            .where(
-              and(
-                eq(sshCredentials.id, credentialId),
-                eq(sshCredentials.userId, userId),
-              ),
-            ),
-          "ssh_credentials",
-          userId,
-        );
+        const cred =
+          await createCurrentHostResolutionRepository().findCredentialByIdForUser(
+            Number(credentialId),
+            userId,
+          );
 
-        if (!credentials || credentials.length === 0) {
+        if (!cred) {
           return res.status(404).json({ error: "Credential not found" });
         }
 
-        const cred = credentials[0];
-
-        resolvedPassword = cred.password as string | undefined;
+        resolvedPassword = pickResolvedPassword(password, cred.password) as
+          | string
+          | undefined;
         resolvedKey = cred.privateKey as string | undefined;
         resolvedKeyPassword = cred.keyPassword as string | undefined;
         resolvedKeyType = cred.keyType as string | undefined;
@@ -721,6 +801,7 @@ router.put(
       authType,
       useWarpgate,
       credentialId,
+      vaultProfileId,
       key,
       keyPassword,
       keyType,
@@ -770,13 +851,19 @@ router.put(
       rdpPort,
       vncPort,
       telnetPort,
+      rdpAuthType,
+      rdpCredentialId,
       rdpUser,
       rdpPassword,
       rdpDomain,
       rdpSecurity,
       rdpIgnoreCert,
+      vncAuthType,
+      vncCredentialId,
       vncPassword,
       vncUser,
+      telnetAuthType,
+      telnetCredentialId,
       telnetUser,
       telnetPassword,
     } = hostData;
@@ -820,6 +907,7 @@ router.put(
       authType: effectiveAuthType,
       useWarpgate: useWarpgate ? 1 : 0,
       credentialId: credentialId || null,
+      vaultProfileId: vaultProfileId || null,
       overrideCredentialUsername: overrideCredentialUsername ? 1 : 0,
       pin: pin ? 1 : 0,
       enableTerminal: enableTerminal ? 1 : 0,
@@ -890,11 +978,26 @@ router.put(
       rdpPort: rdpPort || 3389,
       vncPort: vncPort || 5900,
       telnetPort: telnetPort || 23,
+      rdpAuthType: enableRdp ? rdpAuthType || null : null,
+      rdpCredentialId:
+        enableRdp && rdpAuthType === "credential" && rdpCredentialId
+          ? rdpCredentialId
+          : null,
       rdpUser: rdpUser || null,
       rdpDomain: rdpDomain || null,
       rdpSecurity: rdpSecurity || null,
       rdpIgnoreCert: rdpIgnoreCert ? 1 : 0,
+      vncAuthType: enableVnc ? vncAuthType || null : null,
+      vncCredentialId:
+        enableVnc && vncAuthType === "credential" && vncCredentialId
+          ? vncCredentialId
+          : null,
       vncUser: vncUser || null,
+      telnetAuthType: enableTelnet ? telnetAuthType || null : null,
+      telnetCredentialId:
+        enableTelnet && telnetAuthType === "credential" && telnetCredentialId
+          ? telnetCredentialId
+          : null,
       telnetUser: telnetUser || null,
     };
 
@@ -915,20 +1018,6 @@ router.put(
       sshDataObj.keyType = null;
     } else if (effectiveAuthType === "key") {
       if (key && typeof key === "string") {
-        if (!key.includes("-----BEGIN") || !key.includes("-----END")) {
-          sshLogger.warn("Invalid SSH key format provided", {
-            operation: "host_update",
-            hostId: parseInt(hostId),
-            userId,
-            name,
-            ip,
-            port,
-          });
-          return res.status(400).json({
-            error: "Invalid SSH key format. Key must be in PEM format.",
-          });
-        }
-
         const keyValidation = parseSSHKey(
           key,
           typeof keyPassword === "string" ? keyPassword : undefined,
@@ -956,7 +1045,17 @@ router.put(
       if (keyType) {
         sshDataObj.keyType = keyType;
       }
+      sshDataObj.password = password || null;
+    } else if (effectiveAuthType === "credential") {
+      sshDataObj.password = password || null;
+      sshDataObj.key = null;
+      sshDataObj.keyPassword = null;
+      sshDataObj.keyType = null;
+    } else if (effectiveAuthType === "agent") {
       sshDataObj.password = null;
+      sshDataObj.key = null;
+      sshDataObj.keyPassword = null;
+      sshDataObj.keyType = null;
     } else {
       sshDataObj.password = null;
       sshDataObj.key = null;
@@ -972,7 +1071,7 @@ router.put(
       const accessInfo = await permissionManager.canAccessHost(
         userId,
         Number(hostId),
-        "write",
+        "edit",
       );
 
       if (!accessInfo.hasAccess) {
@@ -984,30 +1083,12 @@ router.put(
         return res.status(403).json({ error: "Access denied" });
       }
 
-      if (!accessInfo.isOwner) {
-        sshLogger.warn("Shared user attempted to update host (view-only)", {
-          operation: "host_update",
-          hostId: parseInt(hostId),
-          userId,
-        });
-        return res.status(403).json({
-          error: "Only the host owner can modify host configuration",
-        });
-      }
+      const hostRecord =
+        await createCurrentHostResolutionRepository().findHostUpdateState(
+          Number(hostId),
+        );
 
-      const hostRecord = await db
-        .select({
-          userId: hosts.userId,
-          credentialId: hosts.credentialId,
-          rdpCredentialId: hosts.rdpCredentialId,
-          vncCredentialId: hosts.vncCredentialId,
-          authType: hosts.authType,
-        })
-        .from(hosts)
-        .where(eq(hosts.id, Number(hostId)))
-        .limit(1);
-
-      if (hostRecord.length === 0) {
+      if (!hostRecord) {
         sshLogger.warn("Host not found for update", {
           operation: "host_update",
           hostId: parseInt(hostId),
@@ -1016,72 +1097,84 @@ router.put(
         return res.status(404).json({ error: "Host not found" });
       }
 
-      const ownerId = hostRecord[0].userId;
+      const ownerId = hostRecord.userId;
 
-      if (
-        !accessInfo.isOwner &&
-        sshDataObj.credentialId !== undefined &&
-        sshDataObj.credentialId !== hostRecord[0].credentialId
-      ) {
-        return res.status(403).json({
-          error: "Only the host owner can change the credential",
-        });
-      }
+      if (!accessInfo.isOwner) {
+        // Shared editors work on the owner's real record but may never
+        // repoint it at credential/vault references (those live in the
+        // owner's personal vault) or switch the authentication type.
+        const referenceViolations: Array<[unknown, number | null, string]> = [
+          [sshDataObj.credentialId, hostRecord.credentialId, "credential"],
+          [
+            sshDataObj.rdpCredentialId,
+            hostRecord.rdpCredentialId,
+            "RDP credential",
+          ],
+          [
+            sshDataObj.vncCredentialId,
+            hostRecord.vncCredentialId,
+            "VNC credential",
+          ],
+          [
+            sshDataObj.telnetCredentialId,
+            hostRecord.telnetCredentialId,
+            "Telnet credential",
+          ],
+          [
+            sshDataObj.vaultProfileId,
+            hostRecord.vaultProfileId,
+            "Vault profile",
+          ],
+        ];
 
-      if (
-        !accessInfo.isOwner &&
-        sshDataObj.authType !== undefined &&
-        sshDataObj.authType !== hostRecord[0].authType
-      ) {
-        return res.status(403).json({
-          error: "Only the host owner can change the authentication type",
-        });
-      }
+        for (const [incoming, current, label] of referenceViolations) {
+          if (incoming !== undefined && (incoming ?? null) !== current) {
+            return res.status(403).json({
+              error: `Only the host owner can change the ${label}`,
+            });
+          }
+        }
 
-      {
-        const newCredId =
-          sshDataObj.credentialId !== undefined
-            ? sshDataObj.credentialId
-            : hostRecord[0].credentialId;
-        const newRdpCredId =
-          sshDataObj.rdpCredentialId !== undefined
-            ? sshDataObj.rdpCredentialId
-            : hostRecord[0].rdpCredentialId;
-        const newVncCredId =
-          sshDataObj.vncCredentialId !== undefined
-            ? sshDataObj.vncCredentialId
-            : hostRecord[0].vncCredentialId;
-        const hadCredential =
-          hostRecord[0].credentialId !== null ||
-          hostRecord[0].rdpCredentialId !== null ||
-          hostRecord[0].vncCredentialId !== null;
-        const willHaveCredential =
-          newCredId !== null || newRdpCredId !== null || newVncCredId !== null;
-        if (hadCredential && !willHaveCredential) {
-          await db
-            .delete(hostAccess)
-            .where(eq(hostAccess.hostId, Number(hostId)));
+        if (
+          sshDataObj.authType !== undefined &&
+          sshDataObj.authType !== hostRecord.authType
+        ) {
+          return res.status(403).json({
+            error: "Only the host owner can change the authentication type",
+          });
         }
       }
 
-      await SimpleDBOps.update(
-        hosts,
-        "ssh_data",
-        eq(hosts.id, Number(hostId)),
+      await createCurrentHostRepository().updateEncryptedForUser(
+        ownerId,
+        Number(hostId),
         sshDataObj,
-        ownerId,
       );
 
-      const updatedHosts = await SimpleDBOps.select(
-        db
-          .select()
-          .from(hosts)
-          .where(eq(hosts.id, Number(hostId))),
-        "ssh_data",
-        ownerId,
-      );
+      // Keep every recipient's re-encrypted secret snapshots in sync with
+      // the updated host record.
+      try {
+        const { SharedHostSecretsManager } =
+          await import("../../utils/shared-host-secrets-manager.js");
+        await SharedHostSecretsManager.getInstance().resyncHost(Number(hostId));
+      } catch (resyncError) {
+        sshLogger.warn("Failed to resync shared host secrets after update", {
+          operation: "host_update_resync",
+          hostId: parseInt(hostId),
+          error:
+            resyncError instanceof Error
+              ? resyncError.message
+              : "Unknown error",
+        });
+      }
 
-      if (updatedHosts.length === 0) {
+      const updatedHost =
+        await createCurrentHostResolutionRepository().findHostById(
+          Number(hostId),
+          ownerId,
+        );
+
+      if (!updatedHost) {
         sshLogger.warn("Updated host not found after update", {
           operation: "host_update",
           hostId: parseInt(hostId),
@@ -1090,7 +1183,6 @@ router.put(
         return res.status(404).json({ error: "Host not found after update" });
       }
 
-      const updatedHost = updatedHosts[0];
       const baseHost = transformHostResponse(updatedHost);
 
       const resolvedHost =
@@ -1102,15 +1194,9 @@ router.put(
       });
 
       const { ipAddress: uhIp, userAgent: uhUa } = getRequestMeta(req);
-      const { users: usersTableUpd } = await import("../db/schema.js");
-      const uhActor = await db
-        .select({ username: usersTableUpd.username })
-        .from(usersTableUpd)
-        .where(eq(usersTableUpd.id, userId))
-        .limit(1);
       await logAudit({
         userId,
-        username: uhActor[0]?.username ?? userId,
+        username: await getAuditUsername(userId),
         action: "update_host",
         resourceType: "host",
         resourceId: hostId,
@@ -1169,128 +1255,19 @@ router.get(
     try {
       const now = new Date().toISOString();
 
-      const userRoleIds = await db
-        .select({ roleId: userRoles.roleId })
-        .from(userRoles)
-        .where(eq(userRoles.userId, userId));
-      const roleIds = userRoleIds.map((r) => r.roleId);
+      const roleIds =
+        await createCurrentRoleRepository().listUserRoleIds(userId);
+      const accessEntries =
+        await createCurrentRbacAccessRepository().listVisibleHostAccessEntries(
+          userId,
+          roleIds,
+          now,
+        );
 
-      const rawData = await db
-        .select({
-          id: hosts.id,
-          userId: hosts.userId,
-          connectionType: hosts.connectionType,
-          name: hosts.name,
-          ip: hosts.ip,
-          port: hosts.port,
-          username: hosts.username,
-          folder: hosts.folder,
-          tags: hosts.tags,
-          pin: hosts.pin,
-          authType: hosts.authType,
-          password: hosts.password,
-          key: hosts.key,
-          keyPassword: hosts.keyPassword,
-          keyType: hosts.keyType,
-          enableTerminal: hosts.enableTerminal,
-          enableTunnel: hosts.enableTunnel,
-          tunnelConnections: hosts.tunnelConnections,
-          jumpHosts: hosts.jumpHosts,
-          enableFileManager: hosts.enableFileManager,
-          scpLegacy: hosts.scpLegacy,
-          defaultPath: hosts.defaultPath,
-          autostartPassword: hosts.autostartPassword,
-          autostartKey: hosts.autostartKey,
-          autostartKeyPassword: hosts.autostartKeyPassword,
-          forceKeyboardInteractive: hosts.forceKeyboardInteractive,
-          statsConfig: hosts.statsConfig,
-          terminalConfig: hosts.terminalConfig,
-          sudoPassword: hosts.sudoPassword,
-          createdAt: hosts.createdAt,
-          updatedAt: hosts.updatedAt,
-          credentialId: hosts.credentialId,
-          overrideCredentialUsername: hosts.overrideCredentialUsername,
-          quickActions: hosts.quickActions,
-          notes: hosts.notes,
-          enableDocker: hosts.enableDocker,
-          enableProxmox: hosts.enableProxmox,
-          enableTmuxMonitor: hosts.enableTmuxMonitor,
-          showTerminalInSidebar: hosts.showTerminalInSidebar,
-          showFileManagerInSidebar: hosts.showFileManagerInSidebar,
-          showTunnelInSidebar: hosts.showTunnelInSidebar,
-          showDockerInSidebar: hosts.showDockerInSidebar,
-          showServerStatsInSidebar: hosts.showServerStatsInSidebar,
-          useSocks5: hosts.useSocks5,
-          socks5Host: hosts.socks5Host,
-          socks5Port: hosts.socks5Port,
-          socks5Username: hosts.socks5Username,
-          socks5Password: hosts.socks5Password,
-          socks5ProxyChain: hosts.socks5ProxyChain,
-          portKnockSequence: hosts.portKnockSequence,
-          domain: hosts.domain,
-          security: hosts.security,
-          ignoreCert: hosts.ignoreCert,
-          guacamoleConfig: hosts.guacamoleConfig,
-          macAddress: hosts.macAddress,
-          wolBroadcastAddress: hosts.wolBroadcastAddress,
-          dockerConfig: hosts.dockerConfig,
-          proxmoxConfig: hosts.proxmoxConfig,
-          enableSsh: hosts.enableSsh,
-          enableRdp: hosts.enableRdp,
-          enableVnc: hosts.enableVnc,
-          enableTelnet: hosts.enableTelnet,
-          sshPort: hosts.sshPort,
-          rdpPort: hosts.rdpPort,
-          vncPort: hosts.vncPort,
-          telnetPort: hosts.telnetPort,
-          rdpCredentialId: hosts.rdpCredentialId,
-          rdpUser: hosts.rdpUser,
-          rdpPassword: hosts.rdpPassword,
-          rdpDomain: hosts.rdpDomain,
-          rdpSecurity: hosts.rdpSecurity,
-          rdpIgnoreCert: hosts.rdpIgnoreCert,
-          vncCredentialId: hosts.vncCredentialId,
-          vncUser: hosts.vncUser,
-          vncPassword: hosts.vncPassword,
-          telnetUser: hosts.telnetUser,
-          telnetPassword: hosts.telnetPassword,
-
-          ownerId: hosts.userId,
-          isShared: sql<boolean>`${hostAccess.id} IS NOT NULL AND ${hosts.userId} != ${userId}`,
-          permissionLevel: hostAccess.permissionLevel,
-          expiresAt: hostAccess.expiresAt,
-        })
-        .from(hosts)
-        .leftJoin(
-          hostAccess,
-          and(
-            eq(hostAccess.hostId, hosts.id),
-            or(
-              eq(hostAccess.userId, userId),
-              roleIds.length > 0
-                ? inArray(hostAccess.roleId, roleIds)
-                : sql`false`,
-            ),
-            or(isNull(hostAccess.expiresAt), gte(hostAccess.expiresAt, now)),
-          ),
-        )
-        .where(
-          or(
-            eq(hosts.userId, userId),
-            and(
-              eq(hostAccess.userId, userId),
-              or(isNull(hostAccess.expiresAt), gte(hostAccess.expiresAt, now)),
-            ),
-            roleIds.length > 0
-              ? and(
-                  inArray(hostAccess.roleId, roleIds),
-                  or(
-                    isNull(hostAccess.expiresAt),
-                    gte(hostAccess.expiresAt, now),
-                  ),
-                )
-              : sql`false`,
-          ),
+      const rawData =
+        await createCurrentHostResolutionRepository().listHostRowsForAccessList(
+          userId,
+          accessEntries,
         );
 
       const ownHosts = rawData.filter((row) => row.userId === userId);
@@ -1318,9 +1295,21 @@ router.get(
         }
       }
 
-      const sanitizedSharedHosts = sharedHosts;
+      const ownerUsernames = new Map<string, string>();
+      const userRepository = createCurrentUserRepository();
+      for (const sharedHost of sharedHosts) {
+        const ownerId = sharedHost.userId as string;
+        if (!ownerUsernames.has(ownerId)) {
+          try {
+            const owner = await userRepository.findById(ownerId);
+            ownerUsernames.set(ownerId, owner?.username ?? "");
+          } catch {
+            ownerUsernames.set(ownerId, "");
+          }
+        }
+      }
 
-      const data = [...decryptedOwnHosts, ...sanitizedSharedHosts];
+      const data = [...decryptedOwnHosts, ...sharedHosts];
 
       const result = await Promise.all(
         data.map(async (row: Record<string, unknown>) => {
@@ -1329,6 +1318,9 @@ router.get(
             isShared: !!row.isShared,
             permissionLevel: row.permissionLevel || undefined,
             sharedExpiresAt: row.expiresAt || undefined,
+            ownerUsername: row.isShared
+              ? ownerUsernames.get(row.userId as string) || undefined
+              : undefined,
           };
 
           const resolved =
@@ -1337,7 +1329,14 @@ router.get(
         }),
       );
 
-      const sanitized = result.map((host) => stripSensitiveFields(host));
+      const sanitized = result.map((host) =>
+        host.isShared
+          ? sanitizeHostForRecipient(
+              host,
+              host.permissionLevel as string | undefined,
+            )
+          : stripSensitiveFields(host),
+      );
       res.json(sanitized);
     } catch (err) {
       sshLogger.error("Failed to fetch SSH hosts from database", err, {
@@ -1392,16 +1391,28 @@ router.get(
       return res.status(400).json({ error: "Invalid userId or hostId" });
     }
     try {
-      const data = await SimpleDBOps.select(
-        db
-          .select()
-          .from(hosts)
-          .where(and(eq(hosts.id, Number(hostId)), eq(hosts.userId, userId))),
-        "ssh_data",
+      const hostResolutionRepository = createCurrentHostResolutionRepository();
+      const host = await hostResolutionRepository.findHostByIdForUser(
+        Number(hostId),
         userId,
       );
 
-      if (data.length === 0) {
+      if (host) {
+        const result = transformHostResponse(host);
+        const resolved =
+          (await resolveHostCredentials(result, userId)) || result;
+
+        return res.json(stripSensitiveFields(resolved));
+      }
+
+      // Not the owner: shared recipients get a sanitized view of the host.
+      const accessInfo = await permissionManager.canAccessHost(
+        userId,
+        Number(hostId),
+        "connect",
+      );
+
+      if (!accessInfo.hasAccess) {
         sshLogger.warn("SSH host not found", {
           operation: "host_fetch_by_id",
           hostId: parseInt(hostId),
@@ -1410,11 +1421,38 @@ router.get(
         return res.status(404).json({ error: "SSH host not found" });
       }
 
-      const host = data[0];
-      const result = transformHostResponse(host);
-      const resolved = (await resolveHostCredentials(result, userId)) || result;
+      const ownerId = await hostResolutionRepository.findHostOwnerId(
+        Number(hostId),
+      );
+      const sharedHost = ownerId
+        ? await hostResolutionRepository.findHostById(Number(hostId), ownerId)
+        : null;
 
-      res.json(stripSensitiveFields(resolved));
+      if (!sharedHost) {
+        return res.status(404).json({ error: "SSH host not found" });
+      }
+
+      let ownerUsername: string | undefined;
+      try {
+        const owner = ownerId
+          ? await createCurrentUserRepository().findById(ownerId)
+          : null;
+        ownerUsername = owner?.username ?? undefined;
+      } catch {
+        ownerUsername = undefined;
+      }
+
+      const sharedResult = {
+        ...transformHostResponse(sharedHost),
+        isShared: true,
+        permissionLevel: accessInfo.permissionLevel,
+        sharedExpiresAt: accessInfo.expiresAt || undefined,
+        ownerUsername,
+      };
+
+      res.json(
+        sanitizeHostForRecipient(sharedResult, accessInfo.permissionLevel),
+      );
     } catch (err) {
       sshLogger.error("Failed to fetch SSH host by ID from database", err, {
         operation: "host_fetch_by_id",
@@ -1444,7 +1482,7 @@ router.get(
  *         name: field
  *         schema:
  *           type: string
- *           enum: [password, sudoPassword]
+ *           enum: [password, sudoPassword, vncPassword]
  *     responses:
  *       200:
  *         description: The requested password value.
@@ -1460,22 +1498,20 @@ router.get(
     const userId = (req as AuthenticatedRequest).userId;
     const field = (req.query.field as string) || "password";
 
-    if (!["password", "sudoPassword"].includes(field)) {
+    if (!["password", "sudoPassword", "vncPassword"].includes(field)) {
       return res.status(400).json({ error: "Invalid field" });
     }
 
     try {
-      const data = await SimpleDBOps.select(
-        db.select().from(hosts).where(eq(hosts.id, hostId)),
-        "ssh_data",
+      const host = await createCurrentHostResolutionRepository().findHostById(
+        hostId,
         userId,
       );
 
-      if (data.length === 0) {
+      if (!host) {
         return res.status(404).json({ error: "Host not found" });
       }
 
-      const host = data[0];
       const resolved = (await resolveHostCredentials(host, userId)) || host;
       let value = resolved[field];
 
@@ -1546,20 +1582,15 @@ router.get(
     }
 
     try {
-      const hostResults = await SimpleDBOps.select(
-        db
-          .select()
-          .from(hosts)
-          .where(and(eq(hosts.id, Number(hostId)), eq(hosts.userId, userId))),
-        "ssh_data",
-        userId,
-      );
+      const host =
+        await createCurrentHostResolutionRepository().findHostByIdForUser(
+          Number(hostId),
+          userId,
+        );
 
-      if (hostResults.length === 0) {
+      if (!host) {
         return res.status(404).json({ error: "SSH host not found" });
       }
-
-      const host = hostResults[0];
 
       const resolvedHost = (await resolveHostCredentials(host, userId)) || host;
 
@@ -1594,13 +1625,19 @@ router.get(
             rdpPort: resolvedHost.rdpPort || 3389,
             vncPort: resolvedHost.vncPort || 5900,
             telnetPort: resolvedHost.telnetPort || 23,
+            rdpAuthType: resolvedHost.rdpAuthType || null,
+            rdpCredentialId: resolvedHost.rdpCredentialId || null,
             rdpUser: resolvedHost.rdpUser || null,
             rdpPassword: resolvedHost.rdpPassword || null,
             rdpDomain: resolvedHost.rdpDomain || null,
             rdpSecurity: resolvedHost.rdpSecurity || null,
             rdpIgnoreCert: !!resolvedHost.rdpIgnoreCert,
+            vncAuthType: resolvedHost.vncAuthType || null,
+            vncCredentialId: resolvedHost.vncCredentialId || null,
             vncUser: resolvedHost.vncUser || null,
             vncPassword: resolvedHost.vncPassword || null,
+            telnetAuthType: resolvedHost.telnetAuthType || null,
+            telnetCredentialId: resolvedHost.telnetCredentialId || null,
             telnetUser: resolvedHost.telnetUser || null,
             telnetPassword: resolvedHost.telnetPassword || null,
             guacamoleConfig: resolvedHost.guacamoleConfig
@@ -1712,11 +1749,8 @@ router.get(
     }
 
     try {
-      const allHosts = await SimpleDBOps.select(
-        db.select().from(hosts).where(eq(hosts.userId, userId)),
-        "ssh_data",
-        userId,
-      );
+      const allHosts =
+        await createCurrentHostResolutionRepository().findHostsByUserId(userId);
 
       const exportedHosts = [];
 
@@ -1879,12 +1913,13 @@ router.delete(
       hostId: parseInt(hostId),
     });
     try {
-      const hostToDelete = await db
-        .select()
-        .from(hosts)
-        .where(and(eq(hosts.id, Number(hostId)), eq(hosts.userId, userId)));
+      const hostToDelete =
+        await createCurrentHostResolutionRepository().findHostByIdForUser(
+          Number(hostId),
+          userId,
+        );
 
-      if (hostToDelete.length === 0) {
+      if (!hostToDelete) {
         sshLogger.warn("SSH host not found for deletion", {
           operation: "host_delete",
           hostId: parseInt(hostId),
@@ -1895,48 +1930,35 @@ router.delete(
 
       const numericHostId = Number(hostId);
 
-      await db
-        .delete(fileManagerRecent)
-        .where(eq(fileManagerRecent.hostId, numericHostId));
+      await createCurrentFileManagerBookmarkRepository().deleteByHostId(
+        numericHostId,
+      );
 
-      await db
-        .delete(fileManagerPinned)
-        .where(eq(fileManagerPinned.hostId, numericHostId));
+      await createCurrentTransferRecentRepository().deleteByHostId(
+        numericHostId,
+      );
 
-      await db
-        .delete(fileManagerShortcuts)
-        .where(eq(fileManagerShortcuts.hostId, numericHostId));
+      await createCurrentCommandHistoryRepository().deleteByHostId(
+        numericHostId,
+      );
 
-      await db
-        .delete(transferRecent)
-        .where(
-          or(
-            eq(transferRecent.sourceHostId, numericHostId),
-            eq(transferRecent.destHostId, numericHostId),
-          ),
-        );
+      await createCurrentSshCredentialUsageRepository().deleteByHostId(
+        numericHostId,
+      );
 
-      await db
-        .delete(commandHistory)
-        .where(eq(commandHistory.hostId, numericHostId));
+      await createCurrentRecentActivityRepository().deleteByHostId(
+        numericHostId,
+      );
 
-      await db
-        .delete(sshCredentialUsage)
-        .where(eq(sshCredentialUsage.hostId, numericHostId));
+      await createCurrentRbacAccessRepository().deleteHostAccessForHost(
+        numericHostId,
+      );
 
-      await db
-        .delete(recentActivity)
-        .where(eq(recentActivity.hostId, numericHostId));
+      await createCurrentSessionRecordingRepository().deleteByHostId(
+        numericHostId,
+      );
 
-      await db.delete(hostAccess).where(eq(hostAccess.hostId, numericHostId));
-
-      await db
-        .delete(sessionRecordings)
-        .where(eq(sessionRecordings.hostId, numericHostId));
-
-      await db
-        .delete(hosts)
-        .where(and(eq(hosts.id, numericHostId), eq(hosts.userId, userId)));
+      await createCurrentHostRepository().deleteForUser(userId, numericHostId);
 
       databaseLogger.success("SSH host deleted", {
         operation: "host_delete_success",
@@ -1945,19 +1967,13 @@ router.delete(
       });
 
       const { ipAddress: dhIp, userAgent: dhUa } = getRequestMeta(req);
-      const { users: usersTableDel } = await import("../db/schema.js");
-      const dhActor = await db
-        .select({ username: usersTableDel.username })
-        .from(usersTableDel)
-        .where(eq(usersTableDel.id, userId))
-        .limit(1);
       await logAudit({
         userId,
-        username: dhActor[0]?.username ?? userId,
+        username: await getAuditUsername(userId),
         action: "delete_host",
         resourceType: "host",
         resourceId: hostId,
-        resourceName: hostToDelete[0].name ?? hostToDelete[0].ip,
+        resourceName: hostToDelete.name ?? hostToDelete.ip,
         ipAddress: dhIp,
         userAgent: dhUa,
         success: true,
@@ -2019,17 +2035,12 @@ router.get(
     }
 
     try {
-      const recent = await db
-        .select()
-        .from(transferRecent)
-        .where(
-          and(
-            eq(transferRecent.userId, userId),
-            eq(transferRecent.sourceHostId, sourceHostId),
-          ),
-        )
-        .orderBy(desc(transferRecent.lastUsed))
-        .limit(10);
+      const recent =
+        await createCurrentTransferRecentRepository().listBySourceHost(
+          userId,
+          sourceHostId,
+          10,
+        );
 
       res.json(recent);
     } catch (err) {
@@ -2056,53 +2067,15 @@ router.post(
     }
 
     try {
-      const existing = await db
-        .select()
-        .from(transferRecent)
-        .where(
-          and(
-            eq(transferRecent.userId, userId),
-            eq(transferRecent.sourceHostId, sourceHostId),
-            eq(transferRecent.destHostId, destHostId),
-            eq(transferRecent.destPath, destPath),
-          ),
-        );
+      const transferRecentRepository = createCurrentTransferRecentRepository();
+      await transferRecentRepository.upsertForDestination(userId, {
+        sourceHostId,
+        destHostId,
+        destPath,
+        destPathLabel,
+      });
 
-      if (existing.length > 0) {
-        await db
-          .update(transferRecent)
-          .set({ lastUsed: new Date().toISOString() })
-          .where(eq(transferRecent.id, existing[0].id));
-      } else {
-        await db.insert(transferRecent).values({
-          userId,
-          sourceHostId,
-          destHostId,
-          destPath,
-          destPathLabel: destPathLabel || destPath,
-          lastUsed: new Date().toISOString(),
-        });
-      }
-
-      const allRecent = await db
-        .select()
-        .from(transferRecent)
-        .where(
-          and(
-            eq(transferRecent.userId, userId),
-            eq(transferRecent.sourceHostId, sourceHostId),
-          ),
-        )
-        .orderBy(desc(transferRecent.lastUsed));
-
-      if (allRecent.length > 10) {
-        const toDelete = allRecent.slice(10);
-        for (const entry of toDelete) {
-          await db
-            .delete(transferRecent)
-            .where(eq(transferRecent.id, entry.id));
-        }
-      }
+      await transferRecentRepository.pruneSourceHost(userId, sourceHostId, 10);
 
       res.json({ message: "Recent destination saved" });
     } catch (err) {
@@ -2124,13 +2097,14 @@ async function resolveHostCredentials(
 
       if (requestingUserId && requestingUserId !== ownerId) {
         try {
-          const { SharedCredentialManager } =
-            await import("../../utils/shared-credential-manager.js");
-          const sharedCredManager = SharedCredentialManager.getInstance();
-          const sharedCred = await sharedCredManager.getSharedCredentialForUser(
-            host.id as number,
-            requestingUserId,
-          );
+          const { SharedHostSecretsManager } =
+            await import("../../utils/shared-host-secrets-manager.js");
+          const sharedCred =
+            await SharedHostSecretsManager.getInstance().getSecretForUser(
+              host.id as number,
+              requestingUserId,
+              "ssh",
+            );
 
           if (sharedCred) {
             const resolvedHost: Record<string, unknown> = {
@@ -2168,25 +2142,16 @@ async function resolveHostCredentials(
         }
       }
 
-      const credentials = await SimpleDBOps.select(
-        db
-          .select()
-          .from(sshCredentials)
-          .where(
-            and(
-              eq(sshCredentials.id, credentialId),
-              eq(sshCredentials.userId, ownerId),
-            ),
-          ),
-        "ssh_credentials",
-        ownerId,
-      );
+      const credential =
+        await createCurrentHostResolutionRepository().findCredentialByIdForUser(
+          credentialId,
+          ownerId,
+        );
 
-      if (credentials.length > 0) {
-        const credential = credentials[0];
+      if (credential) {
         const resolvedHost: Record<string, unknown> = {
           ...host,
-          password: credential.password,
+          password: pickResolvedPassword(host.password, credential.password),
           key: credential.key,
           keyPassword: credential.keyPassword,
           keyType: credential.keyType,
@@ -2281,31 +2246,20 @@ router.get(
     }
 
     try {
-      const { opksshTokens } = await import("../db/schema.js");
-      const token = await db
-        .select()
-        .from(opksshTokens)
-        .where(
-          and(eq(opksshTokens.userId, userId), eq(opksshTokens.hostId, hostId)),
-        )
-        .limit(1);
+      const opksshTokenRepository = createCurrentOpksshTokenRepository();
+      const tokenData = await opksshTokenRepository.findByUserAndHost(
+        userId,
+        hostId,
+      );
 
-      if (!token || token.length === 0) {
+      if (!tokenData) {
         return res.status(404).json({ exists: false });
       }
 
-      const tokenData = token[0];
       const expiresAt = new Date(tokenData.expiresAt);
 
       if (expiresAt < new Date()) {
-        await db
-          .delete(opksshTokens)
-          .where(
-            and(
-              eq(opksshTokens.userId, userId),
-              eq(opksshTokens.hostId, hostId),
-            ),
-          );
+        await opksshTokenRepository.deleteByUserAndHost(userId, hostId);
         return res.status(404).json({ exists: false });
       }
 
@@ -2363,7 +2317,7 @@ router.delete(
     }
 
     try {
-      const { deleteOPKSSHToken } = await import("../../ssh/opkssh-auth.js");
+      const { deleteOPKSSHToken } = await import("../../hosts/opkssh-auth.js");
       await deleteOPKSSHToken(userId, hostId);
       res.json({ success: true });
     } catch (error) {

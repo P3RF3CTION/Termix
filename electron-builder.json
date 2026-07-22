@@ -28,11 +28,8 @@
     "!dist/icon-mac.png",
     "!public/icon-mac.png",
     "!dist/icon.ico",
-    "!public/icon.ico",
     "!dist/icon.icns",
-    "!public/icon.icns",
-    "!dist/icons/**/*",
-    "!public/icons/**/*"
+    "!public/icon.icns"
   ],
   "extraMetadata": {
     "main": "electron/main.cjs",
@@ -61,6 +58,8 @@
     "artifactName": "termix_windows_${arch}_nsis.${ext}",
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
+    "installerIcon": "public/icon.ico",
+    "uninstallerIcon": "public/icon.ico",
     "shortcutName": "Termix",
     "uninstallDisplayName": "Termix"
   },
@@ -118,8 +117,8 @@
     "category": "public.app-category.developer-tools",
     "hardenedRuntime": true,
     "gatekeeperAssess": false,
-    "entitlements": "build/entitlements.mac.plist",
-    "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+    "entitlements": "packaging/build/entitlements.mac.plist",
+    "entitlementsInherit": "packaging/build/entitlements.mac.inherit.plist",
     "type": "distribution",
     "minimumSystemVersion": "10.15",
     "mergeASARs": false,
@@ -130,12 +129,12 @@
     "artifactName": "termix_macos_${arch}_dmg.${ext}",
     "sign": true
   },
-  "afterPack": "build/after-pack.cjs",
-  "afterSign": "build/notarize.cjs",
+  "afterPack": "packaging/build/after-pack.cjs",
+  "afterSign": "packaging/build/notarize.cjs",
   "mas": {
-    "provisioningProfile": "build/Termix_Mac_App_Store.provisionprofile",
-    "entitlements": "build/entitlements.mas.plist",
-    "entitlementsInherit": "build/entitlements.mas.inherit.plist",
+    "provisioningProfile": "packaging/build/Termix_Mac_App_Store.provisionprofile",
+    "entitlements": "packaging/build/entitlements.mas.plist",
+    "entitlementsInherit": "packaging/build/entitlements.mas.inherit.plist",
     "hardenedRuntime": false,
     "gatekeeperAssess": false,
     "type": "distribution",

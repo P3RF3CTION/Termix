@@ -26,6 +26,7 @@ import {
 } from "@/main-axios";
 import type { Host as DemoHost } from "@/types/ui-types";
 import type { SSHHost, TunnelConnection, TunnelStatus } from "@/types";
+import { findHostByTunnelEndpoint } from "./tunnel-endpoints";
 
 function tunnelName(
   host: SSHHost,
@@ -238,7 +239,14 @@ function TunnelCard({
   );
 }
 
-export function TunnelTab({ host }: { label: string; host?: DemoHost }) {
+export function TunnelTab({
+  host,
+  isVisible = true,
+}: {
+  label: string;
+  host?: DemoHost;
+  isVisible?: boolean;
+}) {
   const { t } = useTranslation();
   const [sshHost, setSshHost] = useState<SSHHost | null>(null);
   const [tunnelStatuses, setTunnelStatuses] = useState<
@@ -263,14 +271,40 @@ export function TunnelTab({ host }: { label: string; host?: DemoHost }) {
   }, [host]);
 
   useEffect(() => {
+    if (!isVisible) return;
+
     fetchHost();
-    const interval = setInterval(fetchHost, 5000);
     window.addEventListener("ssh-hosts:changed", fetchHost);
+
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (intervalId !== null) return;
+      // Host config rarely changes; tunnel runtime status uses subscribeTunnelStatuses.
+      intervalId = setInterval(fetchHost, 30_000);
+    };
+    const stop = () => {
+      if (intervalId === null) return;
+      clearInterval(intervalId);
+      intervalId = null;
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        stop();
+        return;
+      }
+      void fetchHost();
+      start();
+    };
+
+    if (document.visibilityState !== "hidden") start();
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
-      clearInterval(interval);
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("ssh-hosts:changed", fetchHost);
     };
-  }, [fetchHost]);
+  }, [fetchHost, isVisible]);
 
   useEffect(() => {
     return subscribeTunnelStatuses(setTunnelStatuses, () => {});
@@ -304,11 +338,7 @@ export function TunnelTab({ host }: { label: string; host?: DemoHost }) {
         let endpointSsh: SSHHost | undefined;
         if (!isDirect) {
           const allHosts = await getSSHHosts();
-          endpointSsh = allHosts.find(
-            (h) =>
-              h.name === tunnel.endpointHost ||
-              `${h.username}@${h.ip}` === tunnel.endpointHost,
-          );
+          endpointSsh = findHostByTunnelEndpoint(allHosts, tunnel.endpointHost);
         }
         await connectTunnel({
           name,
@@ -351,7 +381,9 @@ export function TunnelTab({ host }: { label: string; host?: DemoHost }) {
             endpointSsh?.authType === "password"
               ? endpointSsh.password
               : undefined,
-          endpointAuthMethod: endpointSsh?.authType ?? "password",
+          endpointAuthMethod: isDirect
+            ? sshHost.authType
+            : (endpointSsh?.authType ?? "password"),
           endpointSSHKey:
             endpointSsh?.authType === "key" ? endpointSsh.key : undefined,
           endpointKeyPassword:

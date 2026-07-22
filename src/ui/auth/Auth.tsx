@@ -41,7 +41,7 @@ import type { SSOProviderPublic } from "@/types/index";
 import { ElectronServerConfig as ServerConfigComponent } from "@/auth/ElectronServerConfig";
 import { ElectronLoginForm } from "@/auth/ElectronLoginForm";
 import { Checkbox } from "@/components/checkbox";
-import i18n from "@/i18n/i18n";
+import { changeAppLanguage, normalizeLanguageCode } from "@/i18n/i18n";
 import {
   removeSilentSigninFromSearch,
   shouldTriggerSilentSignin,
@@ -238,14 +238,14 @@ export function Auth({ onLogin }: AuthProps) {
   const [confirmNewPassword, setConfirmNewPassword] = useState("");
   const [resetTempToken, setResetTempToken] = useState("");
 
-  const [language, setLanguage] = useState(
-    () => localStorage.getItem("i18nextLng") ?? "en",
+  const [language, setLanguage] = useState(() =>
+    normalizeLanguageCode(localStorage.getItem("i18nextLng")),
   );
 
   function handleLanguageChange(code: string) {
-    setLanguage(code);
-    localStorage.setItem("i18nextLng", code);
-    i18n.changeLanguage(code);
+    void changeAppLanguage(code)
+      .then((language) => setLanguage(language))
+      .catch(() => {});
   }
 
   const [registrationAllowed, setRegistrationAllowed] = useState(true);
@@ -277,6 +277,27 @@ export function Auth({ onLogin }: AuthProps) {
       // Ignore storage failures; auth state still works for the current session.
     }
   }, [rememberMe]);
+
+  useEffect(() => {
+    if (!isInElectronWebView()) return;
+
+    const handleOIDCSystemBrowserResult = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      if (!event.data || typeof event.data !== "object") return;
+      if (event.data.type !== "OIDC_SYSTEM_BROWSER_AUTH_RESULT") return;
+
+      const providerId =
+        typeof event.data.providerId === "number" ? event.data.providerId : -1;
+      if (event.data.success) return;
+
+      setProviderLoading((prev) => ({ ...prev, [providerId]: false }));
+      toast.error(event.data.error || t("errors.failedOidcLogin"));
+    };
+
+    window.addEventListener("message", handleOIDCSystemBrowserResult);
+    return () =>
+      window.removeEventListener("message", handleOIDCSystemBrowserResult);
+  }, [t]);
 
   useEffect(() => {
     getRegistrationAllowed()
@@ -770,6 +791,7 @@ export function Auth({ onLogin }: AuthProps) {
               source: "oidc_request",
               authUrl,
               callbackPort,
+              providerId: loadingKey,
             },
             "*",
           );

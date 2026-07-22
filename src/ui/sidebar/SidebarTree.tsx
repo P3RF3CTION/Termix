@@ -1,6 +1,13 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useState, useEffect, type MouseEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useLayoutEffect,
+  type MouseEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Box,
   Boxes,
@@ -29,6 +36,7 @@ import {
   Share2,
   Terminal,
   Trash2,
+  Users,
   Zap,
 } from "lucide-react";
 import {
@@ -55,12 +63,23 @@ import {
 import type { Host, HostFolder, TabType } from "@/types/ui-types";
 import type { SSHHostData } from "@/types/index";
 import { FolderIconEl } from "@/components/folder-style";
+import { resolveHostTabType } from "@/lib/host-connection-tabs";
 import { copyToClipboard } from "@/lib/clipboard";
+import {
+  canDeleteHost,
+  canEditHost,
+  canShareHost,
+} from "@/sidebar/host-permissions";
 import { FolderMetadataDialog } from "./FolderMetadataDialog";
 import {
   useStatusColorScheme,
   getStatusClasses,
 } from "@/hooks/use-status-color-scheme";
+import {
+  useHostStatus,
+  useServerStatus,
+  useServerStatusMeta,
+} from "@/lib/ServerStatusContext";
 import {
   Tooltip,
   TooltipContent,
@@ -253,8 +272,8 @@ function folderHostCount(folder: HostFolder): {
 export function HostItem({
   host,
   onOpenTab,
-  onEditHost,
-  onShareHost,
+  onEditHost: onEditHostProp,
+  onShareHost: onShareHostProp,
   onProxmoxDiscover,
   onDelete,
   onDuplicate,
@@ -269,6 +288,7 @@ export function HostItem({
   onTrayOpenChange,
   onDragStart,
   onDragEnd,
+  depth = 0,
 }: {
   host: Host;
   onOpenTab: (type: TabType) => void;
@@ -288,8 +308,14 @@ export function HostItem({
   onProxmoxDiscover?: () => void;
   onDragStart?: () => void;
   onDragEnd?: () => void;
+  /** Nesting level when rendered in a flattened virtual list. */
+  depth?: number;
 }) {
   const { t } = useTranslation();
+  // Shared hosts expose actions matching the recipient's permission level.
+  const onEditHost = canEditHost(host) ? onEditHostProp : undefined;
+  const onShareHost = canShareHost(host) ? onShareHostProp : undefined;
+  const allowDelete = canDeleteHost(host);
   const metricsEnabled =
     host.enableSsh && host.statsConfig?.metricsEnabled !== false;
   const [trayOnClick, setTrayOnClick] = useState(
@@ -303,11 +329,17 @@ export function HostItem({
     () => localStorage.getItem("compactHostView") === "true",
   );
   const statusScheme = useStatusColorScheme();
+  const { initialLoadComplete } = useServerStatusMeta();
+  const statusCheckOn = statusCheckEnabled(host);
+  const statusLoading = !initialLoadComplete && statusCheckOn;
+  // Per-host subscription — status polls only re-render rows that flipped.
+  const liveStatus = useHostStatus(Number(host.id), statusCheckOn);
+  const isOnline = liveStatus != null ? liveStatus === "online" : host.online;
   const isTouchOnly =
     typeof window !== "undefined" && window.matchMedia("(hover: none)").matches;
   const shouldUseClickTray = trayOnClick || isTouchOnly;
-  const showPasswordCopy = canCopyHostPassword(host);
-  const showSudoPasswordCopy = canCopyHostSudoPassword(host);
+  const showPasswordCopy = !host.isShared && canCopyHostPassword(host);
+  const showSudoPasswordCopy = !host.isShared && canCopyHostSudoPassword(host);
 
   async function handleCopyPassword(
     e: MouseEvent,
@@ -365,6 +397,9 @@ export function HostItem({
 
   if (query && !hostMatchesQuery(host, query)) return null;
 
+  const depthStyle =
+    depth > 0 ? ({ paddingLeft: depth * 12 } as const) : undefined;
+
   if (compactHostView) {
     return (
       <div
@@ -374,6 +409,7 @@ export function HostItem({
           onDragStart?.();
         }}
         onDragEnd={() => onDragEnd?.()}
+        style={depthStyle}
         className={`group relative flex items-stretch cursor-pointer select-none transition-colors hover:bg-muted/40 ${
           selected
             ? "bg-accent-brand/5"
@@ -413,7 +449,7 @@ export function HostItem({
         }}
       >
         <div
-          className={`w-[3px] shrink-0 transition-colors ${getStatusClasses(host.online, statusScheme, "stripe")}`}
+          className={`w-[3px] shrink-0 transition-colors ${getStatusClasses(isOnline, statusScheme, "stripe", statusLoading)}`}
         />
         <div className="flex flex-col min-w-0 flex-1">
           <div className="flex items-center gap-1.5 min-w-0 px-2.5 py-1">
@@ -428,17 +464,37 @@ export function HostItem({
               <Tooltip>
                 <TooltipTrigger className="flex items-center">
                   <span
-                    className={`size-1.5 rounded-full shrink-0 ${getStatusClasses(host.online, statusScheme, "dot")}`}
+                    className={`size-1.5 rounded-full shrink-0 ${getStatusClasses(isOnline, statusScheme, "dot", statusLoading)}`}
                   />
                 </TooltipTrigger>
                 <TooltipContent side="right">
-                  {buildStatusTooltip(host, host.online)}
+                  {buildStatusTooltip(host, isOnline)}
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
             <span className="text-[13px] font-medium truncate text-foreground leading-none">
               {host.name}
             </span>
+            {host.isShared && (
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="flex items-center gap-0.5 text-[9px] px-1 py-px border border-accent-brand/30 bg-accent-brand/10 text-accent-brand shrink-0 leading-none uppercase tracking-wider">
+                      <Users className="size-2.5" />
+                      {t("hosts.sharing.sharedBadge")}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="right">
+                    {t("hosts.sharing.sharedBadgeTooltip", {
+                      owner: host.ownerUsername || "?",
+                      level: t(
+                        `hosts.sharing.levels.${host.permissionLevel ?? "connect"}.label`,
+                      ),
+                    })}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             {!selectionMode && shouldUseClickTray && (
               <button
                 title={
@@ -640,27 +696,31 @@ export function HostItem({
                         {t("nav.copySudoPassword")}
                       </DropdownMenuItem>
                     )}
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDuplicate();
-                      }}
-                    >
-                      <CopyPlus className="size-3.5 mr-2" />
-                      {t("hosts.cloneHostAction")}
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      className="text-destructive focus:text-destructive"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDelete();
-                      }}
-                    >
-                      <Trash2 className="size-3.5 mr-2" />
-                      {t("common.delete")}
-                    </DropdownMenuItem>
+                    {allowDelete && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDuplicate();
+                          }}
+                        >
+                          <CopyPlus className="size-3.5 mr-2" />
+                          {t("hosts.cloneHostAction")}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDelete();
+                          }}
+                        >
+                          <Trash2 className="size-3.5 mr-2" />
+                          {t("common.delete")}
+                        </DropdownMenuItem>
+                      </>
+                    )}
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
@@ -836,27 +896,31 @@ export function HostItem({
                         {t("nav.copySudoPassword")}
                       </DropdownMenuItem>
                     )}
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDuplicate();
-                      }}
-                    >
-                      <CopyPlus className="size-3.5 mr-2" />
-                      {t("hosts.cloneHostAction")}
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      className="text-destructive focus:text-destructive"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDelete();
-                      }}
-                    >
-                      <Trash2 className="size-3.5 mr-2" />
-                      {t("common.delete")}
-                    </DropdownMenuItem>
+                    {allowDelete && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDuplicate();
+                          }}
+                        >
+                          <CopyPlus className="size-3.5 mr-2" />
+                          {t("hosts.cloneHostAction")}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDelete();
+                          }}
+                        >
+                          <Trash2 className="size-3.5 mr-2" />
+                          {t("common.delete")}
+                        </DropdownMenuItem>
+                      </>
+                    )}
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
@@ -875,6 +939,7 @@ export function HostItem({
         onDragStart?.();
       }}
       onDragEnd={() => onDragEnd?.()}
+      style={depthStyle}
       className={`group relative flex items-stretch cursor-pointer select-none transition-colors hover:bg-muted/40 ${
         selected
           ? "bg-accent-brand/5"
@@ -916,7 +981,7 @@ export function HostItem({
     >
       {/* Status stripe */}
       <div
-        className={`w-[3px] shrink-0 transition-colors ${getStatusClasses(host.online, statusScheme, "stripe")}`}
+        className={`w-[3px] shrink-0 transition-colors ${getStatusClasses(isOnline, statusScheme, "stripe", statusLoading)}`}
       />
 
       <div className="flex flex-col flex-1 min-w-0 px-2.5 pt-2 pb-1.5 gap-1">
@@ -933,11 +998,11 @@ export function HostItem({
             <Tooltip>
               <TooltipTrigger className="flex items-center">
                 <span
-                  className={`size-1.5 rounded-full shrink-0 ${getStatusClasses(host.online, statusScheme, "dot")}`}
+                  className={`size-1.5 rounded-full shrink-0 ${getStatusClasses(isOnline, statusScheme, "dot", statusLoading)}`}
                 />
               </TooltipTrigger>
               <TooltipContent side="right">
-                {buildStatusTooltip(host, host.online)}
+                {buildStatusTooltip(host, isOnline)}
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>
@@ -946,6 +1011,26 @@ export function HostItem({
           </span>
           {host.pin && (
             <Pin className="size-2.5 text-accent-brand/50 shrink-0" />
+          )}
+          {host.isShared && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center gap-0.5 text-[9px] px-1 py-px border border-accent-brand/30 bg-accent-brand/10 text-accent-brand shrink-0 leading-none uppercase tracking-wider">
+                    <Users className="size-2.5" />
+                    {t("hosts.sharing.sharedBadge")}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="right">
+                  {t("hosts.sharing.sharedBadgeTooltip", {
+                    owner: host.ownerUsername || "?",
+                    level: t(
+                      `hosts.sharing.levels.${host.permissionLevel ?? "connect"}.label`,
+                    ),
+                  })}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           )}
           {!selectionMode && shouldUseClickTray && (
             <button
@@ -1074,7 +1159,7 @@ export function HostItem({
         <div
           className={`overflow-hidden transition-all duration-150 ease-out max-h-0 opacity-0 ${!shouldUseClickTray ? "group-hover:max-h-[300px] group-hover:opacity-100" : ""} ${selectionMode ? "!max-h-0 !opacity-0" : ""} ${(isMenuOpen || (shouldUseClickTray && isTrayOpen)) && !selectionMode ? "!max-h-[300px] !opacity-100" : ""}`}
         >
-          {host.online &&
+          {isOnline &&
             ((host.cpu != null && host.cpu > 0) ||
               (host.ram != null && host.ram > 0)) && (
               <div className="flex items-center gap-3 pl-3">
@@ -1418,27 +1503,31 @@ export function HostItem({
                       )}
                     </DropdownMenuSubContent>
                   </DropdownMenuSub>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDuplicate();
-                    }}
-                  >
-                    <CopyPlus className="size-3.5 mr-2" />
-                    {t("hosts.cloneHostAction")}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    className="text-destructive focus:text-destructive"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete();
-                    }}
-                  >
-                    <Trash2 className="size-3.5 mr-2" />
-                    {t("common.delete")}
-                  </DropdownMenuItem>
+                  {allowDelete && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDuplicate();
+                        }}
+                      >
+                        <CopyPlus className="size-3.5 mr-2" />
+                        {t("hosts.cloneHostAction")}
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        className="text-destructive focus:text-destructive"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDelete();
+                        }}
+                      >
+                        <Trash2 className="size-3.5 mr-2" />
+                        {t("common.delete")}
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -1471,10 +1560,14 @@ export function FolderItem({
   onTrayOpenChange,
   onManageFolder,
   onDeleteFolder,
+  onOpenAllSessions,
   onMoveHostsToFolder,
   draggedHostIds,
   onDragHostStart,
   onDragEnd,
+  /** When true, only render the folder header (children come from the virtual list). */
+  flat = false,
+  stripeIndex: stripeIndexProp,
 }: {
   folder: HostFolder;
   depth?: number;
@@ -1485,7 +1578,7 @@ export function FolderItem({
   onDuplicateHost: (host: Host) => void;
   onProxmoxDiscover?: (host: Host) => void;
   query?: string;
-  stripeMap: Map<Host | HostFolder, number>;
+  stripeMap?: Map<Host | HostFolder, number>;
   openFolders: Set<string>;
   onToggleFolder: (name: string) => void;
   selectionMode: boolean;
@@ -1497,26 +1590,36 @@ export function FolderItem({
   onTrayOpenChange: (hostId: string | null) => void;
   onManageFolder: (folder: HostFolder) => void;
   onDeleteFolder: (folder: HostFolder) => void;
+  onOpenAllSessions: (folder: HostFolder) => void;
   onMoveHostsToFolder: (hostIds: string[], targetPath: string) => void;
   draggedHostIds: string[] | null;
   onDragHostStart: (hostId: string) => void;
   onDragEnd: () => void;
+  flat?: boolean;
+  stripeIndex?: number;
 }) {
   const { t } = useTranslation();
-  const { total, online } = folderHostCount(folder);
+  const { getStatus, initialLoadComplete } = useServerStatus();
+  const { total } = folderHostCount(folder);
+  const online = initialLoadComplete
+    ? collectAllHosts(folder.children).filter(
+        (h) => statusCheckEnabled(h) && getStatus(Number(h.id)) === "online",
+      ).length
+    : folderHostCount(folder).online;
   const [dragOver, setDragOver] = useState(false);
 
   if (query && !folderHasMatch(folder, query)) return null;
 
   const folderPath = folder.path ?? folder.name;
   const isOpen = query ? true : openFolders.has(folderPath);
-  const stripeIndex = stripeMap.get(folder) ?? 0;
+  const stripeIndex = stripeIndexProp ?? stripeMap?.get(folder) ?? 0;
   // Synthetic group headers (group-by tag/status/etc.) are not real folders, so
   // they can't be edited, deleted, or used as drop targets.
   const isGroup = folderPath.startsWith("__group__:");
 
   return (
     <div
+      style={depth > 0 ? { paddingLeft: depth * 12 } : undefined}
       onDragOver={(e) => {
         if (draggedHostIds && !isGroup) {
           e.preventDefault();
@@ -1562,6 +1665,16 @@ export function FolderItem({
             {!isGroup && (
               <span className="flex items-center gap-1.5 ml-1 opacity-0 group-hover/folder:opacity-100 transition-opacity">
                 <span
+                  title={t("hosts.openAllSessions")}
+                  className="text-muted-foreground/50 hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenAllSessions(folder);
+                  }}
+                >
+                  <FolderOpen className="size-2.5" />
+                </span>
+                <span
                   title={t("hosts.editFolder")}
                   className="text-muted-foreground/50 hover:text-foreground"
                   onClick={(e) => {
@@ -1586,7 +1699,7 @@ export function FolderItem({
           </>
         }
       </button>
-      {isOpen && (
+      {!flat && isOpen && (
         <div className="border-l border-border/40 ml-[30px]">
           {folder.children.map((child, i) =>
             isFolder(child) ? (
@@ -1613,6 +1726,7 @@ export function FolderItem({
                 onTrayOpenChange={onTrayOpenChange}
                 onManageFolder={onManageFolder}
                 onDeleteFolder={onDeleteFolder}
+                onOpenAllSessions={onOpenAllSessions}
                 onMoveHostsToFolder={onMoveHostsToFolder}
                 draggedHostIds={draggedHostIds}
                 onDragHostStart={onDragHostStart}
@@ -1631,7 +1745,7 @@ export function FolderItem({
                 onDelete={() => onDeleteHost(child)}
                 onDuplicate={() => onDuplicateHost(child)}
                 query={query}
-                stripeIndex={stripeMap.get(child) ?? 0}
+                stripeIndex={stripeMap?.get(child) ?? 0}
                 selectionMode={selectionMode}
                 selected={selectedHostIds.has(child.id)}
                 onToggleSelect={() => onToggleSelect(child.id)}
@@ -1699,6 +1813,34 @@ export function SidebarTree({
     mode: "create" | "edit";
     folder?: HostFolder;
   } | null>(null);
+  const [compactHostView, setCompactHostView] = useState(
+    () => localStorage.getItem("compactHostView") === "true",
+  );
+  const [trayOnClick, setTrayOnClick] = useState(
+    () => localStorage.getItem("hostTrayOnClick") === "true",
+  );
+
+  useEffect(() => {
+    const handler = () =>
+      setCompactHostView(localStorage.getItem("compactHostView") === "true");
+    window.addEventListener("storage", handler);
+    window.addEventListener("compactHostViewChanged", handler);
+    return () => {
+      window.removeEventListener("storage", handler);
+      window.removeEventListener("compactHostViewChanged", handler);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = () =>
+      setTrayOnClick(localStorage.getItem("hostTrayOnClick") === "true");
+    window.addEventListener("storage", handler);
+    window.addEventListener("hostTrayOnClickChanged", handler);
+    return () => {
+      window.removeEventListener("storage", handler);
+      window.removeEventListener("hostTrayOnClickChanged", handler);
+    };
+  }, []);
 
   function handleDragHostStart(hostId: string) {
     // When the dragged host is part of an active selection, move the whole set.
@@ -1730,6 +1872,14 @@ export function SidebarTree({
 
   function handleManageFolder(folder: HostFolder) {
     setFolderDialog({ mode: "edit", folder });
+  }
+
+  function handleOpenAllSessions(folder: HostFolder) {
+    const hosts = collectAllHosts(folder.children);
+    for (const host of hosts) {
+      const type = resolveHostTabType(host);
+      onOpenTab(host, type);
+    }
   }
 
   async function handleSaveFolderMetadata(value: {
@@ -1888,6 +2038,8 @@ export function SidebarTree({
         rdpDomain: host.domain ?? null,
         rdpSecurity: host.security ?? null,
         rdpIgnoreCert: host.ignoreCert ?? false,
+        vncAuthType: host.vncAuthType ?? null,
+        vncCredentialId: host.vncCredentialId ?? null,
         vncPassword: host.vncPassword ?? null,
         vncUser: host.vncUser ?? null,
         telnetUser: host.telnetUser ?? null,
@@ -1925,9 +2077,55 @@ export function SidebarTree({
   const allFolderPaths = collectAllFolderPaths(children);
 
   const visibleRows = collectVisibleRows(children, query, openFolders);
-  const stripeMap = new Map<Host | HostFolder, number>(
-    visibleRows.map((r, i) => [r.item, i]),
-  );
+  const parentRef = useRef<HTMLDivElement>(null);
+
+  const isTouchOnly =
+    typeof window !== "undefined" && window.matchMedia("(hover: none)").matches;
+  const clickTrayActive = trayOnClick || isTouchOnly;
+
+  const virtualizer = useVirtualizer({
+    count: visibleRows.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: (index) => {
+      const row = visibleRows[index];
+      if (!row) return 36;
+      if (isFolder(row.item)) return 36;
+      const isOpen = openTrayHostId === row.item.id;
+      if (compactHostView) {
+        // Compact rows are a single line; the tray adds a second wrapped row.
+        return isOpen ? 88 : 32;
+      }
+      // Default rows show name + address (+ optional tags), taller to start with.
+      // Click-tray mode also keeps the connection buttons visible even when closed.
+      const base = clickTrayActive ? 76 : 56;
+      return isOpen ? base + 96 : base;
+    },
+    overscan: 12,
+    getItemKey: (index) => {
+      const row = visibleRows[index];
+      if (!row) return index;
+      return isFolder(row.item)
+        ? `folder:${row.item.path ?? row.item.name}`
+        : `host:${row.item.id}`;
+    },
+  });
+
+  // Remeasure when the tree shape changes (rows added/removed/reordered), so
+  // stale cached sizes from before don't leak onto different rows. Tray
+  // open/close is intentionally excluded — `measureElement`'s ResizeObserver
+  // already tracks that live via the CSS transition, and force-resetting the
+  // cache here would snap rows back to the rough estimate mid-animation and
+  // cause visible jitter.
+  useLayoutEffect(() => {
+    virtualizer.measure();
+  }, [
+    virtualizer,
+    openFolders,
+    query,
+    visibleRows.length,
+    compactHostView,
+    trayOnClick,
+  ]);
 
   if (loading) {
     return (
@@ -1957,6 +2155,7 @@ export function SidebarTree({
   return (
     <div className="relative flex flex-col flex-1 min-h-0">
       <div
+        ref={parentRef}
         className={`flex-1 min-h-0 overflow-y-auto ${rootDragOver ? "ring-1 ring-inset ring-accent-brand/50" : ""}`}
         onDragOver={(e) => {
           if (draggedHostIds) {
@@ -1983,65 +2182,91 @@ export function SidebarTree({
             </span>
           </div>
         ) : (
-          children.map((child, i) =>
-            isFolder(child) ? (
-              <FolderItem
-                key={i}
-                folder={child}
-                onOpenTab={onOpenTab}
-                onEditHost={onEditHost}
-                onShareHost={onShareHost}
-                onDeleteHost={handleDeleteHost}
-                onDuplicateHost={handleDuplicateHost}
-                onProxmoxDiscover={onProxmoxDiscover}
-                query={query}
-                stripeMap={stripeMap}
-                openFolders={openFolders}
-                onToggleFolder={toggleFolder}
-                selectionMode={selectionMode}
-                selectedHostIds={selectedHostIds}
-                onToggleSelect={toggleSelect}
-                openMenuHostId={openMenuHostId}
-                onMenuOpenChange={setOpenMenuHostId}
-                openTrayHostId={openTrayHostId}
-                onTrayOpenChange={setOpenTrayHostId}
-                onManageFolder={handleManageFolder}
-                onDeleteFolder={handleDeleteFolder}
-                onMoveHostsToFolder={handleMoveHostsToFolder}
-                draggedHostIds={draggedHostIds}
-                onDragHostStart={handleDragHostStart}
-                onDragEnd={() => setDraggedHostIds(null)}
-              />
-            ) : (
-              <HostItem
-                key={i}
-                host={child}
-                onOpenTab={(type) => onOpenTab(child, type)}
-                onEditHost={() => onEditHost(child)}
-                onShareHost={onShareHost ? () => onShareHost(child) : undefined}
-                onProxmoxDiscover={
-                  onProxmoxDiscover ? () => onProxmoxDiscover(child) : undefined
-                }
-                onDelete={() => handleDeleteHost(child)}
-                onDuplicate={() => handleDuplicateHost(child)}
-                query={query}
-                stripeIndex={stripeMap.get(child) ?? 0}
-                selectionMode={selectionMode}
-                selected={selectedHostIds.has(child.id)}
-                onToggleSelect={() => toggleSelect(child.id)}
-                isMenuOpen={openMenuHostId === child.id}
-                onMenuOpenChange={(open) =>
-                  setOpenMenuHostId(open ? child.id : null)
-                }
-                isTrayOpen={openTrayHostId === child.id}
-                onTrayOpenChange={(open) =>
-                  setOpenTrayHostId(open ? child.id : null)
-                }
-                onDragStart={() => handleDragHostStart(child.id)}
-                onDragEnd={() => setDraggedHostIds(null)}
-              />
-            ),
-          )
+          <div
+            className="relative w-full"
+            style={{ height: virtualizer.getTotalSize() }}
+          >
+            {virtualizer.getVirtualItems().map((vItem) => {
+              const row = visibleRows[vItem.index];
+              if (!row) return null;
+              const { item, depth } = row;
+              return (
+                <div
+                  key={vItem.key}
+                  data-index={vItem.index}
+                  ref={virtualizer.measureElement}
+                  className="absolute top-0 left-0 w-full"
+                  style={{
+                    transform: `translateY(${vItem.start}px)`,
+                  }}
+                >
+                  {isFolder(item) ? (
+                    <FolderItem
+                      folder={item}
+                      depth={depth}
+                      flat
+                      onOpenTab={onOpenTab}
+                      onEditHost={onEditHost}
+                      onShareHost={onShareHost}
+                      onDeleteHost={handleDeleteHost}
+                      onDuplicateHost={handleDuplicateHost}
+                      onProxmoxDiscover={onProxmoxDiscover}
+                      query={query}
+                      openFolders={openFolders}
+                      onToggleFolder={toggleFolder}
+                      selectionMode={selectionMode}
+                      selectedHostIds={selectedHostIds}
+                      onToggleSelect={toggleSelect}
+                      openMenuHostId={openMenuHostId}
+                      onMenuOpenChange={setOpenMenuHostId}
+                      openTrayHostId={openTrayHostId}
+                      onTrayOpenChange={setOpenTrayHostId}
+                      onManageFolder={handleManageFolder}
+                      onDeleteFolder={handleDeleteFolder}
+                      onOpenAllSessions={handleOpenAllSessions}
+                      onMoveHostsToFolder={handleMoveHostsToFolder}
+                      draggedHostIds={draggedHostIds}
+                      onDragHostStart={handleDragHostStart}
+                      onDragEnd={() => setDraggedHostIds(null)}
+                      stripeIndex={vItem.index}
+                    />
+                  ) : (
+                    <HostItem
+                      host={item}
+                      depth={depth}
+                      onOpenTab={(type) => onOpenTab(item, type)}
+                      onEditHost={() => onEditHost(item)}
+                      onShareHost={
+                        onShareHost ? () => onShareHost(item) : undefined
+                      }
+                      onProxmoxDiscover={
+                        onProxmoxDiscover
+                          ? () => onProxmoxDiscover(item)
+                          : undefined
+                      }
+                      onDelete={() => handleDeleteHost(item)}
+                      onDuplicate={() => handleDuplicateHost(item)}
+                      query={query}
+                      stripeIndex={vItem.index}
+                      selectionMode={selectionMode}
+                      selected={selectedHostIds.has(item.id)}
+                      onToggleSelect={() => toggleSelect(item.id)}
+                      isMenuOpen={openMenuHostId === item.id}
+                      onMenuOpenChange={(open) =>
+                        setOpenMenuHostId(open ? item.id : null)
+                      }
+                      isTrayOpen={openTrayHostId === item.id}
+                      onTrayOpenChange={(open) =>
+                        setOpenTrayHostId(open ? item.id : null)
+                      }
+                      onDragStart={() => handleDragHostStart(item.id)}
+                      onDragEnd={() => setDraggedHostIds(null)}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
 

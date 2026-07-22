@@ -33,6 +33,7 @@ import {
   getCommandHistoryEnabled,
   updateCommandHistoryEnabled,
   isElectron,
+  getConfiguredServerUrl,
   getUserRoles,
 } from "@/main-axios";
 import {
@@ -53,6 +54,10 @@ import {
   updateSSOProvider,
   deleteSSOProvider,
 } from "@/api/sso-provider-api";
+import {
+  getMetricsHistoryRetention,
+  saveMetricsHistoryRetention,
+} from "@/api/host-metrics-api";
 import type { SSOProvider } from "@/types/index";
 import type { ApiKey, CreatedApiKey, UserRole } from "@/main-axios";
 import type { AdminSection } from "@/types/ui-types";
@@ -65,7 +70,7 @@ import {
   type AdminUser,
 } from "./AdminManagementSections";
 import { toast } from "sonner";
-import { getBasePath } from "@/lib/base-path";
+import { getDatabaseTransferUrl } from "@/lib/database-transfer-url";
 import {
   AdminDatabaseSection,
   AdminGeneralSettingsSection,
@@ -82,6 +87,8 @@ import {
   AdminLinkAccountDialog,
   AdminUnlinkAccountDialog,
 } from "./AdminUserDialogs";
+import { AdminUserManagePanel } from "./AdminUserManagePanel";
+import type { Host } from "@/types/ui-types";
 
 type ApiErrorLike = {
   response?: {
@@ -95,17 +102,25 @@ function apiErrorMessage(error: unknown, fallback: string) {
   return (error as ApiErrorLike).response?.data?.error || fallback;
 }
 
-export function AdminSettingsPanel() {
+export function AdminSettingsPanel({
+  onEditingChange,
+  onOpenHostTab,
+}: {
+  onEditingChange?: (editing: boolean) => void;
+  onOpenHostTab?: (host: Host) => void;
+} = {}) {
   const { t } = useTranslation();
   const [openSection, setOpenSection] = useState<AdminSection | null>(
     "general",
   );
+  const [manageUser, setManageUser] = useState<AdminUser | null>(null);
   const [allowRegistration, setAllowRegistration] = useState(true);
   const [allowPasswordLogin, setAllowPasswordLogin] = useState(true);
   const [allowPasswordReset, setAllowPasswordReset] = useState(true);
   const [sessionTimeout, setSessionTimeout] = useState("24");
   const [statusInterval, setStatusInterval] = useState("60");
   const [metricsInterval, setMetricsInterval] = useState("30");
+  const [metricsHistoryRetention, setMetricsHistoryRetention] = useState("7");
   const [guacEnabled, setGuacEnabled] = useState(false);
   const [guacUrl, setGuacUrl] = useState("guacd:4822");
   const [logLevel, setLogLevel] = useState("info");
@@ -201,6 +216,11 @@ export function AdminSettingsPanel() {
   }, []);
 
   useEffect(() => {
+    onEditingChange?.(manageUser !== null);
+    return () => onEditingChange?.(false);
+  }, [manageUser, onEditingChange]);
+
+  useEffect(() => {
     if (editUserOpen && editUserTarget) {
       setEditUserRoles([]);
       setEditUserRolesLoading(true);
@@ -221,6 +241,8 @@ export function AdminSettingsPanel() {
             isAdmin: user.is_admin,
             isOidc: user.is_oidc,
             passwordHash: user.password_hash,
+            dataUnlocked: user.data_unlocked,
+            totpEnabled: user.totp_enabled,
           })),
         ),
       )
@@ -287,6 +309,10 @@ export function AdminSettingsPanel() {
         setStatusInterval(String(monitoring.value.statusCheckInterval));
         setMetricsInterval(String(monitoring.value.metricsInterval));
       }
+
+      getMetricsHistoryRetention()
+        .then((days) => setMetricsHistoryRetention(String(days)))
+        .catch(() => {});
       if (level.status === "fulfilled") setLogLevel(level.value.level);
       if (guac.status === "fulfilled") {
         setGuacEnabled(guac.value.enabled);
@@ -417,15 +443,25 @@ export function AdminSettingsPanel() {
   async function handleSaveMonitoring() {
     const status = parseInt(statusInterval, 10);
     const metrics = parseInt(metricsInterval, 10);
+    const retention = parseInt(metricsHistoryRetention, 10);
     if (isNaN(status) || isNaN(metrics)) {
       toast.error(t("admin.monitoringIntervalInvalid"));
       return;
     }
+    if (!isNaN(retention) && (retention < 1 || retention > 90)) {
+      toast.error(t("admin.metricsHistoryRetentionRange"));
+      return;
+    }
     try {
-      await updateGlobalMonitoringSettings({
-        statusCheckInterval: status,
-        metricsInterval: metrics,
-      });
+      await Promise.all([
+        updateGlobalMonitoringSettings({
+          statusCheckInterval: status,
+          metricsInterval: metrics,
+        }),
+        !isNaN(retention)
+          ? saveMetricsHistoryRetention(retention)
+          : Promise.resolve(),
+      ]);
       toast.success(t("admin.monitoringSaved"));
     } catch {
       toast.error(t("admin.monitoringSaveFailed"));
@@ -698,17 +734,11 @@ export function AdminSettingsPanel() {
   async function handleExportDatabase() {
     setExportLoading(true);
     try {
-      const isDev =
-        !isElectron() &&
-        (window.location.port === "5173" ||
-          window.location.hostname === "localhost" ||
-          window.location.hostname === "127.0.0.1");
-
-      const apiUrl = isElectron()
-        ? `${window.configuredServerUrl}/database/export`
-        : isDev
-          ? `http://localhost:30001/database/export`
-          : `${window.location.protocol}//${window.location.host}${getBasePath()}/database/export`;
+      const apiUrl = getDatabaseTransferUrl("export", {
+        electron: isElectron(),
+        configuredServerUrl: getConfiguredServerUrl(),
+        location: window.location,
+      });
 
       const response = await fetch(apiUrl, {
         method: "POST",
@@ -750,17 +780,11 @@ export function AdminSettingsPanel() {
     }
     setImportLoading(true);
     try {
-      const isDev =
-        !isElectron() &&
-        (window.location.port === "5173" ||
-          window.location.hostname === "localhost" ||
-          window.location.hostname === "127.0.0.1");
-
-      const apiUrl = isElectron()
-        ? `${window.configuredServerUrl}/database/import`
-        : isDev
-          ? `http://localhost:30001/database/import`
-          : `${window.location.protocol}//${window.location.host}${getBasePath()}/database/import`;
+      const apiUrl = getDatabaseTransferUrl("import", {
+        electron: isElectron(),
+        configuredServerUrl: getConfiguredServerUrl(),
+        location: window.location,
+      });
 
       const formData = new FormData();
       formData.append("file", importFile);
@@ -804,8 +828,31 @@ export function AdminSettingsPanel() {
     }
   }
 
+  if (manageUser) {
+    return (
+      <AdminUserManagePanel
+        key={manageUser.id}
+        user={manageUser}
+        roles={roles}
+        onBack={() => setManageUser(null)}
+        onOpenHostTab={onOpenHostTab}
+        onUserDeleted={() => {
+          setUsers((prev) => prev.filter((u) => u.id !== manageUser.id));
+          setManageUser(null);
+        }}
+        onTotpDisabled={() => {
+          setUsers((prev) =>
+            prev.map((u) =>
+              u.id === manageUser.id ? { ...u, totpEnabled: false } : u,
+            ),
+          );
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-2 p-3">
+    <div className="flex flex-col gap-2 p-3 flex-1 min-h-0 overflow-y-auto">
       <AdminGeneralSettingsSection
         open={openSection === "general"}
         onToggle={() => toggle("general")}
@@ -828,6 +875,8 @@ export function AdminSettingsPanel() {
         setStatusInterval={setStatusInterval}
         metricsInterval={metricsInterval}
         setMetricsInterval={setMetricsInterval}
+        metricsHistoryRetention={metricsHistoryRetention}
+        setMetricsHistoryRetention={setMetricsHistoryRetention}
         handleSaveMonitoring={handleSaveMonitoring}
         guacEnabled={guacEnabled}
         handleToggleGuacamole={handleToggleGuacamole}
@@ -871,6 +920,7 @@ export function AdminSettingsPanel() {
         setLinkAccountOpen={setLinkAccountOpen}
         setUnlinkAccountTarget={setUnlinkAccountTarget}
         setUnlinkAccountOpen={setUnlinkAccountOpen}
+        onManageUser={setManageUser}
       />
 
       <AdminSessionsSection

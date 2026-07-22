@@ -1,4 +1,5 @@
 import { authApi } from "@/main-axios";
+import { createTtlRequestCache } from "@/lib/ttl-request-cache";
 
 // OPEN TABS API
 // ============================================================================
@@ -42,6 +43,8 @@ export interface ActiveSessionInfo {
   createdAt: number;
 }
 
+const activeSessionsCache = createTtlRequestCache<ActiveSessionInfo[]>(2_000);
+
 export async function getOpenTabs(): Promise<OpenTabRecord[]> {
   const response = await authApi.get("/open-tabs");
   return response.data;
@@ -69,8 +72,10 @@ export async function addOpenTab(tab: OpenTabUpsertPayload): Promise<void> {
 }
 
 export async function getActiveSessions(): Promise<ActiveSessionInfo[]> {
-  const response = await authApi.get("/open-tabs/active-sessions");
-  return response.data;
+  return activeSessionsCache.get(async () => {
+    const response = await authApi.get("/open-tabs/active-sessions");
+    return Array.isArray(response.data) ? response.data : [];
+  });
 }
 
 // ============================================================================
@@ -89,6 +94,7 @@ export interface UserPreferences {
   showHostTags?: boolean | null;
   hostTrayOnClick?: boolean | null;
   pinAppRail?: boolean | null;
+  expandAppRailOnHover?: boolean | null;
   foldersCollapsed?: boolean | null;
   confirmSnippetExecution?: boolean | null;
   disableUpdateCheck?: boolean | null;

@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  Bell,
   Clock,
+  Fingerprint,
   Hammer,
   KeyRound,
   LayoutPanelLeft,
@@ -12,24 +14,30 @@ import {
   ScrollText,
   Server,
   Settings,
+  Usb,
   User,
   Zap,
 } from "lucide-react";
 import type { SplitMode, TabType, ToolsTab } from "@/types/ui-types";
+import { getAlertFirings } from "@/api/alerts-api";
 
 export type RailView =
   | "hosts"
   | "credentials"
+  | "termix-id"
   | "quick-connect"
+  | "serial"
   | ToolsTab
   | "connections"
   | "session-logs"
   | "user-profile"
-  | "admin-settings";
+  | "admin-settings"
+  | "alerts";
 
 export type HideableRailView =
   | Exclude<RailView, "user-profile" | "admin-settings">
-  | "network_graph";
+  | "network_graph"
+  | "homepage";
 
 type RailItem =
   | {
@@ -56,6 +64,12 @@ function buildRailButtons(
     },
     { kind: "separator" },
     {
+      view: "termix-id",
+      icon: <Fingerprint size={16} />,
+      title: t("nav.termixId"),
+    },
+    { kind: "separator" },
+    {
       view: "connections",
       icon: <Plug size={16} />,
       title: t("nav.connections"),
@@ -65,6 +79,12 @@ function buildRailButtons(
       view: "quick-connect",
       icon: <Zap size={16} />,
       title: t("nav.quickConnect"),
+    },
+    { kind: "separator" },
+    {
+      view: "serial",
+      icon: <Usb size={16} />,
+      title: t("nav.serial"),
     },
     { kind: "separator" },
     { view: "ssh-tools", icon: <Hammer size={16} />, title: t("nav.sshTools") },
@@ -117,8 +137,8 @@ function buildRailButtons(
 }
 
 const btnBase =
-  "relative flex items-center gap-2.5 h-7 rounded shrink-0 transition-colors";
-const btnStyle = { margin: "0 4px", padding: "0 6px" };
+  "relative flex items-center h-7 rounded shrink-0 transition-colors gap-2.5";
+const btnStyle = { margin: "0 4px", padding: "0 8px" };
 
 export function AppRail({
   railView,
@@ -144,6 +164,52 @@ export function AppRail({
   const [pinned, setPinned] = useState(
     () => localStorage.getItem("pinAppRail") === "true",
   );
+  const [expandOnHover, setExpandOnHover] = useState(
+    () => localStorage.getItem("expandAppRailOnHover") !== "false",
+  );
+  const [unreadAlerts, setUnreadAlerts] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    const poll = () => {
+      if (document.visibilityState === "hidden") return;
+      getAlertFirings({ acknowledged: false, limit: 50 })
+        .then((firings) => {
+          if (!cancelled) setUnreadAlerts(firings.length);
+        })
+        .catch(() => {});
+    };
+
+    const start = () => {
+      if (intervalId !== null) return;
+      intervalId = setInterval(poll, 30000);
+    };
+    const stop = () => {
+      if (intervalId === null) return;
+      clearInterval(intervalId);
+      intervalId = null;
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        stop();
+        return;
+      }
+      poll();
+      start();
+    };
+
+    poll();
+    if (document.visibilityState !== "hidden") start();
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      cancelled = true;
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
   const [hiddenTabs, setHiddenTabs] = useState<Set<string>>(() => {
     try {
       const stored = localStorage.getItem("hiddenRailTabs");
@@ -154,10 +220,18 @@ export function AppRail({
   });
 
   useEffect(() => {
-    const handler = () =>
+    const pinHandler = () =>
       setPinned(localStorage.getItem("pinAppRail") === "true");
-    window.addEventListener("pinAppRailChanged", handler);
-    return () => window.removeEventListener("pinAppRailChanged", handler);
+    const hoverHandler = () =>
+      setExpandOnHover(
+        localStorage.getItem("expandAppRailOnHover") !== "false",
+      );
+    window.addEventListener("pinAppRailChanged", pinHandler);
+    window.addEventListener("expandAppRailOnHoverChanged", hoverHandler);
+    return () => {
+      window.removeEventListener("pinAppRailChanged", pinHandler);
+      window.removeEventListener("expandAppRailOnHoverChanged", hoverHandler);
+    };
   }, []);
 
   useEffect(() => {
@@ -173,7 +247,7 @@ export function AppRail({
     return () => window.removeEventListener("hiddenRailTabsChanged", handler);
   }, []);
 
-  const railExpanded = pinned || hovered;
+  const railExpanded = pinned || (expandOnHover && hovered);
   const railButtons = buildRailButtons(splitMode, t, hiddenTabs);
 
   return (
@@ -205,8 +279,8 @@ export function AppRail({
                 {item.icon}
               </span>
               <span
-                className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-opacity duration-150 ${
-                  railExpanded ? "opacity-100 delay-75" : "opacity-0"
+                className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-[opacity,width] duration-150 ${
+                  railExpanded ? "opacity-100 delay-75" : "opacity-0 w-0"
                 }`}
               >
                 {item.title}
@@ -230,8 +304,8 @@ export function AppRail({
                 {item.icon}
               </span>
               <span
-                className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-opacity duration-150 ${
-                  railExpanded ? "opacity-100 delay-75" : "opacity-0"
+                className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-[opacity,width] duration-150 ${
+                  railExpanded ? "opacity-100 delay-75" : "opacity-0 w-0"
                 }`}
               >
                 {item.title}
@@ -246,6 +320,11 @@ export function AppRail({
 
       <div className="shrink-0 flex flex-col gap-1 border-t border-border pt-1 pb-1">
         {[
+          {
+            view: "alerts" as RailView,
+            icon: <Bell size={16} />,
+            title: t("nav.alerts"),
+          },
           {
             view: "user-profile" as RailView,
             icon: <User size={16} />,
@@ -272,13 +351,18 @@ export function AppRail({
             }`}
           >
             <span
-              className="shrink-0 flex items-center justify-center"
+              className="relative shrink-0 flex items-center justify-center"
               style={{ width: 16, height: 16 }}
             >
               {item.icon}
+              {item.view === "alerts" && unreadAlerts > 0 && (
+                <span className="absolute -top-1 -right-1 flex size-3 items-center justify-center rounded-full bg-destructive text-[8px] font-bold text-white leading-none">
+                  {unreadAlerts > 9 ? "9+" : unreadAlerts}
+                </span>
+              )}
             </span>
             <span
-              className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-opacity duration-150 ${railExpanded ? "opacity-100 delay-75" : "opacity-0"}`}
+              className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-[opacity,width] duration-150 ${railExpanded ? "opacity-100 delay-75" : "opacity-0 w-0"}`}
             >
               {item.title}
             </span>
@@ -297,7 +381,7 @@ export function AppRail({
             <LogOut size={16} />
           </span>
           <span
-            className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-opacity duration-150 ${railExpanded ? "opacity-100 delay-75" : "opacity-0"}`}
+            className={`text-xs font-medium whitespace-nowrap overflow-hidden transition-[opacity,width] duration-150 ${railExpanded ? "opacity-100 delay-75" : "opacity-0 w-0"}`}
           >
             {t("common.logout")}
           </span>
@@ -307,7 +391,7 @@ export function AppRail({
       <div className="shrink-0 border-t border-border">
         <button
           className="flex items-center gap-2.5 w-full h-10 text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
-          style={{ padding: "0 6px" }}
+          style={{ padding: "0 8px" }}
         >
           <div
             className="rounded-full bg-accent-brand/20 border border-accent-brand/30 flex items-center justify-center font-bold text-accent-brand shrink-0"

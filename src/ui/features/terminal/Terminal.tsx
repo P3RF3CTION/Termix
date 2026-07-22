@@ -7,6 +7,7 @@ import {
   forwardRef,
   useCallback,
 } from "react";
+import { createPortal } from "react-dom";
 import { useXTerm } from "react-xtermjs";
 import { FitAddon } from "@xterm/addon-fit";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
@@ -54,8 +55,13 @@ import {
 import { ConnectionLog } from "@/ssh/connection-log/ConnectionLog.tsx";
 import { toast } from "sonner";
 import { Button } from "@/components/button";
+import { Save } from "lucide-react";
 import { resolveTermixThemeColors } from "./terminal-theme.ts";
 import type { TerminalHandle, TerminalHostConfig } from "./terminal-types.ts";
+import {
+  getNextTerminalFontSize,
+  getTerminalFontZoomDirection,
+} from "./terminal-font-zoom.ts";
 export type { TerminalHandle, TerminalHostConfig } from "./terminal-types.ts";
 
 type HostKeyVerificationData = Omit<
@@ -78,6 +84,26 @@ interface SSHTerminalProps {
   onOpenFileManager?: (path?: string) => void;
   onOpenFileInEditor?: (filePath: string) => void;
   previewTheme?: string | null;
+  /** When true, suppress automatic focus on connect/visibility change. */
+  disableAutoFocus?: boolean;
+  isQuickConnect?: boolean;
+  onSaveQuickConnect?: () => Promise<void>;
+}
+
+const ALTERNATE_SCREEN_SEQUENCE = /\x1b\[\?(47|1047|1049)([hl])/g;
+
+function updateAlternateScreenMode(output: string, currentMode: boolean) {
+  ALTERNATE_SCREEN_SEQUENCE.lastIndex = 0;
+  let isActive = currentMode;
+  let sawSequence = false;
+  let match: RegExpExecArray | null;
+
+  while ((match = ALTERNATE_SCREEN_SEQUENCE.exec(output)) !== null) {
+    sawSequence = true;
+    isActive = match[2] === "h";
+  }
+
+  return { isActive, sawSequence };
 }
 
 const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
@@ -94,6 +120,9 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       onOpenFileManager,
       onOpenFileInEditor,
       previewTheme,
+      disableAutoFocus = false,
+      isQuickConnect = false,
+      onSaveQuickConnect,
     },
     ref,
   ) {
@@ -117,7 +146,11 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     };
 
     const activeTheme = previewTheme || config.theme;
-    const themeColors = resolveTermixThemeColors(activeTheme, appTheme);
+    const themeColors = resolveTermixThemeColors(
+      activeTheme,
+      appTheme,
+      config.customThemeColors,
+    );
     const backgroundImage = config.backgroundImage || "";
     const backgroundImageOpacity = config.backgroundImageOpacity ?? 0.15;
     const backgroundColor = backgroundImage
@@ -131,6 +164,8 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     const pongReceivedRef = useRef(true);
     const pongTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const [isConnected, setIsConnected] = useState(false);
+    const [isSavingQuickConnect, setIsSavingQuickConnect] = useState(false);
+    const [isQuickConnectSaved, setIsQuickConnectSaved] = useState(false);
     const [isConnecting, setIsConnecting] = useState(false);
     const [isFitted, setIsFitted] = useState(false);
     const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -172,6 +207,15 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     const currentHostIdRef = useRef<number | null>(null);
     const currentHostConfigRef = useRef<TerminalHostConfig | null>(null);
 
+    // Vault SSH signer interactive OIDC flow
+    const [vaultDialog, setVaultDialog] = useState<{
+      stage: "waiting" | "error";
+      error?: string;
+    } | null>(null);
+    const vaultFailedRef = useRef(false);
+    const vaultPopupRef = useRef<Window | null>(null);
+    const vaultTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
     const [hostKeyVerification, setHostKeyVerification] = useState<{
       isOpen: boolean;
       scenario: "new" | "changed";
@@ -187,6 +231,20 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     const [linkClickDialog, setLinkClickDialog] = useState<{
       url: string;
     } | null>(null);
+
+    useEffect(() => {
+      if (!linkClickDialog) return;
+
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        setLinkClickDialog(null);
+      };
+
+      window.addEventListener("keydown", handleKeyDown, true);
+      return () => window.removeEventListener("keydown", handleKeyDown, true);
+    }, [linkClickDialog]);
 
     const [tmuxSessionPicker, setTmuxSessionPicker] = useState<{
       sessions: Array<{
@@ -340,7 +398,8 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     }, [autocompleteSelectedIndex]);
 
     const activityLoggingRef = useRef(false);
-    const sudoPromptShownRef = useRef(false);
+    const passwordPromptShownRef = useRef(false);
+    const alternateScreenModeRef = useRef(false);
 
     const lastSentSizeRef = useRef<{ cols: number; rows: number } | null>(null);
     const pendingSizeRef = useRef<{ cols: number; rows: number } | null>(null);
@@ -348,6 +407,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     const lastFittedSizeRef = useRef<{ cols: number; rows: number } | null>(
       null,
     );
+    const terminalFontSizeRef = useRef(config.fontSize);
     const DEBOUNCE_MS = 140;
 
     const logTerminalActivity = async () => {
@@ -379,20 +439,8 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
     }, [isVisible]);
 
     useEffect(() => {
-      const checkAuth = () => {
-        setIsAuthenticated((prev) => {
-          if (!prev) {
-            return true;
-          }
-          return prev;
-        });
-      };
-
-      checkAuth();
-
-      const authCheckInterval = setInterval(checkAuth, 5000);
-
-      return () => clearInterval(authCheckInterval);
+      // One-shot: historical code polled every 5s but only ever flipped false→true.
+      setIsAuthenticated(true);
     }, []);
 
     function hardRefresh() {
@@ -444,6 +492,23 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       } finally {
         isFittingRef.current = false;
       }
+    }
+
+    function changeTerminalFontSize(direction: -1 | 1) {
+      const currentFontSize =
+        terminal.options.fontSize ??
+        terminalFontSizeRef.current ??
+        DEFAULT_TERMINAL_CONFIG.fontSize;
+      const nextFontSize = getNextTerminalFontSize(currentFontSize, direction);
+
+      if (nextFontSize === currentFontSize) {
+        return;
+      }
+
+      terminalFontSizeRef.current = nextFontSize;
+      terminal.options.fontSize = nextFontSize;
+      performFit();
+      hardRefresh();
     }
 
     function handleTotpSubmit(code: string) {
@@ -587,6 +652,91 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       }, DEBOUNCE_MS);
     }
 
+    function formatTerminalOutput(output: string): string {
+      const alternateScreen = updateAlternateScreenMode(
+        output,
+        alternateScreenModeRef.current,
+      );
+      alternateScreenModeRef.current = alternateScreen.isActive;
+
+      const syntaxHighlightingEnabled =
+        hostConfig.terminalConfig?.syntaxHighlighting !== false;
+      if (
+        !syntaxHighlightingEnabled ||
+        alternateScreen.sawSequence ||
+        alternateScreen.isActive
+      ) {
+        return output;
+      }
+
+      return highlightTerminalOutput(
+        output,
+        hostConfig.terminalConfig?.syntaxHighlightingOptions,
+      );
+    }
+
+    async function resolvePasswordForPrompt(isSudoPrompt: boolean) {
+      let passwordToFill = isSudoPrompt
+        ? hostConfig.terminalConfig?.sudoPassword || hostConfig.password
+        : hostConfig.password || hostConfig.terminalConfig?.sudoPassword;
+
+      if (!passwordToFill && hostConfig.id) {
+        passwordToFill = isSudoPrompt
+          ? (await getHostPassword(hostConfig.id, "sudoPassword")) ||
+            (await getHostPassword(hostConfig.id, "password")) ||
+            undefined
+          : (await getHostPassword(hostConfig.id, "password")) ||
+            (await getHostPassword(hostConfig.id, "sudoPassword")) ||
+            undefined;
+      }
+
+      return passwordToFill;
+    }
+
+    function maybeOfferPasswordFill(strippedData: string) {
+      const passwordPromptPattern =
+        /(?:\[sudo\][^\n\r]*:\s*$|sudo:[^\n\r]*password[^\n\r]*required|password for [^\n\r]*:\s*$|Password:\s*$|password:\s*$)/im;
+      if (!passwordPromptPattern.test(strippedData)) return;
+
+      const hasStoredPassword =
+        hostConfig.terminalConfig?.sudoPassword ||
+        hostConfig.password ||
+        hostConfig.hasSudoPassword ||
+        hostConfig.hasPassword;
+      if (!hasStoredPassword || passwordPromptShownRef.current) return;
+
+      passwordPromptShownRef.current = true;
+      const isSudoPrompt = /(?:\[sudo\]|sudo:)/i.test(strippedData);
+
+      confirmWithToast(
+        t("terminal.passwordPromptFillTitle"),
+        async () => {
+          const passwordToFill = await resolvePasswordForPrompt(isSudoPrompt);
+          if (
+            passwordToFill &&
+            webSocketRef.current &&
+            webSocketRef.current.readyState === WebSocket.OPEN
+          ) {
+            webSocketRef.current.send(
+              JSON.stringify({
+                type: "input",
+                data: passwordToFill + "\n",
+              }),
+            );
+          }
+          setTimeout(() => {
+            passwordPromptShownRef.current = false;
+          }, 3000);
+        },
+        t("common.confirm"),
+        t("common.cancel"),
+        { confirmOnEnter: true },
+      );
+      setTimeout(() => {
+        passwordPromptShownRef.current = false;
+      }, 15000);
+    }
+
     useImperativeHandle(
       ref,
       () => ({
@@ -643,6 +793,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
             connectToHost(cols, rows);
           }
         },
+        isConnected: () => isConnected,
         fit: () => {
           if (!fitAddonRef.current || !terminal || isFittingRef.current) return;
           isFittingRef.current = true;
@@ -696,7 +847,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
           }
         },
       }),
-      [terminal],
+      [isConnected, terminal],
     );
 
     function getUseRightClickCopyPaste() {
@@ -888,6 +1039,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       rows: number,
     ) {
       ws.addEventListener("open", () => {
+        alternateScreenModeRef.current = false;
         connectionTimeoutRef.current = setTimeout(() => {
           if (
             !isConnected &&
@@ -1010,90 +1162,17 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
                 currentAutocompleteCommand.current = "";
               }
 
-              const syntaxHighlightingEnabled =
-                hostConfig.terminalConfig?.syntaxHighlighting !== false;
-
-              const outputData = syntaxHighlightingEnabled
-                ? highlightTerminalOutput(
-                    msg.data,
-                    hostConfig.terminalConfig?.syntaxHighlightingOptions,
-                  )
-                : msg.data;
-
-              terminal.write(outputData);
-              const sudoPasswordPattern =
-                /(?:\[sudo\][^\n\r]*:\s*$|sudo:[^\n\r]*password[^\n\r]*required|password for [^\n\r]*:\s*$|Password:\s*$)/im;
+              terminal.write(formatTerminalOutput(msg.data));
               // Strip ANSI escape codes before testing — newer sudo versions (Ubuntu 26.04+)
               // emit colored prompts with embedded escape sequences that break the regex.
               const strippedData = msg.data.replace(
                 /\x1b(?:[@-Z\\-_]|\[[0-9;?>=!]*[@-~])/g,
                 "",
               );
-              const hasSudoPw =
-                hostConfig.terminalConfig?.sudoPassword ||
-                hostConfig.password ||
-                hostConfig.hasSudoPassword ||
-                hostConfig.hasPassword;
-              if (
-                config.sudoPasswordAutoFill &&
-                sudoPasswordPattern.test(strippedData) &&
-                hasSudoPw &&
-                !sudoPromptShownRef.current
-              ) {
-                sudoPromptShownRef.current = true;
-                confirmWithToast(
-                  t("terminal.sudoPasswordPopupTitle"),
-                  async () => {
-                    // Fetch password on-demand from server
-                    let passwordToFill =
-                      hostConfig.terminalConfig?.sudoPassword ||
-                      hostConfig.password;
-                    if (!passwordToFill && hostConfig.id) {
-                      passwordToFill =
-                        (await getHostPassword(
-                          hostConfig.id,
-                          "sudoPassword",
-                        )) ||
-                        (await getHostPassword(hostConfig.id, "password")) ||
-                        undefined;
-                    }
-                    if (
-                      passwordToFill &&
-                      webSocketRef.current &&
-                      webSocketRef.current.readyState === WebSocket.OPEN
-                    ) {
-                      webSocketRef.current.send(
-                        JSON.stringify({
-                          type: "input",
-                          data: passwordToFill + "\n",
-                        }),
-                      );
-                    }
-                    setTimeout(() => {
-                      sudoPromptShownRef.current = false;
-                    }, 3000);
-                  },
-                  t("common.confirm"),
-                  t("common.cancel"),
-                  { confirmOnEnter: true },
-                );
-                setTimeout(() => {
-                  sudoPromptShownRef.current = false;
-                }, 15000);
-              }
+              maybeOfferPasswordFill(strippedData);
             } else {
-              const syntaxHighlightingEnabled =
-                hostConfig.terminalConfig?.syntaxHighlighting !== false;
-
               const stringData = String(msg.data);
-              const outputData = syntaxHighlightingEnabled
-                ? highlightTerminalOutput(
-                    stringData,
-                    hostConfig.terminalConfig?.syntaxHighlightingOptions,
-                  )
-                : stringData;
-
-              terminal.write(outputData);
+              terminal.write(formatTerminalOutput(stringData));
             }
           } else if (msg.type === "error") {
             const errorMessage = msg.message || t("terminal.unknownError");
@@ -1141,6 +1220,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
             setIsConnecting(false);
           } else if (msg.type === "connected") {
             opksshFailedRef.current = false;
+            vaultFailedRef.current = false;
             wasConnectedRef.current = true;
             setIsConnected(true);
             setIsConnecting(false);
@@ -1324,6 +1404,86 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
                 );
               }
             }
+          } else if (msg.type === "vault_auth_required") {
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (vaultFailedRef.current) {
+              setVaultDialog({
+                stage: "error",
+                error: t("terminal.vaultAuthFailed"),
+              });
+              updateConnectionError(t("terminal.vaultAuthFailed"));
+              addLog({
+                type: "error",
+                stage: "auth",
+                message: t("terminal.vaultAuthFailed"),
+              });
+            } else {
+              vaultFailedRef.current = true;
+              webSocketRef.current?.send(
+                JSON.stringify({
+                  type: "vault_start_auth",
+                  data: { hostId: msg.hostId },
+                }),
+              );
+            }
+          } else if (msg.type === "vault_auth_url") {
+            if (connectionErrorRef.current) return;
+            try {
+              vaultPopupRef.current = window.open(
+                msg.url,
+                "termix-vault-oidc",
+                "width=540,height=720",
+              );
+            } catch {
+              vaultPopupRef.current = null;
+            }
+            setVaultDialog({ stage: "waiting" });
+            if (vaultTimeoutRef.current) clearTimeout(vaultTimeoutRef.current);
+            vaultTimeoutRef.current = setTimeout(() => {
+              setVaultDialog(null);
+              webSocketRef.current?.close();
+            }, 300000);
+          } else if (msg.type === "vault_completed") {
+            if (vaultTimeoutRef.current) {
+              clearTimeout(vaultTimeoutRef.current);
+              vaultTimeoutRef.current = null;
+            }
+            try {
+              vaultPopupRef.current?.close();
+            } catch {
+              // popup may already be closed
+            }
+            setVaultDialog(null);
+            if (webSocketRef.current && terminal) {
+              webSocketRef.current.send(
+                JSON.stringify({
+                  type: "vault_auth_completed",
+                  data: {
+                    hostId: currentHostIdRef.current,
+                    cols: terminal.cols || 80,
+                    rows: terminal.rows || 24,
+                    hostConfig: currentHostConfigRef.current,
+                  },
+                }),
+              );
+            }
+          } else if (msg.type === "vault_error") {
+            if (connectionErrorRef.current) return;
+            vaultFailedRef.current = true;
+            if (vaultTimeoutRef.current) {
+              clearTimeout(vaultTimeoutRef.current);
+              vaultTimeoutRef.current = null;
+            }
+            try {
+              vaultPopupRef.current?.close();
+            } catch {
+              // popup may already be closed
+            }
+            setVaultDialog({ stage: "error", error: msg.error });
+            setIsConnecting(false);
           } else if (msg.type === "opkssh_status") {
             if (connectionErrorRef.current) return;
             if (msg.stage === "chooser") {
@@ -1473,6 +1633,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
           } else if (msg.type === "sessionAttached") {
             isAttachingSessionRef.current = false;
             opksshFailedRef.current = false;
+            vaultFailedRef.current = false;
             wasConnectedRef.current = true;
             setIsConnected(true);
             setIsConnecting(false);
@@ -1815,7 +1976,11 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       };
 
       const activeTheme = previewTheme || config.theme;
-      const themeColors = resolveTermixThemeColors(activeTheme, appTheme);
+      const themeColors = resolveTermixThemeColors(
+        activeTheme,
+        appTheme,
+        config.customThemeColors,
+      );
 
       const fontConfig = TERMINAL_FONTS.find(
         (f) => f.value === config.fontFamily,
@@ -1827,6 +1992,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       terminal.options.cursorStyle = config.cursorStyle;
       terminal.options.scrollback = config.scrollback;
       terminal.options.fontSize = config.fontSize;
+      terminalFontSizeRef.current = config.fontSize;
       terminal.options.fontFamily = fontFamily;
       terminal.options.rightClickSelectsWord = config.rightClickSelectsWord;
       terminal.options.fastScrollSensitivity = config.fastScrollSensitivity;
@@ -1889,7 +2055,11 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       const fontFamily = fontConfig?.fallback || TERMINAL_FONTS[0].fallback;
 
       const activeTheme = previewTheme || config.theme;
-      const themeColors = resolveTermixThemeColors(activeTheme, appTheme);
+      const themeColors = resolveTermixThemeColors(
+        activeTheme,
+        appTheme,
+        config.customThemeColors,
+      );
 
       // Set initial options before opening the terminal
       terminal.options = {
@@ -1968,6 +2138,18 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       terminal.unicode.activeVersion = "11";
 
       terminal.open(xtermRef.current);
+
+      const xtermTextarea = xtermRef.current.querySelector("textarea");
+      if (xtermTextarea) {
+        xtermTextarea.setAttribute("autocomplete", "off");
+        xtermTextarea.setAttribute("autocorrect", "off");
+        xtermTextarea.setAttribute("autocapitalize", "none");
+        xtermTextarea.setAttribute("spellcheck", "false");
+        xtermTextarea.setAttribute("data-gramm", "false");
+        xtermTextarea.setAttribute("data-gramm_editor", "false");
+        xtermTextarea.setAttribute("data-enable-grammarly", "false");
+      }
+
       terminal.onTitleChange((title) => {
         if (title) onTitleChange?.(title);
       });
@@ -1977,6 +2159,11 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       });
 
       terminal.attachCustomWheelEventHandler((ev) => {
+        if (ev.ctrlKey || ev.metaKey) {
+          changeTerminalFontSize(ev.deltaY < 0 ? 1 : -1);
+          return false;
+        }
+
         const cfg = {
           ...DEFAULT_TERMINAL_CONFIG,
           ...hostConfig.terminalConfig,
@@ -2096,9 +2283,11 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       element?.addEventListener("keydown", handleTabCapture, true);
 
       const resizeObserver = new ResizeObserver(() => {
+        // Background keep-alive tabs still observe layout; skip fit work.
+        if (!isVisibleRef.current) return;
         if (resizeTimeout.current) clearTimeout(resizeTimeout.current);
         resizeTimeout.current = setTimeout(() => {
-          if (isVisible) {
+          if (isVisibleRef.current) {
             performFit();
           }
         }, 50);
@@ -2202,6 +2391,14 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
             globalShortcutHandler.current?.(e);
             return false;
           }
+        }
+
+        const fontZoomDirection = getTerminalFontZoomDirection(e);
+        if (fontZoomDirection !== 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          changeTerminalFontSize(fontZoomDirection);
+          return false;
         }
 
         if (
@@ -2554,7 +2751,7 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
       const fitTimeoutId = setTimeout(() => {
         if (!isFittingRef.current && terminal.cols > 0 && terminal.rows > 0) {
           performFit();
-          if (!splitScreen && !isConnecting) {
+          if (!splitScreen && !isConnecting && !disableAutoFocus) {
             requestAnimationFrame(() => terminal.focus());
           }
         }
@@ -2619,6 +2816,32 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
             tmux:detach
           </button>
         )}
+
+        {isQuickConnect &&
+          isConnected &&
+          !isQuickConnectSaved &&
+          onSaveQuickConnect && (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={isSavingQuickConnect}
+              onClick={async () => {
+                setIsSavingQuickConnect(true);
+                try {
+                  await onSaveQuickConnect();
+                  setIsQuickConnectSaved(true);
+                } catch {
+                  // The shell reports the failure with a toast.
+                } finally {
+                  setIsSavingQuickConnect(false);
+                }
+              }}
+              className="absolute top-2 left-2 z-[110] h-7 gap-1.5 bg-black/60 text-white/80 hover:bg-black/80 hover:text-white"
+            >
+              <Save className="size-3.5" />
+              {t("hosts.addHost")}
+            </Button>
+          )}
 
         <SimpleLoader
           visible={isConnecting && !isConnectionLogExpanded}
@@ -2769,6 +2992,70 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
           />
         )}
 
+        {vaultDialog && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60">
+            <div className="w-[420px] max-w-[90%] border border-border bg-background p-5 shadow-lg">
+              <h3 className="text-sm font-bold mb-2 text-foreground">
+                {vaultDialog.stage === "error"
+                  ? t("terminal.vaultAuthFailed")
+                  : t("terminal.vaultAuthTitle")}
+              </h3>
+              {vaultDialog.stage === "error" ? (
+                <p className="text-xs text-destructive mb-4 break-words">
+                  {vaultDialog.error || t("terminal.vaultAuthFailed")}
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground mb-4">
+                  {t("terminal.vaultAuthDescription")}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                {vaultDialog.stage === "waiting" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      try {
+                        vaultPopupRef.current?.focus();
+                      } catch {
+                        // popup may be gone
+                      }
+                    }}
+                  >
+                    {t("terminal.vaultReopen")}
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    if (vaultTimeoutRef.current) {
+                      clearTimeout(vaultTimeoutRef.current);
+                      vaultTimeoutRef.current = null;
+                    }
+                    try {
+                      vaultPopupRef.current?.close();
+                    } catch {
+                      // popup may already be closed
+                    }
+                    webSocketRef.current?.send(
+                      JSON.stringify({
+                        type: "vault_cancel",
+                        data: { hostId: currentHostIdRef.current },
+                      }),
+                    );
+                    setVaultDialog(null);
+                  }}
+                >
+                  {vaultDialog.stage === "error"
+                    ? t("common.close")
+                    : t("hosts.cancelBtn")}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {hostKeyVerification?.isOpen && (
           <HostKeyVerificationDialog
             isOpen={true}
@@ -2843,56 +3130,60 @@ const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
           onSelect={handleAutocompleteSelect}
         />
 
-        {linkClickDialog && (
-          <div
-            className="absolute inset-0 flex items-center justify-center z-[150]"
-            style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
-          >
+        {linkClickDialog &&
+          createPortal(
             <div
-              className="flex flex-col gap-3 p-4 rounded shadow-lg max-w-sm w-full mx-4"
-              style={{ backgroundColor }}
+              className="fixed inset-0 flex items-center justify-center z-[10000]"
+              style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+              onClick={() => setLinkClickDialog(null)}
             >
-              <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
-                {t("terminal.linkDialogTitle")}
-              </p>
-              <p className="text-sm break-all text-foreground select-all">
-                {linkClickDialog.url}
-              </p>
-              <div className="flex gap-2 justify-end">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    writeTextToClipboard(linkClickDialog.url);
-                    setLinkClickDialog(null);
-                  }}
-                >
-                  {t("terminal.linkDialogCopy")}
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={() => {
-                    window.open(
-                      linkClickDialog.url,
-                      "_blank",
-                      "noopener,noreferrer",
-                    );
-                    setLinkClickDialog(null);
-                  }}
-                >
-                  {t("terminal.linkDialogOpen")}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setLinkClickDialog(null)}
-                >
-                  {t("common.cancel")}
-                </Button>
+              <div
+                className="flex flex-col gap-3 p-4 rounded shadow-lg max-w-sm w-full mx-4"
+                style={{ backgroundColor }}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+                  {t("terminal.linkDialogTitle")}
+                </p>
+                <p className="text-sm break-all text-foreground select-all">
+                  {linkClickDialog.url}
+                </p>
+                <div className="flex gap-2 justify-end">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      writeTextToClipboard(linkClickDialog.url);
+                      setLinkClickDialog(null);
+                    }}
+                  >
+                    {t("terminal.linkDialogCopy")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      window.open(
+                        linkClickDialog.url,
+                        "_blank",
+                        "noopener,noreferrer",
+                      );
+                      setLinkClickDialog(null);
+                    }}
+                  >
+                    {t("terminal.linkDialogOpen")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setLinkClickDialog(null)}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                </div>
               </div>
-            </div>
-          </div>
-        )}
+            </div>,
+            document.body,
+          )}
       </div>
     );
   },

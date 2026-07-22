@@ -1,10 +1,11 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Response, Router } from "express";
-import { and, eq, inArray } from "drizzle-orm";
 import { sshLogger } from "../../utils/logger.js";
-import { SimpleDBOps } from "../../utils/simple-db-ops.js";
-import { db, DatabaseSaveTrigger } from "../db/index.js";
-import { hosts, sshCredentials } from "../db/schema.js";
+import {
+  createCurrentCredentialRepository,
+  createCurrentHostRepository,
+  createCurrentHostResolutionRepository,
+} from "../repositories/factory.js";
 import {
   isNonEmptyString,
   isValidPort,
@@ -19,6 +20,35 @@ type SSHConfigHost = {
   identityFile?: string;
   proxyJump?: string;
 };
+
+type ShareCredential = {
+  alias?: unknown;
+  name?: unknown;
+  description?: unknown;
+  folder?: unknown;
+  tags?: unknown;
+  authType?: unknown;
+  username?: unknown;
+  keyType?: unknown;
+};
+
+function textValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function tagString(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value
+      .map((tag) => textValue(tag))
+      .filter((tag): tag is string => !!tag)
+      .join(",");
+  }
+  return textValue(value) || "";
+}
+
+function normalizeCredentialAuthType(value: unknown): "password" | "key" {
+  return value === "key" ? "key" : "password";
+}
 
 export function parseSSHConfig(content: string): SSHConfigHost[] {
   const results: SSHConfigHost[] = [];
@@ -161,15 +191,11 @@ export function registerHostBulkRoutes(
       }
 
       try {
-        const ownedHosts = await db
-          .select({
-            id: hosts.id,
-            statsConfig: hosts.statsConfig,
-            credentialId: hosts.credentialId,
-            proxmoxConfig: hosts.proxmoxConfig,
-          })
-          .from(hosts)
-          .where(and(inArray(hosts.id, hostIds), eq(hosts.userId, userId)));
+        const hostRepository = createCurrentHostRepository();
+        const ownedHosts = await hostRepository.listBulkUpdateState(
+          userId,
+          hostIds,
+        );
 
         const ownedIds = ownedHosts.map((h) => h.id);
         const unauthorizedIds = hostIds.filter(
@@ -207,10 +233,11 @@ export function registerHostBulkRoutes(
           simpleUpdates.enableProxmox = false;
 
         if (Object.keys(simpleUpdates).length > 0) {
-          await db
-            .update(hosts)
-            .set(simpleUpdates)
-            .where(and(inArray(hosts.id, ownedIds), eq(hosts.userId, userId)));
+          await hostRepository.updateManyForUser(
+            userId,
+            ownedIds,
+            simpleUpdates,
+          );
         }
 
         if (updates.statsConfig && typeof updates.statsConfig === "object") {
@@ -220,10 +247,9 @@ export function registerHostBulkRoutes(
                 ? JSON.parse(host.statsConfig as string)
                 : {};
               const merged = { ...existing, ...updates.statsConfig };
-              await db
-                .update(hosts)
-                .set({ statsConfig: JSON.stringify(merged) })
-                .where(and(eq(hosts.id, host.id), eq(hosts.userId, userId)));
+              await hostRepository.updateForUser(userId, host.id, {
+                statsConfig: JSON.stringify(merged),
+              });
             } catch {
               errors.push(`Failed to update statsConfig for host ${host.id}`);
             }
@@ -247,21 +273,19 @@ export function registerHostBulkRoutes(
                 dockerPatterns: existing.dockerPatterns ?? "docker",
                 preferredPrefixes:
                   existing.preferredPrefixes ?? "10., 192.168.",
+                autoSyncEnabled: existing.autoSyncEnabled ?? false,
+                syncIntervalMinutes: existing.syncIntervalMinutes ?? 15,
+                markMissingGuests: existing.markMissingGuests ?? true,
               };
-              await db
-                .update(hosts)
-                .set({
-                  enableProxmox: true,
-                  proxmoxConfig: JSON.stringify(merged),
-                })
-                .where(and(eq(hosts.id, host.id), eq(hosts.userId, userId)));
+              await hostRepository.updateForUser(userId, host.id, {
+                enableProxmox: true,
+                proxmoxConfig: JSON.stringify(merged),
+              });
             } catch {
               errors.push(`Failed to enable Proxmox for host ${host.id}`);
             }
           }
         }
-
-        DatabaseSaveTrigger.triggerSave("bulk_update");
 
         return res.json({
           updated: ownedIds.length,
@@ -280,7 +304,11 @@ export function registerHostBulkRoutes(
     authenticateJWT,
     async (req: Request, res: Response) => {
       const userId = (req as AuthenticatedRequest).userId;
-      const { hosts: hostsToImport, overwrite } = req.body;
+      const {
+        hosts: hostsToImport,
+        overwrite,
+        credentials: credentialsToImport,
+      } = req.body;
 
       if (!Array.isArray(hostsToImport) || hostsToImport.length === 0) {
         return res
@@ -302,14 +330,79 @@ export function registerHostBulkRoutes(
         errors: [] as string[],
       };
 
+      const credentialAliasMap = new Map<string, number>();
+      const addCredentialAlias = (alias: unknown, id: number) => {
+        const key = textValue(alias);
+        if (key) credentialAliasMap.set(key.toLowerCase(), id);
+      };
+
+      try {
+        const credentialRepository = createCurrentCredentialRepository();
+        const existingCredentials =
+          await credentialRepository.listDecryptedByUserId(userId);
+
+        for (const credential of existingCredentials) {
+          addCredentialAlias(credential.name, credential.id as number);
+        }
+
+        if (Array.isArray(credentialsToImport)) {
+          for (const rawCredential of credentialsToImport as ShareCredential[]) {
+            const alias = textValue(rawCredential.alias);
+            const name = textValue(rawCredential.name) || alias;
+            if (!alias || !name) continue;
+
+            const existingId = credentialAliasMap.get(name.toLowerCase());
+            if (existingId) {
+              addCredentialAlias(alias, existingId);
+              continue;
+            }
+
+            const now = new Date().toISOString();
+            const created = await credentialRepository.createEncryptedForUser(
+              userId,
+              {
+                userId,
+                name,
+                description:
+                  textValue(rawCredential.description) ||
+                  "Imported placeholder. Add the secret before connecting.",
+                folder: textValue(rawCredential.folder),
+                tags: tagString(rawCredential.tags),
+                authType: normalizeCredentialAuthType(rawCredential.authType),
+                username: textValue(rawCredential.username),
+                password: null,
+                key: null,
+                privateKey: null,
+                publicKey: null,
+                keyPassword: null,
+                keyType: textValue(rawCredential.keyType),
+                detectedKeyType: null,
+                usageCount: 0,
+                lastUsed: null,
+                createdAt: now,
+                updatedAt: now,
+              },
+            );
+
+            const createdCredential = created as Record<string, unknown>;
+            addCredentialAlias(alias, createdCredential.id as number);
+            addCredentialAlias(name, createdCredential.id as number);
+          }
+        }
+      } catch (error) {
+        results.errors.push(
+          `Credential placeholders: ${error instanceof Error ? error.message : "failed to prepare credential aliases"}`,
+        );
+      }
+
       let existingHostMap: Map<string, { id: number }> | undefined;
+      const hostRepository = createCurrentHostRepository();
       if (overwrite) {
         try {
-          const allHosts = await SimpleDBOps.select<Record<string, unknown>>(
-            db.select().from(hosts).where(eq(hosts.userId, userId)),
-            "ssh_data",
-            userId,
-          );
+          const allHosts =
+            await createCurrentHostResolutionRepository().findHostsByUserId(
+              userId,
+            );
           existingHostMap = new Map();
           for (const h of allHosts) {
             const key = `${h.ip}:${h.port}:${h.username}`;
@@ -325,6 +418,17 @@ export function registerHostBulkRoutes(
 
         try {
           const effectiveConnectionType = hostData.connectionType || "ssh";
+
+          if (
+            effectiveConnectionType === "ssh" &&
+            hostData.authType === "credential" &&
+            !hostData.credentialId &&
+            hostData.credentialAlias
+          ) {
+            hostData.credentialId = credentialAliasMap.get(
+              hostData.credentialAlias.toLowerCase(),
+            );
+          }
 
           if (!isNonEmptyString(hostData.ip) || !isValidPort(hostData.port)) {
             results.failed++;
@@ -355,11 +459,12 @@ export function registerHostBulkRoutes(
               "none",
               "opkssh",
               "tailscale",
+              "vault",
             ].includes(hostData.authType)
           ) {
             results.failed++;
             results.errors.push(
-              `Host ${i + 1}: Invalid authType. Must be 'password', 'key', 'credential', 'none', 'opkssh', or 'tailscale'`,
+              `Host ${i + 1}: Invalid authType. Must be 'password', 'key', 'credential', 'none', 'opkssh', 'tailscale', or 'vault'`,
             );
             continue;
           }
@@ -405,23 +510,14 @@ export function registerHostBulkRoutes(
             hostData.authType === "credential" &&
             hostData.credentialId
           ) {
-            const cred = await db
-              .select({ id: sshCredentials.id })
-              .from(sshCredentials)
-              .where(
-                and(
-                  eq(sshCredentials.id, hostData.credentialId),
-                  eq(sshCredentials.userId, userId),
-                ),
-              )
-              .limit(1);
+            const credentialRepository = createCurrentCredentialRepository();
+            const cred = await credentialRepository.findByIdForUser(
+              userId,
+              hostData.credentialId,
+            );
 
-            if (cred.length === 0) {
-              const fallback = await db
-                .select({ id: sshCredentials.id })
-                .from(sshCredentials)
-                .where(eq(sshCredentials.userId, userId))
-                .limit(1);
+            if (!cred) {
+              const fallback = await credentialRepository.listByUserId(userId);
 
               if (fallback.length > 0) {
                 hostData.credentialId = fallback[0].id;
@@ -556,17 +652,15 @@ export function registerHostBulkRoutes(
           const existing = existingHostMap?.get(lookupKey);
 
           if (existing) {
-            await SimpleDBOps.update(
-              hosts,
-              "ssh_data",
-              eq(hosts.id, existing.id),
-              sshDataObj,
+            await hostRepository.updateEncryptedForUser(
               userId,
+              existing.id,
+              sshDataObj,
             );
             results.updated++;
           } else {
             sshDataObj.createdAt = new Date().toISOString();
-            await SimpleDBOps.insert(hosts, "ssh_data", sshDataObj, userId);
+            await hostRepository.createEncryptedForUser(userId, sshDataObj);
             results.success++;
           }
         } catch (error) {
@@ -632,7 +726,7 @@ export function registerHostBulkRoutes(
       let parsed: SSHConfigHost[];
       try {
         parsed = parseSSHConfig(content);
-      } catch (err) {
+      } catch {
         return res
           .status(400)
           .json({ error: "Failed to parse SSH config file" });
@@ -674,13 +768,13 @@ export function registerHostBulkRoutes(
       };
 
       let existingHostMap: Map<string, { id: number }> | undefined;
+      const hostRepository = createCurrentHostRepository();
       if (overwrite) {
         try {
-          const allHosts = await SimpleDBOps.select<Record<string, unknown>>(
-            db.select().from(hosts).where(eq(hosts.userId, userId)),
-            "ssh_data",
-            userId,
-          );
+          const allHosts =
+            await createCurrentHostResolutionRepository().findHostsByUserId(
+              userId,
+            );
           existingHostMap = new Map();
           for (const h of allHosts) {
             const key = `${h.ip}:${h.port}:${h.username}`;
@@ -764,17 +858,15 @@ export function registerHostBulkRoutes(
           const existing = existingHostMap?.get(lookupKey);
 
           if (existing) {
-            await SimpleDBOps.update(
-              hosts,
-              "ssh_data",
-              eq(hosts.id, existing.id),
-              sshDataObj,
+            await hostRepository.updateEncryptedForUser(
               userId,
+              existing.id,
+              sshDataObj,
             );
             results.updated++;
           } else {
             sshDataObj.createdAt = new Date().toISOString();
-            await SimpleDBOps.insert(hosts, "ssh_data", sshDataObj, userId);
+            await hostRepository.createEncryptedForUser(userId, sshDataObj);
             results.success++;
           }
         } catch (error) {

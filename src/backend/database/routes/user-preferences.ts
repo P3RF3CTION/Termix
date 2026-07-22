@@ -1,17 +1,19 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import express from "express";
-import { db } from "../db/index.js";
-import { userPreferences } from "../db/schema.js";
-import { eq } from "drizzle-orm";
 import type { Request, Response } from "express";
 import { databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { createCurrentUserPreferenceRepository } from "../repositories/factory.js";
+import type {
+  UserPreferenceRecord,
+  UserPreferenceUpdate,
+} from "../repositories/user-preference-repository.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
 
-const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
+const pickPreferences = (row?: UserPreferenceRecord | null) => ({
   reopenTabsOnLogin: row?.reopenTabsOnLogin ?? false,
   theme: row?.theme ?? null,
   fontSize: row?.fontSize ?? null,
@@ -23,6 +25,7 @@ const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
   showHostTags: row?.showHostTags ?? null,
   hostTrayOnClick: row?.hostTrayOnClick ?? null,
   pinAppRail: row?.pinAppRail ?? null,
+  expandAppRailOnHover: row?.expandAppRailOnHover ?? null,
   foldersCollapsed: row?.foldersCollapsed ?? null,
   confirmSnippetExecution: row?.confirmSnippetExecution ?? null,
   disableUpdateCheck: row?.disableUpdateCheck ?? null,
@@ -79,6 +82,9 @@ const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
  *                 pinAppRail:
  *                   type: boolean
  *                   nullable: true
+ *                 expandAppRailOnHover:
+ *                   type: boolean
+ *                   nullable: true
  *                 foldersCollapsed:
  *                   type: boolean
  *                   nullable: true
@@ -101,16 +107,13 @@ const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
  *                   type: string
  *                   nullable: true
  */
-router.get("/", authenticateJWT, (req: Request, res: Response) => {
+router.get("/", authenticateJWT, async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).userId;
   try {
-    const rows = db
-      .select()
-      .from(userPreferences)
-      .where(eq(userPreferences.userId, userId))
-      .all();
+    const preferences =
+      await createCurrentUserPreferenceRepository().findByUserId(userId);
 
-    return res.json(pickPreferences(rows[0]));
+    return res.json(pickPreferences(preferences));
   } catch (e) {
     databaseLogger.error("Failed to get user preferences", e, {
       operation: "get_user_preferences",
@@ -156,6 +159,8 @@ router.get("/", authenticateJWT, (req: Request, res: Response) => {
  *                 type: boolean
  *               pinAppRail:
  *                 type: boolean
+ *               expandAppRailOnHover:
+ *                 type: boolean
  *               foldersCollapsed:
  *                 type: boolean
  *               confirmSnippetExecution:
@@ -174,7 +179,7 @@ router.get("/", authenticateJWT, (req: Request, res: Response) => {
  *       200:
  *         description: Preferences updated successfully.
  */
-router.put("/", authenticateJWT, (req: Request, res: Response) => {
+router.put("/", authenticateJWT, async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).userId;
   const {
     reopenTabsOnLogin,
@@ -188,6 +193,7 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     showHostTags,
     hostTrayOnClick,
     pinAppRail,
+    expandAppRailOnHover,
     foldersCollapsed,
     confirmSnippetExecution,
     disableUpdateCheck,
@@ -207,6 +213,7 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     showHostTags?: boolean | null;
     hostTrayOnClick?: boolean | null;
     pinAppRail?: boolean | null;
+    expandAppRailOnHover?: boolean | null;
     foldersCollapsed?: boolean | null;
     confirmSnippetExecution?: boolean | null;
     disableUpdateCheck?: boolean | null;
@@ -216,7 +223,7 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     statusColorScheme?: string | null;
   };
 
-  const updates: Partial<typeof userPreferences.$inferInsert> = {
+  const updates: UserPreferenceUpdate = {
     updatedAt: new Date().toISOString(),
   };
 
@@ -249,6 +256,7 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     showHostTags,
     hostTrayOnClick,
     pinAppRail,
+    expandAppRailOnHover,
     foldersCollapsed,
     confirmSnippetExecution,
     disableUpdateCheck,
@@ -274,6 +282,8 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
   if (showHostTags !== undefined) updates.showHostTags = showHostTags;
   if (hostTrayOnClick !== undefined) updates.hostTrayOnClick = hostTrayOnClick;
   if (pinAppRail !== undefined) updates.pinAppRail = pinAppRail;
+  if (expandAppRailOnHover !== undefined)
+    updates.expandAppRailOnHover = expandAppRailOnHover;
   if (foldersCollapsed !== undefined)
     updates.foldersCollapsed = foldersCollapsed;
   if (confirmSnippetExecution !== undefined)
@@ -290,25 +300,7 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
   }
 
   try {
-    const existing = db
-      .select()
-      .from(userPreferences)
-      .where(eq(userPreferences.userId, userId))
-      .all();
-
-    if (existing.length === 0) {
-      db.insert(userPreferences)
-        .values({
-          userId,
-          ...updates,
-        })
-        .run();
-    } else {
-      db.update(userPreferences)
-        .set(updates)
-        .where(eq(userPreferences.userId, userId))
-        .run();
-    }
+    await createCurrentUserPreferenceRepository().upsert(userId, updates);
 
     return res.json({ success: true, ...updates });
   } catch (e) {

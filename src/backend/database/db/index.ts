@@ -8,6 +8,7 @@ import { DatabaseFileEncryption } from "../../utils/database-file-encryption.js"
 import { SystemCrypto } from "../../utils/system-crypto.js";
 import { DatabaseMigration } from "../../utils/database-migration.js";
 import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
+import { getDefaultGuacdUrl } from "../../utils/guacd-config.js";
 
 const dataDir = process.env.DATA_DIR || "./db/data";
 const dbDir = path.resolve(dataDir);
@@ -23,6 +24,28 @@ const actualDbPath = ":memory:";
 let memoryDatabase: Database.Database;
 let isNewDatabase = false;
 let sqlite: Database.Database;
+
+function getRawSettingValue(key: string): string | null {
+  const row = sqlite
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(key) as { value?: string } | undefined;
+
+  return row?.value ?? null;
+}
+
+function setRawSettingValue(key: string, value: string): void {
+  sqlite
+    .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .run(key, value);
+}
+
+function ensureRawSettingDefault(key: string, value: string): void {
+  if (getRawSettingValue(key) === null) {
+    sqlite
+      .prepare("INSERT INTO settings (key, value) VALUES (?, ?)")
+      .run(key, value);
+  }
+}
 
 async function initializeDatabaseAsync(): Promise<void> {
   const systemCrypto = SystemCrypto.getInstance();
@@ -164,7 +187,9 @@ async function initializeCompleteDatabase(): Promise<void> {
         scopes TEXT DEFAULT 'openid email profile',
         totp_secret TEXT,
         totp_enabled INTEGER NOT NULL DEFAULT 0,
-        totp_backup_codes TEXT
+        totp_backup_codes TEXT,
+        registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        donation_modal_dismissed INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -193,6 +218,22 @@ async function initializeCompleteDatabase(): Promise<void> {
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         expires_at TEXT NOT NULL,
         last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS webauthn_credentials (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        credential_id TEXT NOT NULL UNIQUE,
+        public_key TEXT NOT NULL,
+        counter INTEGER NOT NULL DEFAULT 0,
+        device_type TEXT,
+        backed_up INTEGER NOT NULL DEFAULT 0,
+        transports TEXT,
+        user_verification TEXT NOT NULL DEFAULT 'preferred',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_used_at TEXT,
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
@@ -443,6 +484,8 @@ async function initializeCompleteDatabase(): Promise<void> {
         commands TEXT,
         dangerous_actions TEXT,
         recording_path TEXT,
+        protocol TEXT NOT NULL DEFAULT 'ssh',
+        format TEXT NOT NULL DEFAULT 'text',
         terminated_by_owner INTEGER DEFAULT 0,
         termination_reason TEXT,
         FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
@@ -547,12 +590,30 @@ async function initializeCompleteDatabase(): Promise<void> {
 `);
 
   try {
-    sqlite.prepare("DELETE FROM user_open_tabs").run();
-    databaseLogger.info("Open tabs cleared on startup", {
-      operation: "db_init_open_tabs_cleanup",
-    });
+    const timeoutRow = sqlite
+      .prepare(
+        "SELECT value FROM settings WHERE key = 'terminal_session_timeout_minutes'",
+      )
+      .get() as { value: string } | undefined;
+    const timeoutMinutes = timeoutRow
+      ? parseInt(timeoutRow.value, 10)
+      : 30;
+    const ttlMs =
+      !isNaN(timeoutMinutes) && timeoutMinutes > 0
+        ? timeoutMinutes * 60_000
+        : 30 * 60_000;
+    const cutoff = new Date(Date.now() - ttlMs).toISOString();
+    const result = sqlite
+      .prepare("DELETE FROM user_open_tabs WHERE updated_at <= ?")
+      .run(cutoff);
+    if (result.changes > 0) {
+      databaseLogger.info("Expired open tabs cleared on startup", {
+        operation: "db_init_open_tabs_cleanup",
+        count: result.changes,
+      });
+    }
   } catch (e) {
-    databaseLogger.warn("Could not clear open tabs on startup", {
+    databaseLogger.warn("Could not clear expired open tabs on startup", {
       operation: "db_init_open_tabs_cleanup_failed",
       error: e,
     });
@@ -578,16 +639,7 @@ async function initializeCompleteDatabase(): Promise<void> {
   migrateSchema();
 
   try {
-    const row = sqlite
-      .prepare("SELECT value FROM settings WHERE key = 'allow_registration'")
-      .get();
-    if (!row) {
-      sqlite
-        .prepare(
-          "INSERT INTO settings (key, value) VALUES ('allow_registration', 'true')",
-        )
-        .run();
-    }
+    ensureRawSettingDefault("allow_registration", "true");
   } catch (e) {
     databaseLogger.warn("Could not initialize default settings", {
       operation: "db_init",
@@ -596,16 +648,7 @@ async function initializeCompleteDatabase(): Promise<void> {
   }
 
   try {
-    const row = sqlite
-      .prepare("SELECT value FROM settings WHERE key = 'allow_password_login'")
-      .get();
-    if (!row) {
-      sqlite
-        .prepare(
-          "INSERT INTO settings (key, value) VALUES ('allow_password_login', 'true')",
-        )
-        .run();
-    }
+    ensureRawSettingDefault("allow_password_login", "true");
   } catch (e) {
     databaseLogger.warn("Could not initialize allow_password_login setting", {
       operation: "db_init",
@@ -614,16 +657,7 @@ async function initializeCompleteDatabase(): Promise<void> {
   }
 
   try {
-    const row = sqlite
-      .prepare("SELECT value FROM settings WHERE key = 'guac_enabled'")
-      .get();
-    if (!row) {
-      sqlite
-        .prepare(
-          "INSERT INTO settings (key, value) VALUES ('guac_enabled', 'true')",
-        )
-        .run();
-    }
+    ensureRawSettingDefault("guac_enabled", "true");
   } catch (e) {
     databaseLogger.warn("Could not initialize guac_enabled setting", {
       operation: "db_init",
@@ -632,17 +666,7 @@ async function initializeCompleteDatabase(): Promise<void> {
   }
 
   try {
-    const row = sqlite
-      .prepare("SELECT value FROM settings WHERE key = 'guac_url'")
-      .get();
-    if (!row) {
-      const defaultGuacUrl = `${process.env.GUACD_HOST || "localhost"}:${process.env.GUACD_PORT || "4822"}`;
-      sqlite
-        .prepare(
-          "INSERT INTO settings (key, value) VALUES ('guac_url', ?)",
-        )
-        .run(defaultGuacUrl);
-    }
+    ensureRawSettingDefault("guac_url", getDefaultGuacdUrl());
   } catch (e) {
     databaseLogger.warn("Could not initialize guac_url setting", {
       operation: "db_init",
@@ -679,6 +703,17 @@ const addColumnIfNotExists = (
 };
 
 const migrateSchema = () => {
+  addColumnIfNotExists(
+    "session_recordings",
+    "protocol",
+    "TEXT NOT NULL DEFAULT 'ssh'",
+  );
+  addColumnIfNotExists(
+    "session_recordings",
+    "format",
+    "TEXT NOT NULL DEFAULT 'text'",
+  );
+
   addColumnIfNotExists("user_preferences", "theme", "TEXT");
   addColumnIfNotExists("user_preferences", "font_size", "TEXT");
   addColumnIfNotExists("user_preferences", "accent_color", "TEXT");
@@ -689,12 +724,29 @@ const migrateSchema = () => {
   addColumnIfNotExists("user_preferences", "show_host_tags", "INTEGER");
   addColumnIfNotExists("user_preferences", "host_tray_on_click", "INTEGER");
   addColumnIfNotExists("user_preferences", "pin_app_rail", "INTEGER");
+  addColumnIfNotExists(
+    "user_preferences",
+    "expand_app_rail_on_hover",
+    "INTEGER",
+  );
   addColumnIfNotExists("user_preferences", "folders_collapsed", "INTEGER");
   addColumnIfNotExists("user_preferences", "confirm_snippet_execution", "INTEGER");
   addColumnIfNotExists("user_preferences", "disable_update_check", "INTEGER");
   addColumnIfNotExists("user_preferences", "confirm_tab_close", "INTEGER");
   addColumnIfNotExists("user_preferences", "hidden_rail_tabs", "TEXT");
   addColumnIfNotExists("user_preferences", "compact_host_view", "INTEGER");
+  addColumnIfNotExists("user_preferences", "status_color_scheme", "TEXT");
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS dashboard_service_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      label TEXT NOT NULL,
+      url TEXT NOT NULL,
+      "order" INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
   addColumnIfNotExists("users", "is_admin", "INTEGER NOT NULL DEFAULT 0");
 
@@ -713,6 +765,80 @@ const migrateSchema = () => {
   addColumnIfNotExists("users", "totp_secret", "TEXT");
   addColumnIfNotExists("users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0");
   addColumnIfNotExists("users", "totp_backup_codes", "TEXT");
+
+  const hadRegisteredAtColumn = (() => {
+    try {
+      sqlite.prepare(`SELECT "registered_at" FROM users LIMIT 1`).get();
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  // SQLite's ALTER TABLE ADD COLUMN rejects non-constant defaults like
+  // CURRENT_TIMESTAMP, so the column is added empty and backfilled below.
+  addColumnIfNotExists("users", "registered_at", "TEXT");
+  if (!hadRegisteredAtColumn) {
+    // Pre-existing users are backdated past the 30 day mark so they see the
+    // donation modal immediately on upgrade instead of waiting a fresh
+    // 30 days as if they had just registered.
+    try {
+      sqlite.exec(
+        `UPDATE users SET registered_at = datetime('now', '-31 days') WHERE registered_at IS NULL`,
+      );
+    } catch (backfillError) {
+      databaseLogger.warn("Failed to backfill users.registered_at", {
+        operation: "schema_migration",
+        error:
+          backfillError instanceof Error
+            ? backfillError.message
+            : String(backfillError),
+      });
+    }
+  } else {
+    try {
+      sqlite.exec(
+        `UPDATE users SET registered_at = CURRENT_TIMESTAMP WHERE registered_at IS NULL`,
+      );
+    } catch (backfillError) {
+      databaseLogger.warn(
+        "Failed to backfill NULL users.registered_at values",
+        {
+          operation: "schema_migration",
+          error:
+            backfillError instanceof Error
+              ? backfillError.message
+              : String(backfillError),
+        },
+      );
+    }
+  }
+  addColumnIfNotExists(
+    "users",
+    "donation_modal_dismissed",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+
+  addColumnIfNotExists("sessions", "oidc_sub", "TEXT");
+  addColumnIfNotExists("sessions", "oidc_sid", "TEXT");
+  addColumnIfNotExists("sessions", "sso_provider_id", "INTEGER");
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS webauthn_credentials (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      credential_id TEXT NOT NULL UNIQUE,
+      public_key TEXT NOT NULL,
+      counter INTEGER NOT NULL DEFAULT 0,
+      device_type TEXT,
+      backed_up INTEGER NOT NULL DEFAULT 0,
+      transports TEXT,
+      user_verification TEXT NOT NULL DEFAULT 'preferred',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )
+  `);
 
   addColumnIfNotExists("ssh_data", "name", "TEXT");
   addColumnIfNotExists("ssh_data", "folder", "TEXT");
@@ -783,6 +909,11 @@ const migrateSchema = () => {
     "ssh_data",
     "override_credential_username",
     "INTEGER",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "vault_profile_id",
+    "INTEGER REFERENCES vault_profiles(id) ON DELETE SET NULL",
   );
 
   addColumnIfNotExists("ssh_data", "autostart_password", "TEXT");
@@ -862,10 +993,6 @@ const migrateSchema = () => {
 
   addColumnIfNotExists("ssh_credentials", "cert_public_key", "TEXT");
 
-  addColumnIfNotExists("ssh_credentials", "system_password", "TEXT");
-  addColumnIfNotExists("ssh_credentials", "system_key", "TEXT");
-  addColumnIfNotExists("ssh_credentials", "system_key_password", "TEXT");
-
   try {
     const tableInfo = sqlite.prepare("PRAGMA table_info(ssh_credentials)").all() as Array<{
       cid: number;
@@ -903,9 +1030,6 @@ const migrateSchema = () => {
           private_key TEXT,
           public_key TEXT,
           detected_key_type TEXT,
-          system_password TEXT,
-          system_key TEXT,
-          system_key_password TEXT,
           FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
         );
 
@@ -984,6 +1108,111 @@ const migrateSchema = () => {
       `);
     } catch (createError) {
       databaseLogger.warn("Failed to create snippet_access table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM termix_identities LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS termix_identities (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL UNIQUE,
+          handle TEXT NOT NULL UNIQUE,
+          description TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create termix_identities table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  // Enforce one-Termix-ID-per-user on databases where the table predates the
+  // UNIQUE(user_id) constraint above.
+  try {
+    sqlite.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_termix_identities_user ON termix_identities(user_id)",
+    );
+  } catch (indexError) {
+    databaseLogger.warn("Failed to create termix_identities user_id unique index", {
+      operation: "schema_migration",
+      error: indexError,
+    });
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM termix_identity_keys LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS termix_identity_keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          identity_id INTEGER NOT NULL,
+          user_id TEXT NOT NULL,
+          public_key TEXT NOT NULL,
+          key_type TEXT NOT NULL,
+          algorithm TEXT NOT NULL,
+          label TEXT,
+          comment TEXT,
+          source TEXT NOT NULL DEFAULT 'manual',
+          credential_id INTEGER,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (identity_id) REFERENCES termix_identities (id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (credential_id) REFERENCES ssh_credentials (id) ON DELETE SET NULL
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create termix_identity_keys table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  // The public resolver fetches keys by identity_id on every request; index it.
+  try {
+    sqlite.exec(
+      "CREATE INDEX IF NOT EXISTS idx_termix_identity_keys_identity ON termix_identity_keys(identity_id)",
+    );
+  } catch (indexError) {
+    databaseLogger.warn("Failed to create termix_identity_keys identity index", {
+      operation: "schema_migration",
+      error: indexError,
+    });
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM termix_identity_ca LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS termix_identity_ca (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          identity_id INTEGER NOT NULL UNIQUE,
+          user_id TEXT NOT NULL,
+          public_key TEXT NOT NULL,
+          private_key TEXT NOT NULL,
+          validity_days INTEGER NOT NULL DEFAULT 90,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (identity_id) REFERENCES termix_identities (id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create termix_identity_ca table", {
         operation: "schema_migration",
         error: createError,
       });
@@ -1392,6 +1621,8 @@ const migrateSchema = () => {
           commands TEXT,
           dangerous_actions TEXT,
           recording_path TEXT,
+          protocol TEXT NOT NULL DEFAULT 'ssh',
+          format TEXT NOT NULL DEFAULT 'text',
           terminated_by_owner INTEGER DEFAULT 0,
           termination_reason TEXT,
           FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
@@ -1408,35 +1639,52 @@ const migrateSchema = () => {
   }
 
   try {
-    sqlite.prepare("SELECT id FROM shared_credentials LIMIT 1").get();
+    sqlite.prepare("SELECT id FROM shared_host_secrets LIMIT 1").get();
   } catch {
     try {
       sqlite.exec(`
-        CREATE TABLE IF NOT EXISTS shared_credentials (
+        CREATE TABLE IF NOT EXISTS shared_host_secrets (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           host_access_id INTEGER NOT NULL,
-          original_credential_id INTEGER NOT NULL,
           target_user_id TEXT NOT NULL,
-          encrypted_username TEXT NOT NULL,
-          encrypted_auth_type TEXT NOT NULL,
+          protocol TEXT NOT NULL DEFAULT 'ssh',
+          source_type TEXT NOT NULL DEFAULT 'credential',
+          original_credential_id INTEGER,
+          encrypted_username TEXT,
+          encrypted_auth_type TEXT,
           encrypted_password TEXT,
           encrypted_key TEXT,
           encrypted_key_password TEXT,
           encrypted_key_type TEXT,
+          encrypted_domain TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          needs_re_encryption INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(host_access_id, target_user_id, protocol),
           FOREIGN KEY (host_access_id) REFERENCES host_access (id) ON DELETE CASCADE,
           FOREIGN KEY (original_credential_id) REFERENCES ssh_credentials (id) ON DELETE CASCADE,
           FOREIGN KEY (target_user_id) REFERENCES users (id) ON DELETE CASCADE
         );
       `);
     } catch (createError) {
-      databaseLogger.warn("Failed to create shared_credentials table", {
+      databaseLogger.warn("Failed to create shared_host_secrets table", {
         operation: "schema_migration",
         error: createError,
       });
     }
+  }
+
+  try {
+    if (getRawSettingValue("rbac_permission_levels_v2") === null) {
+      sqlite.exec(
+        "UPDATE host_access SET permission_level = 'connect' WHERE permission_level = 'view'",
+      );
+      setRawSettingValue("rbac_permission_levels_v2", "done");
+    }
+  } catch (migrateError) {
+    databaseLogger.warn("Failed to migrate legacy view permission level", {
+      operation: "schema_migration",
+      error: migrateError,
+    });
   }
 
   try {
@@ -1464,6 +1712,67 @@ const migrateSchema = () => {
       `);
     } catch (createError) {
       databaseLogger.warn("Failed to create opkssh_tokens table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM vault_profiles LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS vault_profiles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          folder TEXT,
+          tags TEXT,
+          vault_addr TEXT NOT NULL,
+          vault_namespace TEXT,
+          oidc_mount TEXT,
+          oidc_role TEXT,
+          ssh_mount TEXT,
+          ssh_role TEXT NOT NULL,
+          valid_principals TEXT,
+          key_type TEXT,
+          shared INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create vault_profiles table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM vault_tokens LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS vault_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          profile_id INTEGER NOT NULL,
+          ssh_cert TEXT NOT NULL,
+          private_key TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT NOT NULL,
+          last_used TEXT,
+          UNIQUE(user_id, profile_id),
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (profile_id) REFERENCES vault_profiles (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create vault_tokens table", {
         operation: "schema_migration",
         error: createError,
       });
@@ -1678,31 +1987,30 @@ const migrateSchema = () => {
 
   // Migrate legacy single oidc_config settings blob into sso_providers table
   try {
-    const migrationDone = sqlite
-      .prepare("SELECT value FROM settings WHERE key = 'sso_migration_v1'")
-      .get();
+    const migrationDone = getRawSettingValue("sso_migration_v1");
     if (!migrationDone) {
       const providerCount = (
-        sqlite.prepare("SELECT COUNT(*) as c FROM sso_providers").get() as { c: number }
+        sqlite.prepare("SELECT COUNT(*) as c FROM sso_providers").get() as {
+          c: number;
+        }
       ).c;
       if (providerCount === 0) {
-        const legacyRow = sqlite
-          .prepare("SELECT value FROM settings WHERE key = 'oidc_config'")
-          .get() as { value: string } | undefined;
-        if (legacyRow) {
+        const legacyConfig = getRawSettingValue("oidc_config");
+        if (legacyConfig) {
           sqlite
             .prepare(
               "INSERT INTO sso_providers (name, type, enabled, display_order, config) VALUES (?, 'oidc', 1, 0, ?)",
             )
-            .run("OIDC", legacyRow.value);
-          databaseLogger.info("Migrated legacy oidc_config into sso_providers table", {
-            operation: "sso_migration_v1",
-          });
+            .run("OIDC", legacyConfig);
+          databaseLogger.info(
+            "Migrated legacy oidc_config into sso_providers table",
+            {
+              operation: "sso_migration_v1",
+            },
+          );
         }
       }
-      sqlite
-        .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('sso_migration_v1', 'true')")
-        .run();
+      setRawSettingValue("sso_migration_v1", "true");
     }
   } catch (e) {
     databaseLogger.warn("Failed to run SSO migration v1", {
@@ -1710,6 +2018,193 @@ const migrateSchema = () => {
       error: e,
     });
   }
+
+  // --- metrics-history begin ---
+  try {
+    sqlite.prepare("SELECT id FROM host_metrics_history LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS host_metrics_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          host_id INTEGER NOT NULL REFERENCES ssh_data(id) ON DELETE CASCADE,
+          ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          cpu_percent REAL,
+          mem_percent REAL,
+          disk_percent REAL,
+          net_rx_bytes INTEGER,
+          net_tx_bytes INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_host_metrics_history_host_ts
+          ON host_metrics_history (host_id, ts DESC);
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create host_metrics_history table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+  // --- metrics-history end ---
+
+  // --- alerts begin ---
+  try {
+    sqlite.prepare("SELECT id FROM alert_rules LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS alert_rules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          host_id INTEGER REFERENCES ssh_data(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          trigger_type TEXT NOT NULL,
+          threshold_value REAL,
+          threshold_duration_seconds INTEGER,
+          cooldown_minutes INTEGER NOT NULL DEFAULT 15,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create alert_rules table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM notification_channels LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS notification_channels (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          type TEXT NOT NULL,
+          config TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create notification_channels table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM alert_rule_channels LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS alert_rule_channels (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          rule_id INTEGER NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+          channel_id INTEGER NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create alert_rule_channels table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM alert_firings LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS alert_firings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          rule_id INTEGER NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+          host_id INTEGER NOT NULL,
+          host_name TEXT NOT NULL,
+          fired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          resolved_at TEXT,
+          value REAL,
+          message TEXT NOT NULL,
+          severity TEXT NOT NULL DEFAULT 'warning',
+          acknowledged INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_firings_user_fired
+          ON alert_firings (user_id, fired_at DESC);
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create alert_firings table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+  // --- alerts end ---
+
+  // Seed default metrics history retention setting
+  try {
+    ensureRawSettingDefault("metrics_history_retention_days", "7");
+  } catch (e) {
+    databaseLogger.warn(
+      "Could not initialize metrics_history_retention_days setting",
+      {
+        operation: "schema_migration",
+        error: e,
+      },
+    );
+  }
+
+  // --- homepage begin ---
+  try {
+    sqlite.prepare("SELECT id FROM homepage_items LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS homepage_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          type_id TEXT NOT NULL,
+          title TEXT,
+          config TEXT NOT NULL DEFAULT '{}',
+          folder_id INTEGER,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create homepage_items table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM homepage_layouts LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS homepage_layouts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+          layout TEXT NOT NULL DEFAULT '{}',
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create homepage_layouts table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+  // --- homepage end ---
 
   databaseLogger.success("Schema migration completed", {
     operation: "schema_migration",
@@ -1753,20 +2248,22 @@ async function saveMemoryDatabaseToFile(): Promise<void> {
 }
 
 async function handlePostInitFileEncryption() {
-  if (!enableFileEncryption) return;
-
   try {
     if (memoryDatabase) {
-      await saveMemoryDatabaseToFile();
+      DatabaseSaveTrigger.initialize(saveMemoryDatabaseToFile);
+
+      if (enableFileEncryption) {
+        await saveMemoryDatabaseToFile();
+      }
 
       setInterval(() => {
         if (DatabaseSaveTrigger.isDirty) {
           saveMemoryDatabaseToFile();
         }
       }, 5 * 60 * 1000);
-
-      DatabaseSaveTrigger.initialize(saveMemoryDatabaseToFile);
     }
+
+    if (!enableFileEncryption) return;
 
     try {
       const migration = new DatabaseMigration(dataDir);

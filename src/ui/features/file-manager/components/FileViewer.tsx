@@ -16,6 +16,8 @@ import {
   Save,
   RotateCcw,
   Keyboard,
+  ExternalLink,
+  Settings,
   Search,
   ZoomIn,
   ZoomOut,
@@ -86,12 +88,15 @@ interface FileViewerProps {
   content?: string;
   savedContent?: string;
   isLoading?: boolean;
+  isSaving?: boolean;
   isEditable?: boolean;
   resetKey?: number;
   onContentChange?: (content: string) => void;
   onSave?: (content: string) => void;
   onRevert?: () => void;
   onDownload?: () => void;
+  onOpenExternal?: () => void;
+  onChooseExternalEditor?: () => void;
   onMediaDimensionsChange?: (dimensions: {
     width: number;
     height: number;
@@ -267,12 +272,15 @@ export function FileViewer({
   content = "",
   savedContent = "",
   isLoading = false,
+  isSaving = false,
   isEditable = false,
   resetKey,
   onContentChange,
   onSave,
   onRevert,
   onDownload,
+  onOpenExternal,
+  onChooseExternalEditor,
   onMediaDimensionsChange,
 }: FileViewerProps) {
   const { t } = useTranslation();
@@ -347,6 +355,7 @@ export function FileViewer({
   };
 
   const handleSave = () => {
+    if (isSaving) return;
     onSave?.(editedContent);
   };
 
@@ -401,7 +410,7 @@ export function FileViewer({
   return (
     <div className="h-full flex flex-col bg-background">
       <div className="flex-shrink-0 bg-card border-b border-border p-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className={cn("p-2 rounded-lg bg-muted", fileTypeInfo.color)}>
               {fileTypeInfo.icon}
@@ -428,7 +437,7 @@ export function FileViewer({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
             {isEditable && (
               <Button
                 variant="ghost"
@@ -484,6 +493,7 @@ export function FileViewer({
                   variant="outline"
                   size="sm"
                   onClick={handleRevert}
+                  disabled={isSaving}
                   className="flex items-center gap-2"
                 >
                   <RotateCcw className="w-4 h-4" />
@@ -493,6 +503,7 @@ export function FileViewer({
                   variant="default"
                   size="sm"
                   onClick={handleSave}
+                  disabled={isSaving}
                   className="flex items-center gap-2"
                 >
                   <Save className="w-4 h-4" />
@@ -510,6 +521,30 @@ export function FileViewer({
                 <Download className="w-4 h-4" />
                 {t("fileManager.download")}
               </Button>
+            )}
+            {isEditable && onOpenExternal && (
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onOpenExternal}
+                  className="flex items-center gap-2"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  {t("fileManager.openExternalEditor")}
+                </Button>
+                {onChooseExternalEditor && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={onChooseExternalEditor}
+                    className="h-8 w-8 p-0"
+                    title={t("fileManager.chooseExternalEditor")}
+                  >
+                    <Settings className="w-4 h-4" />
+                  </Button>
+                )}
+              </div>
             )}
           </div>
         </div>

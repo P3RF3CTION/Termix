@@ -94,6 +94,7 @@ export type NormalizedImportedHost = Record<string, unknown> & {
   keyPassword?: string;
   keyType?: string;
   credentialId?: number;
+  credentialAlias?: string;
   pin?: unknown;
   enableTerminal?: unknown;
   enableTunnel?: unknown;
@@ -138,6 +139,8 @@ export type NormalizedImportedHost = Record<string, unknown> & {
 export function normalizeImportedHost(
   hostData: Record<string, unknown>,
 ): NormalizedImportedHost {
+  const credentialAlias =
+    asString(hostData.credentialAlias) || asString(hostData.credentialName);
   const connectionType =
     asString(hostData.connectionType) ||
     (asBoolean(hostData.enableRdp)
@@ -172,10 +175,15 @@ export function normalizeImportedHost(
     folder: asString(hostData.folder) || asString(hostData.group),
     tags: normalizeImportTags(hostData.tags),
     credentialId: asInteger(hostData.credentialId),
+    credentialAlias,
     authType:
       asString(hostData.authType) ||
       asString(hostData.authMethod) ||
-      (hostData.credentialId ? "credential" : hostData.key ? "key" : undefined),
+      (hostData.credentialId || credentialAlias
+        ? "credential"
+        : hostData.key
+          ? "key"
+          : undefined),
     enableSsh:
       hostData.enableSsh === undefined
         ? connectionType === "ssh"
@@ -221,6 +229,76 @@ export function stripSensitiveFields(
     delete result[field];
   }
   return result;
+}
+
+// Connection essentials a connect-level recipient is allowed to see.
+const CONNECT_LEVEL_FIELDS = new Set([
+  "id",
+  "userId",
+  "ownerId",
+  "ownerUsername",
+  "isShared",
+  "permissionLevel",
+  "sharedExpiresAt",
+  "name",
+  "ip",
+  "port",
+  "username",
+  "folder",
+  "tags",
+  "pin",
+  "authType",
+  "connectionType",
+  "credentialId",
+  "enableTerminal",
+  "enableTunnel",
+  "enableFileManager",
+  "enableDocker",
+  "enableProxmox",
+  "enableTmuxMonitor",
+  "showTerminalInSidebar",
+  "showFileManagerInSidebar",
+  "showTunnelInSidebar",
+  "showDockerInSidebar",
+  "showServerStatsInSidebar",
+  "enableSsh",
+  "enableRdp",
+  "enableVnc",
+  "enableTelnet",
+  "sshPort",
+  "rdpPort",
+  "vncPort",
+  "telnetPort",
+  "defaultPath",
+  "scpLegacy",
+  "tunnelConnections",
+  "jumpHosts",
+  "createdAt",
+  "updatedAt",
+]);
+
+/**
+ * Shapes a shared host row for its recipient. Secrets are always stripped
+ * (all levels); connect-level recipients are additionally reduced to
+ * connection essentials since they may not view the host's configuration.
+ */
+export function sanitizeHostForRecipient(
+  host: Record<string, unknown>,
+  permissionLevel: string | undefined,
+): Record<string, unknown> {
+  const stripped = stripSensitiveFields(host);
+
+  if (permissionLevel !== "connect") {
+    return stripped;
+  }
+
+  const reduced: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(stripped)) {
+    if (CONNECT_LEVEL_FIELDS.has(key)) {
+      reduced[key] = value;
+    }
+  }
+  return reduced;
 }
 
 export function transformHostResponse(

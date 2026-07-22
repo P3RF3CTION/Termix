@@ -24,6 +24,7 @@ import {
 } from "@/main-axios";
 import type { SSHHostWithStatus } from "@/main-axios";
 import type { ProxmoxGuest } from "@/types/proxmox";
+import { resolveProxmoxImportAuth } from "./proxmox-import-auth";
 
 interface ProxmoxDiscoverDialogProps {
   open: boolean;
@@ -118,8 +119,7 @@ export function ProxmoxDiscoverDialog({
     try {
       // Prefer explicitly configured credential, then fall back to the host's own credential
       const credId = defaultCredentialId ?? discoveredCredentialId;
-      const resolvedAuthType =
-        defaultAuthType ?? (credId != null ? "credential" : "password");
+      const importAuth = resolveProxmoxImportAuth(defaultAuthType, credId);
 
       const toImport = guests
         .filter((g) => selected.has(g.vmid))
@@ -129,13 +129,7 @@ export function ProxmoxDiscoverDialog({
           port: g.connectionType === "rdp" ? 3389 : 22,
           username: defaultUsername ?? "root",
           folder: importFolder,
-          authType: resolvedAuthType,
-          ...(resolvedAuthType === "credential" && credId != null
-            ? {
-                credentialId: credId,
-                overrideCredentialUsername: true,
-              }
-            : {}),
+          ...importAuth,
           enableTerminal: g.connectionType !== "rdp",
           enableFileManager: g.connectionType !== "rdp",
           enableTunnel: g.connectionType !== "rdp",
@@ -144,6 +138,18 @@ export function ProxmoxDiscoverDialog({
           enableDocker: g.enableDocker,
           connectionType: g.connectionType,
           tags: ["proxmox", g.type, g.node],
+          proxmoxConfig: {
+            source: {
+              source: "proxmox",
+              sourceHostId: Number(effectiveHostId),
+              node: g.node,
+              vmid: g.vmid,
+              type: g.type,
+              lastSeenAt: new Date().toISOString(),
+              lastStatus: g.status,
+              missingSince: null,
+            },
+          },
         }));
 
       const result = await bulkImportSSHHosts(toImport, false);

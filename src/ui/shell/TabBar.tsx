@@ -16,8 +16,12 @@ import {
   Plus,
   Minus,
   Pencil,
+  Maximize2,
+  Minimize2,
+  FolderOpen,
 } from "lucide-react";
 import { tabIcon } from "@/shell/tabUtils";
+import { isElectron } from "@/lib/electron";
 import type { Tab, TabType, SplitMode } from "@/types/ui-types";
 import { SPLIT_MODES, PANE_COUNTS } from "@/lib/theme";
 
@@ -37,6 +41,9 @@ export function TabBar({
   onAddToSplit,
   onRemoveFromSplit,
   onRenameTab,
+  onOpenFileManager,
+  isAppFullscreen,
+  onToggleAppFullscreen,
 }: {
   tabs: Tab[];
   activeTabId: string;
@@ -51,6 +58,9 @@ export function TabBar({
   onAddToSplit: (tabId: string) => void;
   onRemoveFromSplit: (tabId: string) => void;
   onRenameTab?: (tabId: string, newLabel: string) => void;
+  onOpenFileManager?: (tabId: string) => void;
+  isAppFullscreen: boolean;
+  onToggleAppFullscreen: () => void;
 }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(true);
@@ -437,6 +447,31 @@ export function TabBar({
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
+          {!isElectron() && (
+            <>
+              <Separator orientation="vertical" />
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-full w-12.5 rounded-none border-y-0 border-border text-muted-foreground hover:text-foreground"
+                title={
+                  isAppFullscreen
+                    ? "Exit fullscreen (Ctrl+Shift+F)"
+                    : "Enter fullscreen (Ctrl+Shift+F)"
+                }
+                aria-label={
+                  isAppFullscreen ? "Exit fullscreen" : "Enter fullscreen"
+                }
+                onClick={onToggleAppFullscreen}
+              >
+                {isAppFullscreen ? (
+                  <Minimize2 className="size-4" />
+                ) : (
+                  <Maximize2 className="size-4" />
+                )}
+              </Button>
+            </>
+          )}
           <Separator orientation="vertical" />
           <Button
             variant="ghost"
@@ -495,6 +530,20 @@ export function TabBar({
                   {t("nav.refreshTab")}
                 </button>
               )}
+              {ctxTab.type === "terminal" &&
+                ctxTab.host &&
+                onOpenFileManager && (
+                  <button
+                    className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-left hover:bg-accent hover:text-accent-foreground"
+                    onClick={() => {
+                      onOpenFileManager(contextTabId);
+                      setContextTabId(null);
+                    }}
+                  >
+                    <FolderOpen className="size-3" />
+                    {t("nav.openFileManager")}
+                  </button>
+                )}
               <button
                 className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-left hover:bg-accent hover:text-accent-foreground"
                 onClick={() => {
@@ -562,7 +611,7 @@ export function TabBar({
                 }}
               >
                 <X className="size-3" />
-                {t("nav.closeTab")}
+                {t("nav.close")}
               </button>
             </div>
           );

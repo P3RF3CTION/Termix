@@ -81,15 +81,32 @@ export function FileWindow({
 
   const [content, setContent] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [isEditable, setIsEditable] = useState(false);
   const [pendingContent, setPendingContent] = useState<string>("");
   const [resetKey, setResetKey] = useState(0);
   const [mediaDimensions, setMediaDimensions] = useState<
     { width: number; height: number } | undefined
   >();
+  const [externalEditorPath, setExternalEditorPath] = useState<string>("");
   const autoSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const externalEditorRef = useRef<{
+    editId: string;
+    unsubscribe?: () => void;
+  } | null>(null);
 
   const currentWindow = windows.find((w) => w.id === windowId);
+
+  useEffect(() => {
+    if (!window.electronAPI?.isElectron) return;
+
+    window.electronAPI
+      .getSetting?.("fileManager.externalEditorPath")
+      .then((value) => {
+        if (typeof value === "string") setExternalEditorPath(value);
+      })
+      .catch(() => {});
+  }, []);
 
   const ensureSSHConnection = async () => {
     try {
@@ -293,7 +310,7 @@ export function FileWindow({
 
   const handleSave = async (newContent: string) => {
     try {
-      setIsLoading(true);
+      setIsSaving(true);
 
       await ensureSSHConnection();
 
@@ -324,7 +341,94 @@ export function FileWindow({
         );
       }
     } finally {
-      setIsLoading(false);
+      setIsSaving(false);
+    }
+  };
+
+  const closeExternalEditor = async () => {
+    const session = externalEditorRef.current;
+    if (!session) return;
+
+    session.unsubscribe?.();
+    externalEditorRef.current = null;
+
+    try {
+      await window.electronAPI?.closeExternalEditor?.(session.editId);
+    } catch (error) {
+      console.error("Failed to close external editor session:", error);
+    }
+  };
+
+  const handleOpenExternalEditor = async () => {
+    if (!window.electronAPI?.isElectron) {
+      toast.error(t("fileManager.externalEditorDesktopOnly"));
+      return;
+    }
+
+    try {
+      await closeExternalEditor();
+      const result = await window.electronAPI.openExternalEditor({
+        fileName: file.name,
+        content: pendingContent || content,
+        encoding: "utf8",
+        editorPath: externalEditorPath || null,
+      });
+
+      if (!result.success || !result.editId) {
+        throw new Error(result.error || "Failed to open external editor");
+      }
+
+      const unsubscribe = window.electronAPI.onExternalEditorSaved?.(
+        (payload) => {
+          if (payload.editId !== result.editId) return;
+          void handleSave(payload.content);
+        },
+      );
+
+      externalEditorRef.current = {
+        editId: result.editId,
+        unsubscribe,
+      };
+      toast.success(t("fileManager.externalEditorOpened"));
+    } catch (error: unknown) {
+      console.error("Failed to open external editor:", error);
+      const err = error as { message?: string };
+      toast.error(
+        `${t("fileManager.failedToOpenExternalEditor")}: ${
+          err.message || t("fileManager.unknownError")
+        }`,
+      );
+    }
+  };
+
+  const handleChooseExternalEditor = async () => {
+    if (!window.electronAPI?.isElectron) {
+      toast.error(t("fileManager.externalEditorDesktopOnly"));
+      return;
+    }
+
+    try {
+      const result = await window.electronAPI.showOpenDialog({
+        title: t("fileManager.chooseExternalEditor"),
+        properties: ["openFile"],
+      });
+      const editorPath = result.filePaths?.[0];
+      if (result.canceled || !editorPath) return;
+
+      await window.electronAPI.setSetting?.(
+        "fileManager.externalEditorPath",
+        editorPath,
+      );
+      setExternalEditorPath(editorPath);
+      toast.success(t("fileManager.externalEditorSelected"));
+    } catch (error: unknown) {
+      console.error("Failed to select external editor:", error);
+      const err = error as { message?: string };
+      toast.error(
+        `${t("fileManager.failedToSelectExternalEditor")}: ${
+          err.message || t("fileManager.unknownError")
+        }`,
+      );
     }
   };
 
@@ -354,6 +458,7 @@ export function FileWindow({
       if (autoSaveTimerRef.current) {
         clearTimeout(autoSaveTimerRef.current);
       }
+      void closeExternalEditor();
     };
   }, []);
 
@@ -405,6 +510,7 @@ export function FileWindow({
   };
 
   const handleClose = () => {
+    void closeExternalEditor();
     closeWindow(windowId);
   };
 
@@ -448,12 +554,23 @@ export function FileWindow({
         content={pendingContent || content}
         savedContent={content}
         isLoading={isLoading}
+        isSaving={isSaving}
         resetKey={resetKey}
         onRevert={handleRevert}
         isEditable={isEditable}
         onContentChange={handleContentChange}
         onSave={(newContent) => handleSave(newContent)}
         onDownload={handleDownload}
+        onOpenExternal={
+          window.electronAPI?.isElectron && isEditable
+            ? handleOpenExternalEditor
+            : undefined
+        }
+        onChooseExternalEditor={
+          window.electronAPI?.isElectron && isEditable
+            ? handleChooseExternalEditor
+            : undefined
+        }
         onMediaDimensionsChange={handleMediaDimensionsChange}
       />
     </DraggableWindow>

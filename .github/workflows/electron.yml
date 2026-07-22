@@ -23,6 +23,10 @@ on:
           - file
           - release
           - submit
+      source_ref:
+        description: "Git ref/SHA to build (defaults to the workflow ref)"
+        required: false
+        default: ""
   workflow_call:
     inputs:
       build_type:
@@ -35,6 +39,16 @@ on:
         type: string
       release_tag:
         description: "Explicit release tag to upload assets to (defaults to latest release when empty)"
+        required: false
+        type: string
+        default: ""
+      version_override:
+        description: "Version string to stamp into built artifacts instead of package.json's version"
+        required: false
+        type: string
+        default: ""
+      source_ref:
+        description: "Git ref/SHA to build"
         required: false
         type: string
         default: ""
@@ -52,8 +66,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Setup Node.js
@@ -68,7 +83,10 @@ jobs:
       - name: Get version
         id: package-version
         run: |
-          $VERSION = (Get-Content package.json | ConvertFrom-Json).version
+          $VERSION = "${{ inputs.version_override }}"
+          if ([string]::IsNullOrEmpty($VERSION)) {
+            $VERSION = (Get-Content package.json | ConvertFrom-Json).version
+          }
           echo "version=$VERSION" >> $env:GITHUB_OUTPUT
 
       - name: Build Windows (All Architectures)
@@ -142,8 +160,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Setup Node.js
@@ -274,7 +293,10 @@ jobs:
       - name: Get version for Flatpak
         id: flatpak-version
         run: |
-          VERSION=$(node -p "require('./package.json').version")
+          VERSION="${{ inputs.version_override }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(node -p "require('./package.json').version")
+          fi
           RELEASE_DATE=$(date +%Y-%m-%d)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "release_date=$RELEASE_DATE" >> $GITHUB_OUTPUT
@@ -288,9 +310,9 @@ jobs:
           CHECKSUM_ARM64=$(sha256sum "release/termix_linux_arm64_appimage.AppImage" | awk '{print $1}')
 
           mkdir -p flatpak-build
-          cp flatpak/com.karmaa.termix.yml flatpak-build/
-          cp flatpak/com.karmaa.termix.desktop flatpak-build/
-          cp flatpak/com.karmaa.termix.metainfo.xml flatpak-build/
+          cp packaging/flatpak/com.karmaa.termix.yml flatpak-build/
+          cp packaging/flatpak/com.karmaa.termix.desktop flatpak-build/
+          cp packaging/flatpak/com.karmaa.termix.metainfo.xml flatpak-build/
           cp public/icon.svg flatpak-build/com.karmaa.termix.svg
           convert public/icon.png -resize 256x256 flatpak-build/icon-256.png
           convert public/icon.png -resize 128x128 flatpak-build/icon-128.png
@@ -322,7 +344,7 @@ jobs:
       - name: Create flatpakref file
         run: |
           VERSION="${{ steps.flatpak-version.outputs.version }}"
-          cp flatpak/com.karmaa.termix.flatpakref release/
+          cp packaging/flatpak/com.karmaa.termix.flatpakref release/
           sed -i "s|VERSION_PLACEHOLDER|release-${VERSION}-tag|g" release/com.karmaa.termix.flatpakref
 
       - name: Upload Flatpak bundle
@@ -352,8 +374,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Setup Node.js
@@ -514,7 +537,10 @@ jobs:
       - name: Get version for Homebrew
         id: homebrew-version
         run: |
-          VERSION=$(node -p "require('./package.json').version")
+          VERSION="${{ inputs.version_override }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(node -p "require('./package.json').version")
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Compute universal DMG checksum
@@ -525,7 +551,7 @@ jobs:
           echo "sha256=$CHECKSUM" >> $GITHUB_OUTPUT
 
       - name: Generate Homebrew Cask
-        if: hashFiles('release/termix_macos_universal_dmg.dmg') != '' && (inputs.artifact_destination == 'file' || inputs.artifact_destination == 'release')
+        if: hashFiles('release/termix_macos_universal_dmg.dmg') != '' && inputs.version_override == '' && (inputs.artifact_destination == 'file' || inputs.artifact_destination == 'release')
         run: |
           VERSION="${{ steps.homebrew-version.outputs.version }}"
           DMG_PATH="release/termix_macos_universal_dmg.dmg"
@@ -533,7 +559,7 @@ jobs:
           CHECKSUM=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
 
           mkdir -p homebrew-generated
-          cp Casks/termix.rb homebrew-generated/termix.rb
+          cp packaging/Casks/termix.rb homebrew-generated/termix.rb
 
           sed -i '' "s/VERSION_PLACEHOLDER/$VERSION/g" homebrew-generated/termix.rb
           sed -i '' "s/CHECKSUM_PLACEHOLDER/$CHECKSUM/g" homebrew-generated/termix.rb
@@ -550,7 +576,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Homebrew Cask to release
-        if: hashFiles('homebrew-generated/termix.rb') != '' && inputs.artifact_destination == 'release'
+        if: hashFiles('homebrew-generated/termix.rb') != '' && inputs.version_override == '' && inputs.artifact_destination == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -578,8 +604,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Get version from package.json
@@ -619,7 +646,7 @@ jobs:
           $DOWNLOAD_URL = "https://github.com/Termix-SSH/Termix/releases/download/release-$VERSION-tag/$MSI_NAME"
 
           New-Item -ItemType Directory -Force -Path "choco-build"
-          Copy-Item -Path "chocolatey\*" -Destination "choco-build" -Recurse -Force
+          Copy-Item -Path "packaging\chocolatey\*" -Destination "choco-build" -Recurse -Force
 
           $installScript = Get-Content "choco-build\tools\chocolateyinstall.ps1" -Raw -Encoding UTF8
           $installScript = $installScript -replace 'DOWNLOAD_URL_PLACEHOLDER', $DOWNLOAD_URL
@@ -684,8 +711,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Get version from package.json
@@ -737,10 +765,10 @@ jobs:
 
           mkdir -p flatpak-submission
 
-          cp flatpak/com.karmaa.termix.yml flatpak-submission/
-          cp flatpak/com.karmaa.termix.desktop flatpak-submission/
-          cp flatpak/com.karmaa.termix.metainfo.xml flatpak-submission/
-          cp flatpak/flathub.json flatpak-submission/
+          cp packaging/flatpak/com.karmaa.termix.yml flatpak-submission/
+          cp packaging/flatpak/com.karmaa.termix.desktop flatpak-submission/
+          cp packaging/flatpak/com.karmaa.termix.metainfo.xml flatpak-submission/
+          cp packaging/flatpak/flathub.json flatpak-submission/
 
           cp public/icon.svg flatpak-submission/com.karmaa.termix.svg
           convert public/icon.png -resize 256x256 flatpak-submission/icon-256.png
@@ -821,8 +849,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Get version from package.json
@@ -865,7 +894,7 @@ jobs:
 
           mkdir -p homebrew-submission/Casks/t
 
-          cp Casks/termix.rb homebrew-submission/Casks/t/termix.rb
+          cp packaging/Casks/termix.rb homebrew-submission/Casks/t/termix.rb
 
           sed -i '' "s/VERSION_PLACEHOLDER/$VERSION/g" homebrew-submission/Casks/t/termix.rb
           sed -i '' "s/CHECKSUM_PLACEHOLDER/$CHECKSUM/g" homebrew-submission/Casks/t/termix.rb
@@ -931,8 +960,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
       - name: Setup Node.js
@@ -986,16 +1016,6 @@ jobs:
 
           security find-identity -v -p codesigning $KEYCHAIN_PATH
 
-      - name: Build macOS App Store Package
-        if: steps.check_certs.outputs.has_certs == 'true'
-        env:
-          ELECTRON_BUILDER_ALLOW_UNRESOLVED_DEPENDENCIES: true
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_OPTIONS: --max-old-space-size=4096
-        run: |
-          BUILD_VERSION="${{ github.run_number }}"
-          npm run build && npx electron-builder --mac mas --universal --config.buildVersion="$BUILD_VERSION"
-
       - name: Check for App Store Connect API credentials
         id: check_asc_creds
         run: |
@@ -1014,12 +1034,83 @@ jobs:
         if: steps.check_certs.outputs.has_certs == 'true' && steps.check_asc_creds.outputs.has_credentials == 'true'
         run: gem install fastlane -N
 
-      - name: Upload and submit to Mac App Store
+      - name: Write App Store Connect API key
         if: steps.check_certs.outputs.has_certs == 'true' && steps.check_asc_creds.outputs.has_credentials == 'true'
         env:
           APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
           APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
           APPLE_KEY_CONTENT: ${{ secrets.APPLE_KEY_CONTENT }}
+        run: |
+          # Write API key JSON that Fastlane expects; the PEM's newlines
+          # must be preserved as literal \n escapes, not stripped, or
+          # spaceship fails to parse the key (invalid curve name).
+          mkdir -p /tmp/asc_keys
+          KEY_P8_PATH="/tmp/asc_keys/AuthKey_${APPLE_KEY_ID}.p8"
+          API_KEY_JSON="/tmp/asc_keys/api_key.json"
+
+          echo "$APPLE_KEY_CONTENT" | base64 --decode > "$KEY_P8_PATH"
+
+          KEY_ID="$APPLE_KEY_ID" ISSUER_ID="$APPLE_ISSUER_ID" KEY_P8_PATH="$KEY_P8_PATH" \
+            node -e '
+              const fs = require("fs");
+              const key = fs.readFileSync(process.env.KEY_P8_PATH, "utf8");
+              process.stdout.write(JSON.stringify({
+                key_id: process.env.KEY_ID,
+                issuer_id: process.env.ISSUER_ID,
+                key,
+                in_house: false,
+              }, null, 2) + "\n");
+            ' > "$API_KEY_JSON"
+
+      - name: Resolve next build number from App Store Connect
+        id: build_number
+        if: steps.check_certs.outputs.has_certs == 'true' && steps.check_asc_creds.outputs.has_credentials == 'true'
+        run: |
+          APP_VERSION=$(node -p "require('./package.json').version")
+          OUT_FILE="$RUNNER_TEMP/latest_build_number.txt"
+          LANE_DIR="$RUNNER_TEMP/asc_lane/fastlane"
+          mkdir -p "$LANE_DIR"
+
+          cat > "$LANE_DIR/Fastfile" <<EOF
+          default_platform(:mac)
+
+          lane :fetch_build_number do
+            number = app_store_build_number(
+              live: false,
+              api_key_path: "/tmp/asc_keys/api_key.json",
+              app_identifier: "com.karmaa.termix",
+              version: "$APP_VERSION",
+              initial_build_number: 0,
+            )
+            File.write("$OUT_FILE", number.to_s)
+          end
+          EOF
+
+          (cd "$RUNNER_TEMP/asc_lane" && fastlane fetch_build_number) 2>&1 || true
+
+          LATEST=""
+          if [ -f "$OUT_FILE" ]; then
+            LATEST=$(cat "$OUT_FILE" | tr -d '[:space:]')
+          fi
+
+          if ! [[ "$LATEST" =~ ^[0-9]+$ ]]; then
+            echo "Could not resolve latest build number from App Store Connect; falling back to run number."
+            LATEST="${{ github.run_number }}"
+          fi
+          echo "build_version=$((LATEST + 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS App Store Package
+        if: steps.check_certs.outputs.has_certs == 'true'
+        env:
+          ELECTRON_BUILDER_ALLOW_UNRESOLVED_DEPENDENCIES: true
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          BUILD_VERSION="${{ steps.build_number.outputs.build_version || github.run_number }}"
+          npm run build && npx electron-builder --mac mas --universal --config.buildVersion="$BUILD_VERSION"
+
+      - name: Upload and submit to Mac App Store
+        if: steps.check_certs.outputs.has_certs == 'true' && steps.check_asc_creds.outputs.has_credentials == 'true'
         run: |
           PKG_FILE=$(find release -name "termix_macos_universal_mas.pkg" -type f | head -n 1)
           if [ -z "$PKG_FILE" ]; then
@@ -1028,19 +1119,7 @@ jobs:
           fi
 
           VERSION=$(node -p "require('./package.json').version")
-
-          # Write API key JSON that Fastlane deliver expects
-          mkdir -p /tmp/asc_keys
-          KEY_P8_PATH="/tmp/asc_keys/AuthKey_${APPLE_KEY_ID}.p8"
           API_KEY_JSON="/tmp/asc_keys/api_key.json"
-
-          echo "$APPLE_KEY_CONTENT" | base64 --decode > "$KEY_P8_PATH"
-
-          printf '{\n  "key_id": "%s",\n  "issuer_id": "%s",\n  "key": "%s",\n  "in_house": false\n}\n' \
-            "$APPLE_KEY_ID" \
-            "$APPLE_ISSUER_ID" \
-            "$(tr -d '\n' < "$KEY_P8_PATH")" \
-            > "$API_KEY_JSON"
 
           fastlane deliver \
             --pkg "$PKG_FILE" \
