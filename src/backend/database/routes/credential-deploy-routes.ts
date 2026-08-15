@@ -6,6 +6,7 @@ import type { Request, RequestHandler, Response, Router } from "express";
 import ssh2Pkg from "ssh2";
 import { createCurrentHostResolutionRepository } from "../repositories/factory.js";
 import { preparePrivateKeyForSSH2 } from "../../utils/ssh-key-utils.js";
+import { buildSSHAlgorithms } from "../../utils/ssh-algorithms.js";
 
 const { Client } = ssh2Pkg;
 
@@ -280,38 +281,7 @@ async function deploySSHKeyToHost(
         keepaliveCountMax: 3,
         tcpKeepAlive: true,
         tcpKeepAliveInitialDelay: 30000,
-        algorithms: {
-          kex: [
-            "diffie-hellman-group14-sha256",
-            "diffie-hellman-group14-sha1",
-            "diffie-hellman-group1-sha1",
-            "diffie-hellman-group-exchange-sha256",
-            "diffie-hellman-group-exchange-sha1",
-            "ecdh-sha2-nistp256",
-            "ecdh-sha2-nistp384",
-            "ecdh-sha2-nistp521",
-          ],
-          cipher: [
-            "aes128-ctr",
-            "aes192-ctr",
-            "aes256-ctr",
-            "aes128-gcm@openssh.com",
-            "aes256-gcm@openssh.com",
-            "aes128-cbc",
-            "aes192-cbc",
-            "aes256-cbc",
-            "3des-cbc",
-          ],
-          hmac: [
-            "hmac-sha2-256-etm@openssh.com",
-            "hmac-sha2-512-etm@openssh.com",
-            "hmac-sha2-256",
-            "hmac-sha2-512",
-            "hmac-sha1",
-            "hmac-md5",
-          ],
-          compress: ["none", "zlib@openssh.com", "zlib"],
-        },
+        algorithms: buildSSHAlgorithms(true),
       };
 
       if (hostConfig.authType === "password" && hostConfig.password) {

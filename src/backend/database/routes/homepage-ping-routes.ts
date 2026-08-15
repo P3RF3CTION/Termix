@@ -1,8 +1,7 @@
 import type { Request, Response } from "express";
 import express from "express";
-import https from "https";
-import http from "http";
 import { homepageLogger } from "../../utils/logger.js";
+import { safeOutboundFetch } from "../../utils/safe-outbound-fetch.js";
 
 export const homepagePingRouter = express.Router();
 
@@ -17,54 +16,46 @@ const pingCache = new Map<string, PingCacheEntry>();
 const CACHE_SIZE = 200;
 const FETCH_TIMEOUT_MS = 5000;
 
-function pingUrl(
+async function pingUrl(
   url: string,
 ): Promise<{ ok: boolean; statusCode: number | null; latencyMs: number }> {
-  return new Promise((resolve) => {
-    const start = performance.now();
-    const mod = url.startsWith("https") ? https : http;
+  const start = performance.now();
 
-    const done = (ok: boolean, statusCode: number | null) => {
-      resolve({
-        ok,
-        statusCode,
-        latencyMs: Math.round(performance.now() - start),
+  const attempt = async (
+    method: "HEAD" | "GET",
+  ): Promise<{ statusCode: number | null; failed: boolean }> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await safeOutboundFetch(url, {
+        method,
+        signal: controller.signal,
       });
-    };
+      // Discard body so the connection releases even on GET fallbacks
+      try {
+        await res.arrayBuffer();
+      } catch {
+        // ignore body-read errors — the status code is what we care about
+      }
+      return { statusCode: res.status, failed: false };
+    } catch {
+      return { statusCode: null, failed: true };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
-    const tryGet = () => {
-      const req = mod.get(url, { timeout: FETCH_TIMEOUT_MS }, (res) => {
-        res.resume();
-        const code = res.statusCode ?? null;
-        done(code !== null && code < 400, code);
-      });
-      req.on("error", () => done(false, null));
-      req.on("timeout", () => {
-        req.destroy();
-        done(false, null);
-      });
-    };
+  const headResult = await attempt("HEAD");
+  const finalResult =
+    headResult.statusCode === 405 ? await attempt("GET") : headResult;
 
-    const req = mod.request(
-      url,
-      { method: "HEAD", timeout: FETCH_TIMEOUT_MS },
-      (res) => {
-        res.resume();
-        const code = res.statusCode ?? null;
-        if (code === 405) {
-          tryGet();
-        } else {
-          done(code !== null && code < 400, code);
-        }
-      },
-    );
-    req.on("error", () => done(false, null));
-    req.on("timeout", () => {
-      req.destroy();
-      done(false, null);
-    });
-    req.end();
-  });
+  const latencyMs = Math.round(performance.now() - start);
+  const code = finalResult.statusCode;
+  return {
+    ok: code !== null && code < 400,
+    statusCode: code,
+    latencyMs,
+  };
 }
 
 /**
@@ -97,10 +88,16 @@ homepagePingRouter.get("/", async (req: Request, res: Response) => {
 
   if (!targetUrl) return res.status(400).json({ error: "url is required" });
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = `https://${targetUrl}`;
+
+  let parsedUrl: URL;
   try {
-    new URL(targetUrl);
+    parsedUrl = new URL(targetUrl);
   } catch {
     return res.status(400).json({ error: "Invalid URL" });
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    return res.status(400).json({ error: "Only http(s) URLs are allowed" });
   }
 
   const cached = pingCache.get(targetUrl);
