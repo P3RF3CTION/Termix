@@ -1,8 +1,14 @@
+import { getErrorMessage } from "../../utils/error-message.js";
 import type { AuthenticatedRequest } from "../../../types/index.js";
-import express from "express";
-import type { Response } from "express";
+import express, { type Response } from "express";
 import { databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { getRequestMeta } from "../../utils/audit-logger.js";
+import { isAuthOverrideProtocol } from "../../../types/auth-protocols.js";
+import {
+  SharedHostAuthOverrideService,
+  SharedHostAuthOverrideServiceError,
+} from "../../utils/shared-host-auth-override-service.js";
 import {
   PermissionManager,
   SHARE_PERMISSION_LEVELS,
@@ -13,7 +19,6 @@ import {
   isValidPermission,
 } from "../../utils/permission-catalog.js";
 import {
-  createCurrentCredentialRepository,
   createCurrentHostFolderRepository,
   createCurrentHostResolutionRepository,
   createCurrentRbacAccessRepository,
@@ -28,16 +33,21 @@ const authManager = AuthManager.getInstance();
 const permissionManager = PermissionManager.getInstance();
 
 const authenticateJWT = authManager.createAuthMiddleware();
+const requireDataAccess = authManager.createDataAccessMiddleware();
+const sharedHostAuthOverrideService =
+  SharedHostAuthOverrideService.getInstance();
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function isSharePermissionLevel(value: unknown): value is SharePermissionLevel {
+export function isSharePermissionLevel(
+  value: unknown,
+): value is SharePermissionLevel {
   return SHARE_PERMISSION_LEVELS.includes(value as SharePermissionLevel);
 }
 
-function expiryFromDuration(durationHours: unknown): string | null {
+export function expiryFromDuration(durationHours: unknown): string | null {
   if (durationHours && typeof durationHours === "number" && durationHours > 0) {
     const expiryDate = new Date();
     expiryDate.setTime(expiryDate.getTime() + durationHours * 60 * 60 * 1000);
@@ -59,12 +69,12 @@ async function canManageHostSharing(
   return { allowed: access.hasAccess, isOwner: access.isOwner };
 }
 
-interface ShareTarget {
+export interface ShareTarget {
   type: "user" | "role";
   id: string | number;
 }
 
-function parseShareTargets(
+export function parseShareTargets(
   body: Record<string, unknown>,
 ): ShareTarget[] | null {
   const rawTargets = body.targets;
@@ -95,7 +105,7 @@ function parseShareTargets(
  * /rbac/host/{id}/share:
  *   post:
  *     summary: Share a host
- *     description: Shares a host with one or more users and/or roles at a permission level (connect, view, edit, manage). Allowed for the host owner or recipients holding the manage level. Every auth type is shareable; per-recipient secret snapshots are created automatically.
+ *     description: Shares a host with one or more users and/or roles at a permission level (connect, view, edit, manage). SSH authentication remains private to the owner; recipients may select one of their own saved SSH credentials.
  *     tags:
  *       - RBAC
  *     parameters:
@@ -271,10 +281,7 @@ router.post(
             operation: "rbac_host_share_snapshot_failed",
             hostId,
             accessId: accessGrant.id,
-            error:
-              snapshotError instanceof Error
-                ? snapshotError.message
-                : "Unknown error",
+            error: getErrorMessage(snapshotError),
           });
         }
 
@@ -352,8 +359,6 @@ router.post(
  *         description: Folder shared successfully.
  *       400:
  *         description: Invalid request body.
- *       404:
- *         description: Folder has no hosts.
  *       500:
  *         description: Failed to share folder.
  */
@@ -415,9 +420,6 @@ router.post(
           userId,
           folder,
         );
-      if (hostsInFolder.length === 0) {
-        return res.status(404).json({ error: "Folder has no hosts" });
-      }
 
       const expiresAt = expiryFromDuration(durationHours);
       const rbacAccessRepository = createCurrentRbacAccessRepository();
@@ -489,10 +491,7 @@ router.post(
               operation: "rbac_folder_share_snapshot_failed",
               hostId: host.id,
               accessId: accessGrant.id,
-              error:
-                snapshotError instanceof Error
-                  ? snapshotError.message
-                  : "Unknown error",
+              error: getErrorMessage(snapshotError),
             });
           }
         }
@@ -1430,10 +1429,7 @@ router.delete(
             operation: "remove_role_secret_cleanup",
             targetUserId,
             roleId,
-            error:
-              cleanupError instanceof Error
-                ? cleanupError.message
-                : "Unknown error",
+            error: getErrorMessage(cleanupError),
           },
         );
       }
@@ -1765,48 +1761,104 @@ router.get(
   },
 );
 
+/**
+ * @openapi
+ * /rbac/host-access/{hostId}/auth/{protocol}:
+ *   put:
+ *     summary: Set personal authentication for a shared host protocol
+ *     description: Selects one of the authenticated recipient's own credentials, or clears the selection with null. Only SSH is currently supported.
+ *     tags: [RBAC]
+ *     security:
+ *       - bearerAuth: []
+ */
 router.put(
-  "/host-access/:hostId/credential",
+  "/host-access/:hostId/auth/:protocol",
+  authenticateJWT,
+  requireDataAccess,
   async (req: express.Request, res: express.Response) => {
     try {
       const userId = (req as AuthenticatedRequest).userId!;
       const hostId = Number.parseInt(String(req.params.hostId), 10);
+      const protocol = req.params.protocol;
       const { credentialId } = req.body;
 
-      if (!hostId || isNaN(hostId)) {
+      if (!Number.isInteger(hostId) || hostId <= 0) {
         return res.status(400).json({ error: "Invalid host ID" });
       }
-
-      const access =
-        await createCurrentRbacAccessRepository().findDirectHostAccess(
-          hostId,
-          userId,
-        );
-
-      if (!access) {
-        return res.status(403).json({ error: "No access to this host" });
+      if (!isAuthOverrideProtocol(protocol)) {
+        return res
+          .status(400)
+          .json({ error: "Invalid authentication protocol" });
       }
 
-      if (credentialId) {
-        const cred = await createCurrentCredentialRepository().findByIdForUser(
-          userId,
-          credentialId,
-        );
-
-        if (!cred) {
-          return res.status(404).json({ error: "Credential not found" });
-        }
+      if (
+        credentialId !== null &&
+        (!Number.isInteger(credentialId) || credentialId <= 0)
+      ) {
+        return res.status(400).json({
+          error: "credentialId must be a positive integer or null",
+        });
       }
 
-      await createCurrentRbacAccessRepository().updateHostAccessOverrideCredential(
-        access.id,
-        credentialId || null,
+      const { ipAddress, userAgent } = getRequestMeta(req);
+      await sharedHostAuthOverrideService.setCredentialId(
+        hostId,
+        userId,
+        protocol,
+        credentialId,
+        { ipAddress, userAgent },
       );
-
-      res.json({ success: true });
+      res.json({ success: true, protocol, credentialId });
     } catch (error) {
+      if (error instanceof SharedHostAuthOverrideServiceError) {
+        return res.status(error.statusCode).json({ error: error.message });
+      }
       databaseLogger.error("Failed to set override credential", error);
       res.status(500).json({ error: "Failed to update credential" });
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /rbac/host-access/{hostId}/auth/{protocol}:
+ *   get:
+ *     summary: Get the current recipient's shared-host protocol authentication override
+ *     tags: [RBAC]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.get(
+  "/host-access/:hostId/auth/:protocol",
+  authenticateJWT,
+  requireDataAccess,
+  async (req: express.Request, res: express.Response) => {
+    try {
+      const userId = (req as AuthenticatedRequest).userId!;
+      const hostId = Number.parseInt(String(req.params.hostId), 10);
+      const protocol = req.params.protocol;
+
+      if (!Number.isInteger(hostId) || hostId <= 0) {
+        return res.status(400).json({ error: "Invalid host ID" });
+      }
+      if (!isAuthOverrideProtocol(protocol)) {
+        return res
+          .status(400)
+          .json({ error: "Invalid authentication protocol" });
+      }
+
+      const credentialId = await sharedHostAuthOverrideService.getCredentialId(
+        hostId,
+        userId,
+        protocol,
+      );
+      res.json({ protocol, credentialId });
+    } catch (error) {
+      if (error instanceof SharedHostAuthOverrideServiceError) {
+        return res.status(error.statusCode).json({ error: error.message });
+      }
+      databaseLogger.error("Failed to get override credential", error);
+      res.status(500).json({ error: "Failed to fetch credential" });
     }
   },
 );

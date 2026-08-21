@@ -1,9 +1,13 @@
 import { and, eq, lte, ne } from "drizzle-orm";
 import { sessions } from "../db/schema.js";
 import type { DatabaseContext } from "./database-context.js";
+import { rowsAffected } from "./mutation-result.js";
+import { insertReturning } from "./returning.js";
 
 export type SessionRecord = typeof sessions.$inferSelect;
 export type NewSessionRecord = typeof sessions.$inferInsert;
+
+const SESSION_ACTIVITY_PERSIST_INTERVAL_MS = 60_000;
 
 export class SessionRepository {
   constructor(
@@ -12,10 +16,7 @@ export class SessionRepository {
   ) {}
 
   async create(session: NewSessionRecord): Promise<SessionRecord> {
-    const rows = await this.context.drizzle
-      .insert(sessions)
-      .values(session)
-      .returning();
+    const rows = await insertReturning(this.context, sessions, session);
     await this.afterWrite();
     return rows[0];
   }
@@ -51,12 +52,19 @@ export class SessionRepository {
   async touch(
     id: string,
     lastActiveAt = new Date().toISOString(),
-  ): Promise<void> {
-    await this.context.drizzle
+    minIntervalMs = SESSION_ACTIVITY_PERSIST_INTERVAL_MS,
+  ): Promise<boolean> {
+    const cutoff = new Date(
+      new Date(lastActiveAt).getTime() - minIntervalMs,
+    ).toISOString();
+    const result = await this.context.drizzle
       .update(sessions)
       .set({ lastActiveAt })
-      .where(eq(sessions.id, id));
+      .where(and(eq(sessions.id, id), lte(sessions.lastActiveAt, cutoff)));
+
+    if (rowsAffected(result) === 0) return false;
     await this.afterWrite();
+    return true;
   }
 
   async updateToken(
@@ -72,13 +80,12 @@ export class SessionRepository {
   }
 
   async revoke(id: string): Promise<boolean> {
-    const rows = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(sessions)
-      .where(eq(sessions.id, id))
-      .returning({ id: sessions.id });
+      .where(eq(sessions.id, id));
 
     await this.afterWrite();
-    return rows.length > 0;
+    return rowsAffected(result) > 0;
   }
 
   async revokeAllForUser(
@@ -89,23 +96,19 @@ export class SessionRepository {
       ? and(eq(sessions.userId, userId), ne(sessions.id, exceptSessionId))
       : eq(sessions.userId, userId);
 
-    const rows = await this.context.drizzle
-      .delete(sessions)
-      .where(where)
-      .returning({ id: sessions.id });
+    const result = await this.context.drizzle.delete(sessions).where(where);
 
     await this.afterWrite();
-    return rows.length;
+    return rowsAffected(result);
   }
 
   async deleteExpired(now = new Date()): Promise<number> {
-    const rows = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(sessions)
-      .where(lte(sessions.expiresAt, now.toISOString()))
-      .returning({ id: sessions.id });
+      .where(lte(sessions.expiresAt, now.toISOString()));
 
     await this.afterWrite();
-    return rows.length;
+    return rowsAffected(result);
   }
 
   private async afterWrite(): Promise<void> {

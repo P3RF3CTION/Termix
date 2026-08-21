@@ -1,9 +1,11 @@
+import { getErrorMessage } from "./error-message.js";
 import { databaseLogger } from "./logger.js";
 
 export class DatabaseSaveTrigger {
   private static saveFunction: (() => Promise<void>) | null = null;
   private static isInitialized = false;
   private static pendingSave = false;
+  private static activeSave: Promise<void> | null = null;
   private static saveTimeout: NodeJS.Timeout | null = null;
   private static _dirty = false;
 
@@ -38,23 +40,17 @@ export class DatabaseSaveTrigger {
     }
 
     this.saveTimeout = setTimeout(async () => {
-      if (this.pendingSave) {
-        return;
-      }
-
-      this.pendingSave = true;
+      this.saveTimeout = null;
 
       try {
-        await this.saveFunction!();
+        await this.runSave();
         this._dirty = false;
       } catch (error) {
         databaseLogger.error("Database save failed", error, {
           operation: "db_save_trigger_failed",
           reason,
-          error: error instanceof Error ? error.message : "Unknown error",
+          error: getErrorMessage(error),
         });
-      } finally {
-        this.pendingSave = false;
       }
     }, 2000);
   }
@@ -76,23 +72,39 @@ export class DatabaseSaveTrigger {
       this.saveTimeout = null;
     }
 
-    if (this.pendingSave) {
-      return;
-    }
-
-    this.pendingSave = true;
-
     try {
-      await this.saveFunction();
+      await this.runSave();
+      this._dirty = false;
     } catch (error) {
       databaseLogger.error("Database force save failed", error, {
         operation: "db_save_trigger_force_failed",
         reason,
-        error: error instanceof Error ? error.message : "Unknown error",
+        error: getErrorMessage(error),
       });
       throw error;
+    }
+  }
+
+  private static async runSave(): Promise<void> {
+    while (this.activeSave) {
+      try {
+        await this.activeSave;
+      } catch {
+        // The queued save must still run after an earlier save failed.
+      }
+    }
+
+    const save = Promise.resolve().then(() => this.saveFunction!());
+    this.activeSave = save;
+    this.pendingSave = true;
+
+    try {
+      await save;
     } finally {
-      this.pendingSave = false;
+      if (this.activeSave === save) {
+        this.activeSave = null;
+        this.pendingSave = false;
+      }
     }
   }
 
@@ -115,6 +127,7 @@ export class DatabaseSaveTrigger {
     }
 
     this.pendingSave = false;
+    this.activeSave = null;
     this.isInitialized = false;
     this.saveFunction = null;
   }

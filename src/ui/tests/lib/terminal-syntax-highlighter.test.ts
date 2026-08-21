@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { highlightTerminalOutput } from "../../lib/terminal-syntax-highlighter.js";
+import {
+  highlightTerminalOutput,
+  updateControlStringMode,
+} from "../../lib/terminal-syntax-highlighter.js";
 
 const ESC = "\x1b";
 
@@ -333,5 +336,106 @@ describe("highlightTerminalOutput", () => {
     const out = highlightTerminalOutput(chunk);
     expect(out.split("\n")[0]).toContain(ESC + "[91m");
     expect(out.split("\n")[1]).toContain(ESC + "[36m");
+  });
+});
+
+describe("updateControlStringMode", () => {
+  const BEL = "\x07";
+
+  it("stays inactive for output with no control string", () => {
+    expect(updateControlStringMode("total 4\nfile.txt\n", false)).toEqual({
+      isActive: false,
+      wasActive: false,
+    });
+  });
+
+  it("goes active when a control string is left open at the chunk end", () => {
+    // What PROMPT_COMMAND emits: ESC ] 0 ; <title>, terminator not yet sent.
+    const chunk = `${ESC}]0;user@host:~/path/current-dir`;
+
+    expect(updateControlStringMode(chunk, false)).toEqual({
+      isActive: true,
+      wasActive: false,
+    });
+  });
+
+  it("clears on the continuation chunk that carries the terminator", () => {
+    // The continuation has no escape byte at all, which is why every
+    // single-chunk guard misses it.
+    const continuation = `${BEL}[user@host current-dir]$ `;
+
+    expect(updateControlStringMode(continuation, true)).toEqual({
+      isActive: false,
+      wasActive: true,
+    });
+  });
+
+  it("reports a chunk that opens and closes a control string as inactive", () => {
+    const chunk = `${ESC}]0;title${BEL}ready\n`;
+
+    expect(updateControlStringMode(chunk, false)).toEqual({
+      isActive: false,
+      wasActive: false,
+    });
+  });
+
+  it("accepts ST as a terminator", () => {
+    expect(
+      updateControlStringMode(`${ESC}]7;file:///tmp${ESC}\\`, false),
+    ).toEqual({
+      isActive: false,
+      wasActive: false,
+    });
+  });
+
+  it("treats a trailing lone ESC as active, since its meaning is in the next chunk", () => {
+    expect(updateControlStringMode(`done${ESC}`, false)).toEqual({
+      isActive: true,
+      wasActive: false,
+    });
+  });
+
+  it("recognises DCS, APC and PM openers too", () => {
+    for (const opener of ["P", "^", "_"]) {
+      expect(
+        updateControlStringMode(`${ESC}${opener}payload`, false).isActive,
+      ).toBe(true);
+    }
+  });
+
+  it("does not treat CSI as a control string", () => {
+    expect(updateControlStringMode(`${ESC}[31mred${ESC}[0m`, false)).toEqual({
+      isActive: false,
+      wasActive: false,
+    });
+  });
+
+  it("leaves a continuation chunk unhighlighted", () => {
+    // The bug: this chunk highlights cleanly on its own, and injecting SGR
+    // bytes into an open OSC string dumps the payload onto the screen.
+    const continuation = `${BEL}connect to 10.0.0.11 failed`;
+    expect(highlightTerminalOutput(continuation)).not.toBe(continuation);
+
+    const state = updateControlStringMode(continuation, true);
+    expect(state.wasActive).toBe(true);
+  });
+
+  it("passes through SGR mouse-tracking reports untouched (issue #1023)", () => {
+    // ESC[<Cb;Cx;CyM is the SGR (1006) mouse-report format. The `<` marker
+    // byte was missing from the parameter-byte character class, so these
+    // sequences weren't recognised as ANSI escapes and their raw digits
+    // leaked onto the screen as visible text inside `screen`/tmux sessions.
+    const report = `${ESC}[<35;191;1M`;
+    expect(highlightTerminalOutput(report)).toBe(report);
+  });
+
+  it("passes through a burst of SGR mouse reports untouched", () => {
+    const burst = `${ESC}[<35;191;1M${ESC}[<35;186;2M${ESC}[<35;46;21M`;
+    expect(highlightTerminalOutput(burst)).toBe(burst);
+  });
+
+  it("treats a chunk ending mid SGR-mouse-report as incomplete", () => {
+    const partial = `foo${ESC}[<35;191`;
+    expect(highlightTerminalOutput(partial)).toBe(partial);
   });
 });

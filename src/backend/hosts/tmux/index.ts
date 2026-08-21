@@ -1,7 +1,9 @@
+import { getErrorMessage } from "../../utils/error-message.js";
 import express from "express";
 import cookieParser from "cookie-parser";
 import { Client, type ConnectConfig } from "ssh2";
 import { createCorsMiddleware } from "../../utils/cors-config.js";
+import { createCompressionMiddleware } from "../../utils/compression-config.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
 import {
@@ -40,6 +42,7 @@ import {
   type PaneMetrics,
 } from "./monitor-helpers.js";
 import type { SSHHost, AuthenticatedRequest } from "../../../types/index.js";
+import { getTmuxAuthBehavior } from "./auth-utils.js";
 
 const PANE_ID_RE = /^%\d+$/;
 // tmux session names cannot contain ":" or "."; keep to a conservative
@@ -59,11 +62,12 @@ interface TmuxSessionOverview extends TmuxSessionSummary {
 // and docker; jump hosts and SOCKS5 reuse the shared helpers)
 
 async function buildSshConfig(host: SSHHost): Promise<ConnectConfig> {
+  const authBehavior = getTmuxAuthBehavior(host.authType);
   const base: ConnectConfig = {
     host: (host.ip || "").replace(/^\[|\]$/g, ""),
     port: host.port,
     username: host.username,
-    tryKeyboard: true,
+    tryKeyboard: authBehavior.tryKeyboard,
     keepaliveInterval: 30000,
     keepaliveCountMax: 3,
     readyTimeout: 60000,
@@ -94,7 +98,7 @@ async function buildSshConfig(host: SSHHost): Promise<ConnectConfig> {
     if (host.keyPassword) {
       (base as Record<string, unknown>).passphrase = host.keyPassword;
     }
-  } else if (host.authType === "none") {
+  } else if (authBehavior.credentialless) {
     // no credentials needed
   } else if (host.authType === "vault") {
     // cert auth setup happens in connectToHost (needs client instance)
@@ -143,11 +147,7 @@ export function connectToHost(host: SSHHost): () => Promise<Client> {
 
     let jumpClient: Client | null = null;
     if (host.jumpHosts && host.jumpHosts.length > 0 && host.userId) {
-      jumpClient = await createJumpHostChain(
-        host.jumpHosts,
-        host.userId,
-        proxyConfig,
-      );
+      jumpClient = await createJumpHostChain(host.jumpHosts, host.userId);
       if (!jumpClient) {
         throw new Error("Failed to establish jump host chain");
       }
@@ -328,6 +328,7 @@ async function collectPaneMetrics(
 const app = express();
 const authManager = AuthManager.getInstance();
 
+app.use(createCompressionMiddleware());
 app.use(createCorsMiddleware(["GET", "POST", "PUT", "DELETE", "OPTIONS"]));
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
@@ -391,7 +392,7 @@ async function requireHost(
 }
 
 function toErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : "Unknown error";
+  return getErrorMessage(err);
 }
 
 // Destructive tmux actions terminate processes on the remote host, so they
@@ -429,13 +430,10 @@ async function auditTmuxAction(
 // Typed error codes so the frontend can render a helpful state instead of a
 // raw 500 (same pattern as SESSION_EXPIRED handling in main-axios).
 type TmuxErrorCode =
-  | "TMUX_NOT_INSTALLED"
-  | "TMUX_NO_SERVER"
-  | "HOST_UNREACHABLE"
-  | "TMUX_ERROR";
+  "TMUX_NOT_INSTALLED" | "TMUX_NO_SERVER" | "HOST_UNREACHABLE" | "TMUX_ERROR";
 
 function classifyTmuxError(err: unknown): TmuxErrorCode {
-  const msg = err instanceof Error ? err.message : "";
+  const msg = getErrorMessage(err, "");
   if (/command not found|exited with code 127/i.test(msg))
     return "TMUX_NOT_INSTALLED";
   if (/no server running|lost server/i.test(msg)) return "TMUX_NO_SERVER";

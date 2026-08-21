@@ -3,6 +3,12 @@ import { randomUUID } from "crypto";
 import { hostAccess, hosts } from "../db/schema.js";
 import type { DatabaseContext } from "./database-context.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
+import { rowsAffected } from "./mutation-result.js";
+import {
+  deleteReturning,
+  insertReturning,
+  updateReturning,
+} from "./returning.js";
 
 export type HostRecord = typeof hosts.$inferSelect;
 export type NewHostRecord = typeof hosts.$inferInsert;
@@ -21,10 +27,10 @@ export class HostRepository {
   ) {}
 
   async create(host: NewHostRecord): Promise<HostRecord> {
-    const rows = await this.context.drizzle
-      .insert(hosts)
-      .values({ syncId: randomUUID(), ...host })
-      .returning();
+    const rows = await insertReturning(this.context, hosts, {
+      syncId: randomUUID(),
+      ...host,
+    });
     await this.afterWrite();
     return rows[0];
   }
@@ -51,10 +57,11 @@ export class HostRepository {
       delete (encryptedHost as Partial<NewHostRecord>).id;
     }
 
-    const rows = await this.context.drizzle
-      .insert(hosts)
-      .values(encryptedHost as NewHostRecord)
-      .returning();
+    const rows = await insertReturning(
+      this.context,
+      hosts,
+      encryptedHost as NewHostRecord,
+    );
 
     await this.afterWrite();
     return DataCrypto.decryptRecord("ssh_data", rows[0], userId, userDataKey);
@@ -150,11 +157,12 @@ export class HostRepository {
     hostId: number,
     update: HostUpdate,
   ): Promise<HostRecord | null> {
-    const rows = await this.context.drizzle
-      .update(hosts)
-      .set({ ...update, updatedAt: sql`CURRENT_TIMESTAMP` })
-      .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
-      .returning();
+    const rows = await updateReturning(
+      this.context,
+      hosts,
+      { ...update, updatedAt: sql`CURRENT_TIMESTAMP` },
+      and(eq(hosts.id, hostId), eq(hosts.userId, userId)),
+    );
 
     await this.afterWrite();
     return rows[0] ?? null;
@@ -173,11 +181,12 @@ export class HostRepository {
       userDataKey,
     );
 
-    const rows = await this.context.drizzle
-      .update(hosts)
-      .set({ ...encryptedUpdate, updatedAt: sql`CURRENT_TIMESTAMP` })
-      .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
-      .returning();
+    const rows = await updateReturning(
+      this.context,
+      hosts,
+      { ...encryptedUpdate, updatedAt: sql`CURRENT_TIMESTAMP` },
+      and(eq(hosts.id, hostId), eq(hosts.userId, userId)),
+    );
 
     await this.afterWrite();
     return rows[0]
@@ -213,17 +222,62 @@ export class HostRepository {
       return 0;
     }
 
-    const rows = await this.context.drizzle
+    const result = await this.context.drizzle
       .update(hosts)
       .set({ ...update, updatedAt: sql`CURRENT_TIMESTAMP` })
-      .where(and(inArray(hosts.id, hostIds), eq(hosts.userId, userId)))
-      .returning({ id: hosts.id });
+      .where(and(inArray(hosts.id, hostIds), eq(hosts.userId, userId)));
 
-    if (rows.length > 0) {
+    if (rowsAffected(result) > 0) {
       await this.afterWrite();
     }
 
-    return rows.length;
+    return rowsAffected(result);
+  }
+
+  /**
+   * Sets a distinct manual sortOrder per host (drag-to-reorder). Unlike
+   * updateManyForUser, each id gets its own value, so this is one UPDATE per
+   * row rather than a single set-for-all-matching-ids statement.
+   */
+  async reorderForUser(
+    userId: string,
+    positions: { id: number; sortOrder: number }[],
+  ): Promise<number> {
+    if (positions.length === 0) return 0;
+
+    let affected: number;
+    if (this.context.dialect === "sqlite") {
+      affected = this.context.drizzle.transaction((tx) => {
+        let count = 0;
+        for (const { id, sortOrder } of positions) {
+          const result = tx
+            .update(hosts)
+            .set({ sortOrder, updatedAt: sql`CURRENT_TIMESTAMP` })
+            .where(and(eq(hosts.id, id), eq(hosts.userId, userId)))
+            .run();
+          count += rowsAffected(result);
+        }
+        return count;
+      });
+    } else {
+      affected = await this.context.drizzle.transaction(async (tx) => {
+        let count = 0;
+        for (const { id, sortOrder } of positions) {
+          const result = await tx
+            .update(hosts)
+            .set({ sortOrder, updatedAt: sql`CURRENT_TIMESTAMP` })
+            .where(and(eq(hosts.id, id), eq(hosts.userId, userId)));
+          count += rowsAffected(result);
+        }
+        return count;
+      });
+    }
+
+    if (affected > 0) {
+      await this.afterWrite();
+    }
+
+    return affected;
   }
 
   async deleteForUser(
@@ -232,39 +286,38 @@ export class HostRepository {
   ): Promise<{ syncId: string | null } | null> {
     await this.deleteAccessForHost(hostId);
 
-    const rows = await this.context.drizzle
-      .delete(hosts)
-      .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
-      .returning({ syncId: hosts.syncId });
+    const rows = await deleteReturning(
+      this.context,
+      hosts,
+      and(eq(hosts.id, hostId), eq(hosts.userId, userId)),
+    );
 
     await this.afterWrite();
-    return rows[0] ?? null;
+    return rows[0] ? { syncId: rows[0].syncId } : null;
   }
 
   async deleteByUserId(userId: string): Promise<number> {
-    const rows = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(hosts)
-      .where(eq(hosts.userId, userId))
-      .returning({ id: hosts.id });
+      .where(eq(hosts.userId, userId));
 
-    if (rows.length > 0) {
+    if (rowsAffected(result) > 0) {
       await this.afterWrite();
     }
 
-    return rows.length;
+    return rowsAffected(result);
   }
 
   async deleteAccessForHost(hostId: number): Promise<number> {
-    const rows = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(hostAccess)
-      .where(eq(hostAccess.hostId, hostId))
-      .returning({ id: hostAccess.id });
+      .where(eq(hostAccess.hostId, hostId));
 
-    if (rows.length > 0) {
+    if (rowsAffected(result) > 0) {
       await this.afterWrite();
     }
 
-    return rows.length;
+    return rowsAffected(result);
   }
 
   private async afterWrite(): Promise<void> {

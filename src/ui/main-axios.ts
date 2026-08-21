@@ -1,4 +1,10 @@
-import axios, { AxiosError, type AxiosInstance } from "axios";
+import { getErrorMessage } from "./lib/error-message.js";
+import axios, {
+  AxiosError,
+  type AxiosInstance,
+  type AxiosResponse,
+  type InternalAxiosRequestConfig,
+} from "axios";
 import { toast } from "sonner";
 import { getBasePath } from "@/lib/base-path";
 import { isElectron } from "@/lib/electron";
@@ -55,14 +61,16 @@ import {
   type LogContext,
 } from "@/lib/frontend-logger";
 import { dbHealthMonitor } from "@/lib/db-health-monitor";
+import { asHttpError } from "@/lib/http-error";
+import { getDeviceId } from "@/lib/device-id";
 
 export type ServerStatus = {
-  status: "online" | "offline";
+  status: "online" | "reachable" | "offline";
   lastChecked: string;
 };
 
 export type SSHHostWithStatus = SSHHost & {
-  status: "online" | "offline" | "unknown";
+  status: "online" | "reachable" | "offline" | "unknown";
 };
 
 interface CpuMetrics {
@@ -77,11 +85,27 @@ interface MemoryMetrics {
   totalGiB: number | null;
 }
 
+export interface DiskFilesystem {
+  filesystem: string;
+  type: string;
+  mount: string;
+  percent: number | null;
+  usedHuman: string | null;
+  totalHuman: string | null;
+  availableHuman: string | null;
+  usedBytes: number | null;
+  totalBytes: number | null;
+  availableBytes: number | null;
+  label?: string;
+}
+
 interface DiskMetrics {
   percent: number | null;
   usedHuman: string | null;
   totalHuman: string | null;
   availableHuman?: string | null;
+  mount?: string | null;
+  filesystems?: DiskFilesystem[];
 }
 
 export interface NetworkInterface {
@@ -92,6 +116,8 @@ export interface NetworkInterface {
   tx?: string | null;
   rxBytes?: string | null;
   txBytes?: string | null;
+  rxRateBps?: number | null;
+  txRateBps?: number | null;
 }
 
 export interface ProcessInfo {
@@ -199,9 +225,14 @@ export interface UserInfo {
   username: string;
   is_admin: boolean;
   is_oidc: boolean;
+  is_dual_auth?: boolean;
   password_hash?: string;
   data_unlocked?: boolean;
   show_donation_modal?: boolean;
+}
+
+export interface RemoteSyncUserInfo extends UserInfo {
+  roles: UserRole[];
 }
 
 interface UserCount {
@@ -365,8 +396,7 @@ export function isCurrentAuthInvalidationError(error: unknown): boolean {
   const axiosError = error as AxiosError;
   const apiError = error as ApiError;
   const responseData = axiosError.response?.data as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
   const errorCode = responseData?.code || apiError.code;
   const errorMessage = responseData?.error || apiError.message;
   const status = axiosError.response?.status || apiError.status;
@@ -395,7 +425,7 @@ function createApiInstance(
     withCredentials: true,
   });
 
-  instance.interceptors.request.use((config: AxiosRequestConfig) => {
+  instance.interceptors.request.use((config: InternalAxiosRequestConfig) => {
     const startTime = performance.now();
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -420,6 +450,15 @@ function createApiInstance(
 
     if (isDevMode) {
       logger.requestStart(method, fullUrl, context);
+    }
+
+    const deviceId = getDeviceId();
+    if (deviceId) {
+      if (config.headers.set) {
+        config.headers.set("X-Termix-Device-ID", deviceId);
+      } else {
+        config.headers["X-Termix-Device-ID"] = deviceId;
+      }
     }
 
     if (isElectron()) {
@@ -614,8 +653,7 @@ function createApiInstance(
           userWasAuthenticated = false;
         }
       } else if (!isSilentRetry) {
-        const wasAuthenticated = userWasAuthenticated;
-        dbHealthMonitor.reportDatabaseError(error, wasAuthenticated);
+        dbHealthMonitor.reportDatabaseError(error);
       }
 
       return Promise.reject(error);
@@ -644,9 +682,11 @@ function isDev(): boolean {
   );
 }
 
-const apiHost = import.meta.env.VITE_API_HOST || "localhost";
+const apiHost =
+  import.meta.env.VITE_API_HOST ||
+  (typeof window !== "undefined" ? window.location.hostname : "localhost");
 
-interface AxiosRequestConfigExtended extends AxiosRequestConfig {
+interface AxiosRequestConfigExtended extends InternalAxiosRequestConfig {
   startTime?: number;
   requestId?: string;
   __silentRetry?: boolean;
@@ -656,7 +696,7 @@ interface AxiosErrorExtended extends AxiosError {
   config?: AxiosRequestConfigExtended;
 }
 
-export async function checkElectronUpdate(): Promise<{
+export interface ElectronUpdateCheckResult {
   success: boolean;
   status?: "up_to_date" | "requires_update" | "beta";
   localVersion?: string;
@@ -671,19 +711,22 @@ export async function checkElectronUpdate(): Promise<{
   cached?: boolean;
   cache_age?: number;
   error?: string;
-}> {
+}
+
+export async function checkElectronUpdate(): Promise<ElectronUpdateCheckResult> {
   if (!isElectron())
     return { success: false, error: "Not in Electron environment" };
 
   try {
-    const result = await (
+    const result = (await (
       window as Window &
         typeof globalThis & {
           IS_ELECTRON?: boolean;
-          electronAPI?: unknown;
+          electronAPI?: { invoke?: (channel: string) => Promise<unknown> };
         }
-    ).electronAPI?.invoke("check-electron-update");
-    return result;
+    ).electronAPI?.invoke?.("check-electron-update")) as
+      ElectronUpdateCheckResult | undefined;
+    return result ?? { success: false, error: "Update check failed" };
   } catch (error) {
     console.error("Failed to check Electron update:", error);
     return { success: false, error: "Update check failed" };
@@ -701,6 +744,9 @@ function getApiUrl(path: string, defaultPort: number): string {
     // remote-sync-axios.ts), not by these shared instances.
     return `http://localhost:${defaultPort}${path}`;
   } else if (devMode) {
+    if (!import.meta.env.VITE_API_HOST) {
+      return `/__termix_api/${defaultPort}${path}`;
+    }
     const protocol = window.location.protocol === "https:" ? "https" : "http";
     const sslPort = protocol === "https" ? 8443 : defaultPort;
     const url = `${protocol}://${apiHost}:${sslPort}${path}`;
@@ -731,31 +777,34 @@ function createRemoteOriginApiInstance(path: string): AxiosInstance {
     timeout: 30000,
   });
 
-  instance.interceptors.request.use(async (config: AxiosRequestConfig) => {
-    const [remoteConfig, remoteJwt] = await Promise.all([
-      window.electronAPI?.invoke?.("get-remote-sync-config") as Promise<{
-        serverUrl?: string;
-      } | null>,
-      window.electronAPI?.invoke?.("get-remote-sync-jwt") as Promise<
-        string | null
-      >,
-    ]);
+  instance.interceptors.request.use(
+    async (config: InternalAxiosRequestConfig) => {
+      const [remoteConfig, remoteJwt] = await Promise.all([
+        window.electronAPI?.invoke?.("get-remote-sync-config") as Promise<{
+          serverUrl?: string;
+        } | null>,
+        window.electronAPI?.invoke?.("get-remote-sync-jwt") as Promise<
+          string | null
+        >,
+      ]);
 
-    const baseUrl = (remoteConfig?.serverUrl || "").replace(/\/$/, "");
-    config.baseURL = baseUrl
-      ? `${baseUrl}${path}`
-      : "http://no-server-configured";
+      const baseUrl = (remoteConfig?.serverUrl || "").replace(/\/$/, "");
+      config.baseURL = baseUrl
+        ? `${baseUrl}${path}`
+        : "http://no-server-configured";
 
-    if (config.headers.set) {
-      config.headers.set("X-Electron-App", "true");
-      if (remoteJwt) config.headers.set("Authorization", `Bearer ${remoteJwt}`);
-    } else {
-      config.headers["X-Electron-App"] = "true";
-      if (remoteJwt) config.headers["Authorization"] = `Bearer ${remoteJwt}`;
-    }
+      if (config.headers.set) {
+        config.headers.set("X-Electron-App", "true");
+        if (remoteJwt)
+          config.headers.set("Authorization", `Bearer ${remoteJwt}`);
+      } else {
+        config.headers["X-Electron-App"] = "true";
+        if (remoteJwt) config.headers["Authorization"] = `Bearer ${remoteJwt}`;
+      }
 
-    return config;
-  });
+      return config;
+    },
+  );
 
   return instance;
 }
@@ -763,6 +812,7 @@ function createRemoteOriginApiInstance(path: string): AxiosInstance {
 let remoteFileManagerApi: AxiosInstance | null = null;
 let remoteTunnelApi: AxiosInstance | null = null;
 let remoteStatsApi: AxiosInstance | null = null;
+let remoteGuacamoleApi: AxiosInstance | null = null;
 
 export function getRemoteFileManagerApi(): AxiosInstance {
   if (!remoteFileManagerApi) {
@@ -783,6 +833,13 @@ export function getRemoteStatsApi(): AxiosInstance {
     remoteStatsApi = createRemoteOriginApiInstance("");
   }
   return remoteStatsApi;
+}
+
+export function getRemoteGuacamoleApi(): AxiosInstance {
+  if (!remoteGuacamoleApi) {
+    remoteGuacamoleApi = createRemoteOriginApiInstance("");
+  }
+  return remoteGuacamoleApi;
 }
 
 // Maps a live SSH session (keyed by sessionId, which today is the host's
@@ -1045,7 +1102,7 @@ export function handleApiError(error: unknown, operation: string): never {
     throw error;
   }
 
-  const errorMessage = error instanceof Error ? error.message : "Unknown error";
+  const errorMessage = getErrorMessage(error);
   apiLogger.error(
     `Unexpected error during ${operation}: ${errorMessage}`,
     error,
@@ -1116,6 +1173,9 @@ export interface TransferTimings {
   compressMs?: number;
   transferMs?: number;
   extractMs?: number;
+  verifyMs?: number;
+  directBenchmarkMs?: number;
+  relayBenchmarkMs?: number;
   sourceDeleteMs?: number;
   totalMs?: number;
   transferBytes?: number;
@@ -1219,14 +1279,20 @@ export function createTransferProgressTracker(): TransferProgressTracker {
 export interface TransferProgressResponse {
   transferId: string;
   status: "running" | "success" | "partial" | "error" | "cancelled";
-  phase: "compressing" | "transferring" | "extracting" | "reconnecting";
+  phase:
+    | "compressing"
+    | "transferring"
+    | "benchmarking"
+    | "verifying"
+    | "extracting"
+    | "reconnecting";
   bytesTransferred?: number;
   totalBytes?: number;
   itemsCompleted?: number;
   totalItems?: number;
   failedPaths?: string[];
   message?: string;
-  method?: "stream" | "tar" | "item_sftp";
+  method?: "stream" | "tar" | "item_sftp" | "direct_rsync";
   sourcePaths?: string[];
   destPath?: string;
   sourceSessionId?: string;
@@ -1238,6 +1304,7 @@ export interface TransferProgressResponse {
   partialDestRemaining?: boolean;
   cleanupCompleted?: boolean;
   retryable?: boolean;
+  integrityVerified?: boolean;
   parallelSegmentCount?: number;
 }
 
@@ -1248,7 +1315,7 @@ export async function transferToHost(
   destPath: string,
   move?: boolean,
   methodPreference?: TransferMethodPreference,
-  parallelSegmentCount = 2,
+  parallelSegmentCount?: number,
 ): Promise<{ transferId: string }> {
   try {
     fileLogger.info("Starting host transfer", {
@@ -1438,8 +1505,10 @@ export {
   bulkImportSSHHosts,
   importSSHConfigHosts,
   discoverProxmoxGuests,
+  discoverProxmoxGuestsStream,
   syncProxmoxGuests,
   bulkUpdateSSHHosts,
+  reorderSSHHosts,
   deleteSSHHost,
   getSSHHostById,
   exportSSHHostWithCredentials,
@@ -1545,6 +1614,28 @@ export {
 } from "@/api/host-metrics-api";
 
 export {
+  getProxmoxStats,
+  startProxmoxStatsPolling,
+  stopProxmoxStatsPolling,
+  sendProxmoxStatsHeartbeat,
+  getProxmoxStatsHistory,
+  type ProxmoxStatsHistoryRow,
+  type ProxmoxStatsHistoryResponse,
+} from "@/api/proxmox-stats-api";
+
+export {
+  getHostSidebarPreferences,
+  saveHostSidebarPreferences,
+} from "@/api/host-sidebar-preferences-api";
+
+export {
+  getCredentialSidebarPreferences,
+  saveCredentialSidebarPreferences,
+} from "@/api/credential-sidebar-preferences-api";
+
+export { getUiPreferences, saveUiPreferences } from "@/api/ui-preferences-api";
+
+export {
   getGlobalMonitoringSettings,
   updateGlobalMonitoringSettings,
   getLogLevel,
@@ -1625,6 +1716,20 @@ export async function loginUser(
   }
 }
 
+export async function requestTrustedProxyLogin(): Promise<{
+  enabled: boolean;
+  success?: boolean;
+  username?: string;
+  userId?: string;
+  is_admin?: boolean;
+  token?: string;
+}> {
+  const response = await authApi.post("/users/proxy-login");
+  if (response.data.token) localStorage.setItem("jwt", response.data.token);
+  if (response.data.success) markUserAuthenticated();
+  return response.data;
+}
+
 export async function logoutUser(): Promise<{
   success: boolean;
   message: string;
@@ -1681,6 +1786,18 @@ export async function getUserInfo(): Promise<UserInfo> {
   }
 }
 
+export async function getRemoteSyncUserInfo(): Promise<RemoteSyncUserInfo | null> {
+  if (!isElectron()) return null;
+  try {
+    // ?? null so a missing preload bridge matches the declared return type
+    // rather than resolving to undefined.
+    return ((await window.electronAPI?.invoke?.("get-remote-sync-user-info")) ??
+      null) as RemoteSyncUserInfo | null;
+  } catch {
+    return null;
+  }
+}
+
 export async function dismissDonationModal(): Promise<void> {
   try {
     await authApi.post("/users/me/dismiss-donation-modal");
@@ -1732,9 +1849,10 @@ export async function getOIDCConfig(): Promise<Record<string, unknown>> {
     const response = await authApi.get("/users/oidc-config");
     return response.data;
   } catch (error: unknown) {
+    const httpError = asHttpError(error);
     console.warn(
       "Failed to fetch OIDC config:",
-      error.response?.data?.error || error.message,
+      httpError.response?.data?.error || httpError.message,
     );
     return null;
   }
@@ -1963,6 +2081,7 @@ export {
   dismissAlert,
   getReleasesRSS,
   getVersionInfo,
+  releaseUrlFrom,
   getDatabaseHealth,
 } from "@/api/system-status-api";
 
@@ -1986,8 +2105,10 @@ export {
   renameFolder,
   getSSHFolders,
   updateFolderMetadata,
+  reorderFolders,
   deleteAllHostsInFolder,
   renameCredentialFolder,
+  reorderCredentials,
   detectKeyType,
   detectPublicKeyType,
   validateKeyPair,
@@ -2087,6 +2208,8 @@ export {
   updateHostAccess,
   getHostAccess,
   revokeHostAccess,
+  getHostAuthOverride,
+  setHostAuthOverride,
   getPermissionsCatalog,
   getSharedHosts,
   shareSnippet,

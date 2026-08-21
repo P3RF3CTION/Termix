@@ -14,17 +14,7 @@
 const { app, safeStorage } = require("electron");
 const fs = require("fs");
 const path = require("path");
-
-const SYNCED_ENTITY_TYPES = [
-  "hosts",
-  "sshCredentials",
-  "sshFolders",
-  "snippets",
-  "snippetFolders",
-  "vaultProfiles",
-  "dashboardServiceLinks",
-  "homepageItems",
-];
+const { SYNCED_ENTITY_TYPES } = require("./remote-sync-entities.cjs");
 
 const SYNC_INTERVAL_MS = 90 * 1000;
 const EMBEDDED_BASE_URL = "http://127.0.0.1:30001";
@@ -106,7 +96,15 @@ function getSafeStorageAvailable() {
 
 function saveRemoteSyncJwt(token) {
   if (!getSafeStorageAvailable()) {
-    return { success: false, error: "Encryption unavailable on this system" };
+    // Carries a stable reason alongside the message: the renderer has a
+    // translated explanation for this one, because "no OS keyring" is a
+    // machine-level problem the user has to go and fix, not something signing
+    // in again can resolve.
+    return {
+      success: false,
+      reason: "encryption_unavailable",
+      error: "Encryption unavailable on this system",
+    };
   }
   writeJson(getRemoteSyncCredentialPath(), {
     encrypted: true,
@@ -133,6 +131,41 @@ function clearRemoteSyncJwt() {
     // already absent
   }
   return { success: true };
+}
+
+async function getRemoteSyncUserInfo() {
+  const config = getRemoteSyncConfig();
+  const token = getRemoteSyncJwt();
+  if (!config?.serverUrl || !token || isJwtExpiredOrExpiringSoon(token)) {
+    return null;
+  }
+
+  const baseUrl = config.serverUrl.replace(/\/$/, "");
+  const userResponse = await fetch(`${baseUrl}/users/me`, {
+    headers: { Authorization: `Bearer ${token}`, "X-Electron-App": "true" },
+  });
+  if (!userResponse.ok) return null;
+
+  const user = await userResponse.json();
+  const rolesResponse = await fetch(
+    `${baseUrl}/rbac/users/${encodeURIComponent(user.userId)}/roles`,
+    {
+      headers: { Authorization: `Bearer ${token}`, "X-Electron-App": "true" },
+    },
+  );
+  const roles = rolesResponse.ok
+    ? (await rolesResponse.json()).roles || []
+    : [];
+
+  return {
+    userId: user.userId,
+    username: user.username,
+    is_admin: !!user.is_admin,
+    is_oidc: !!user.is_oidc,
+    is_dual_auth: !!user.is_dual_auth,
+    totp_enabled: !!user.totp_enabled,
+    roles,
+  };
 }
 
 function decodeJwtExpiry(token) {
@@ -354,7 +387,7 @@ class RemoteSyncEngine {
       text.includes("<body>");
     if (looksLikeHtml) {
       const err = new Error(
-        "The reverse proxy in front of this server is blocking sync traffic with its own login page. Reconnecting won't fix this -- the proxy needs to let Termix's API requests through (e.g. an SSO bypass rule for the sync API, or a non-proxied hostname/port for it).",
+        "The reverse proxy in front of this server is blocking sync traffic with its own login page. Reconnecting won't fix this. The proxy needs to let Termix's API requests through (e.g. an SSO bypass rule for the sync API, or a non-proxied hostname/port for it).",
       );
       err.proxyBlocked = true;
       throw err;
@@ -371,6 +404,15 @@ class RemoteSyncEngine {
     const url = `${baseUrl}/sync/${entityType}${since ? `?since=${encodeURIComponent(since)}` : ""}`;
     const data = await this.fetchJson(url, token);
     return data.rows || [];
+  }
+
+  /**
+   * Every syncId a side currently holds, ignoring the incremental window.
+   * Used only to decide whether a deletion still has something to delete.
+   */
+  async pullSyncIds(baseUrl, token, entityType) {
+    const rows = await this.pullSide(baseUrl, token, entityType, null);
+    return new Set(rows.filter((row) => row.syncId).map((row) => row.syncId));
   }
 
   async pullTombstones(baseUrl, token, entityType, since) {
@@ -457,24 +499,46 @@ class RemoteSyncEngine {
       }
 
       // Apply tombstones to whichever side hasn't already deleted the row.
-      for (const tombstone of localTombstones) {
-        if (remoteBySyncId.has(tombstone.syncId)) {
-          await this.pushTombstone(
-            remoteBaseUrl,
-            remoteJwt,
-            entityType,
-            tombstone.syncId,
-          );
+      //
+      // The presence check cannot use localRows/remoteRows: those are the
+      // incremental window, and a row deleted on one side while untouched on
+      // the other is by definition outside it, so every deletion was dropped.
+      // It also cannot be skipped -- pushing unconditionally makes the
+      // receiving side record a fresh tombstone, which the next pass would push
+      // back, forever. So ask the receiving side what it actually still holds,
+      // and only when there is a deletion to apply.
+      if (localTombstones.length) {
+        const remoteSyncIds = await this.pullSyncIds(
+          remoteBaseUrl,
+          remoteJwt,
+          entityType,
+        );
+        for (const tombstone of localTombstones) {
+          if (remoteSyncIds.has(tombstone.syncId)) {
+            await this.pushTombstone(
+              remoteBaseUrl,
+              remoteJwt,
+              entityType,
+              tombstone.syncId,
+            );
+          }
         }
       }
-      for (const tombstone of remoteTombstones) {
-        if (localBySyncId.has(tombstone.syncId)) {
-          await this.pushTombstone(
-            EMBEDDED_BASE_URL,
-            this.localJwt,
-            entityType,
-            tombstone.syncId,
-          );
+      if (remoteTombstones.length) {
+        const localSyncIds = await this.pullSyncIds(
+          EMBEDDED_BASE_URL,
+          this.localJwt,
+          entityType,
+        );
+        for (const tombstone of remoteTombstones) {
+          if (localSyncIds.has(tombstone.syncId)) {
+            await this.pushTombstone(
+              EMBEDDED_BASE_URL,
+              this.localJwt,
+              entityType,
+              tombstone.syncId,
+            );
+          }
         }
       }
 
@@ -511,6 +575,7 @@ module.exports = {
   saveRemoteSyncJwt,
   getRemoteSyncJwt,
   clearRemoteSyncJwt,
+  getRemoteSyncUserInfo,
   isJwtExpiredOrExpiringSoon,
   decodeJwtExpiry,
 };

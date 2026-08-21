@@ -678,6 +678,7 @@ export function HostEditorRdpTab({
               <option>de-de-qwertz</option>
               <option>de-ch-qwertz</option>
               <option>fr-fr-azerty</option>
+              <option>fr-be-azerty</option>
               <option>it-it-qwerty</option>
               <option>sv-se-qwerty</option>
               <option>ja-jp-qwerty</option>
@@ -859,26 +860,6 @@ export function HostEditorRdpTab({
         }
       >
         <div className="flex flex-col gap-4 py-3">
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {t("hosts.guac.recordingPath")}
-            </label>
-            <Input
-              placeholder="/var/lib/termix/recordings"
-              value={form.guacamoleConfig["recording-path"] ?? ""}
-              onChange={(e) => setGuacField("recording-path", e.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {t("hosts.guac.recordingName")}
-            </label>
-            <Input
-              placeholder="${GUAC_USERNAME}-${GUAC_DATE}-${GUAC_TIME}"
-              value={form.guacamoleConfig["recording-name"] ?? ""}
-              onChange={(e) => setGuacField("recording-name", e.target.value)}
-            />
-          </div>
           <SettingRow
             label={t("hosts.guac.createPathIfMissing")}
             description={t("hosts.guac.createPathIfMissingDesc")}
@@ -1335,6 +1316,7 @@ export function HostEditorVncTab({
               <option>de-de-qwertz</option>
               <option>de-ch-qwertz</option>
               <option>fr-fr-azerty</option>
+              <option>fr-be-azerty</option>
               <option>it-it-qwerty</option>
               <option>sv-se-qwerty</option>
               <option>ja-jp-qwerty</option>
@@ -1418,26 +1400,6 @@ export function HostEditorVncTab({
         }
       >
         <div className="flex flex-col gap-4 py-3">
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {t("hosts.guac.recordingPath")}
-            </label>
-            <Input
-              placeholder="/var/lib/termix/recordings"
-              value={form.guacamoleConfig["recording-path"] ?? ""}
-              onChange={(e) => setGuacField("recording-path", e.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {t("hosts.guac.recordingName")}
-            </label>
-            <Input
-              placeholder="${GUAC_USERNAME}-${GUAC_DATE}-${GUAC_TIME}"
-              value={form.guacamoleConfig["recording-name"] ?? ""}
-              onChange={(e) => setGuacField("recording-name", e.target.value)}
-            />
-          </div>
           <SettingRow
             label={t("hosts.guac.createPathIfMissing")}
             description={t("hosts.guac.createPathIfMissingDesc")}
@@ -1889,26 +1851,6 @@ export function HostEditorTelnetTab({
         }
       >
         <div className="flex flex-col gap-4 py-3">
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {t("hosts.guac.recordingPath")}
-            </label>
-            <Input
-              placeholder="/var/lib/termix/recordings"
-              value={form.guacamoleConfig["recording-path"] ?? ""}
-              onChange={(e) => setGuacField("recording-path", e.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {t("hosts.guac.recordingName")}
-            </label>
-            <Input
-              placeholder="${GUAC_USERNAME}-${GUAC_DATE}-${GUAC_TIME}"
-              value={form.guacamoleConfig["recording-name"] ?? ""}
-              onChange={(e) => setGuacField("recording-name", e.target.value)}
-            />
-          </div>
           <SettingRow
             label={t("hosts.guac.createPathIfMissing")}
             description={t("hosts.guac.createPathIfMissingDesc")}

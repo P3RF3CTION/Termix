@@ -1,12 +1,16 @@
 import GuacamoleLite from "guacamole-lite";
 import { guacLogger } from "../../utils/logger.js";
-import { GuacamoleTokenService } from "./token-service.js";
-import { getCurrentSettingValue } from "../../database/repositories/factory.js";
+import {
+  GuacamoleTokenService,
+  type GuacamoleRecordingMetadata,
+} from "./token-service.js";
+import {
+  createCurrentSessionRecordingRepository,
+  getCurrentSettingValue,
+} from "../../database/repositories/factory.js";
 import { resolveGuacdOptions } from "../../utils/guacd-config.js";
 import fs from "fs";
 import path from "path";
-import { createCurrentSessionRecordingRepository } from "../../database/repositories/factory.js";
-import type { GuacamoleRecordingMetadata } from "./token-service.js";
 
 const tokenService = GuacamoleTokenService.getInstance();
 
@@ -104,10 +108,16 @@ async function persistGuacamoleRecording(
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   if (!fs.existsSync(resolvedPath)) {
+    const guacdPath = recording.guacdPath ?? GUACAMOLE_RECORDINGS_DIR;
     guacLogger.warn("Guacamole recording file was not found", {
       operation: "guac_recording_missing",
       hostId: recording.hostId,
       path: resolvedPath,
+      guacdPath,
+      hint:
+        "guacd writes the recording to guacdPath, the backend reads it from path. " +
+        "When guacd runs in its own container these must be the same volume — set " +
+        "GUACD_RECORDING_PATH to guacd's mount point and GUACD_RECORDING_BACKEND_PATH to this one.",
     });
     return;
   }
@@ -172,6 +182,11 @@ const clientOptions = {
       cursor: "remote",
       width: 1280,
       height: 720,
+      // macOS Screen Sharing negotiates its VNC security type over several
+      // round trips (RFB type 30 -> 33/36/2/35) and can fail the first
+      // attempt; retrying lets guacd's VNC client re-establish instead of
+      // guacd giving up immediately (Support#1063).
+      autoretry: 2,
     },
     telnet: {
       "terminal-type": "xterm-256color",

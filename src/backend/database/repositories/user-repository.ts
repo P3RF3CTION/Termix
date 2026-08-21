@@ -1,6 +1,12 @@
-import { eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray, like, sql } from "drizzle-orm";
 import { users } from "../db/schema.js";
 import type { DatabaseContext } from "./database-context.js";
+import {
+  countValue,
+  rowsAffected,
+  supportsReturning,
+} from "./mutation-result.js";
+import { insertReturning, updateReturning } from "./returning.js";
 
 export type UserRecord = typeof users.$inferSelect;
 export type NewUserRecord = typeof users.$inferInsert;
@@ -15,6 +21,42 @@ export class UserRepository {
 
   async listAll(): Promise<UserRecord[]> {
     return this.context.drizzle.select().from(users);
+  }
+
+  /**
+   * One page of users, optionally filtered by username.
+   *
+   * The admin panel used to render every account at once, which is fine at
+   * home and not fine on a directory-backed install with thousands of them.
+   * Sorted by username so paging is stable between requests.
+   */
+  async listPage(input: {
+    search?: string;
+    limit: number;
+    offset: number;
+  }): Promise<{ users: UserRecord[]; total: number }> {
+    const term = input.search?.trim();
+    const where = term
+      ? like(sql`lower(${users.username})`, `%${term.toLowerCase()}%`)
+      : undefined;
+
+    const [rows, totalResult] = await Promise.all([
+      this.context.drizzle
+        .select()
+        .from(users)
+        .where(where)
+        // Case-insensitive: a plain sort puts every capitalised name ahead of
+        // every lowercase one, which reads as unordered in the admin list.
+        .orderBy(asc(sql`lower(${users.username})`))
+        .limit(input.limit)
+        .offset(input.offset),
+      this.context.drizzle
+        .select({ count: sql<number>`COUNT(*)` })
+        .from(users)
+        .where(where),
+    ]);
+
+    return { users: rows, total: countValue(totalResult[0]?.count) };
   }
 
   async findById(id: string): Promise<UserRecord | null> {
@@ -62,10 +104,7 @@ export class UserRepository {
   }
 
   async create(user: NewUserRecord): Promise<UserRecord> {
-    const rows = await this.context.drizzle
-      .insert(users)
-      .values(user)
-      .returning();
+    const rows = await insertReturning(this.context, users, user);
     await this.afterWrite();
     return rows[0];
   }
@@ -73,17 +112,10 @@ export class UserRepository {
   async createFirstLocalUser(
     user: NewFirstLocalUserRecord,
   ): Promise<{ user: UserRecord; isFirstUser: boolean }> {
-    const result = this.context.drizzle.transaction((tx) => {
-      const existingUsers = tx.select({ id: users.id }).from(users).all();
-      const isFirstUser = existingUsers.length === 0;
-      const rows = tx
-        .insert(users)
-        .values({ ...user, isAdmin: isFirstUser })
-        .returning()
-        .all();
-
-      return { user: rows[0], isFirstUser };
-    });
+    const result = await this.createCheckingIfFirst((isFirstUser) => ({
+      ...user,
+      isAdmin: isFirstUser,
+    }));
 
     await this.afterWrite();
     return result;
@@ -92,41 +124,87 @@ export class UserRepository {
   async createFirstSsoUser(
     user: NewUserRecord,
   ): Promise<{ user: UserRecord; isFirstUser: boolean }> {
-    const result = this.context.drizzle.transaction((tx) => {
-      const existingUsers = tx.select({ id: users.id }).from(users).all();
-      const isFirstUser = existingUsers.length === 0;
-      const rows = tx
-        .insert(users)
-        .values({ ...user, isAdmin: isFirstUser || Boolean(user.isAdmin) })
-        .returning()
-        .all();
-
-      return { user: rows[0], isFirstUser };
-    });
+    const result = await this.createCheckingIfFirst((isFirstUser) => ({
+      ...user,
+      isAdmin: isFirstUser || Boolean(user.isAdmin),
+    }));
 
     await this.afterWrite();
     return result;
   }
 
+  /**
+   * Creates a user, making them an admin if the table was empty.
+   *
+   * The check and the insert have to be one transaction: two people signing up
+   * at once would otherwise both see an empty table and both become admin.
+   *
+   * The two branches are not a style choice. better-sqlite3 is synchronous and
+   * rejects an async transaction callback outright — "Transaction function
+   * cannot return a promise" — so a single body cannot serve both. It fails
+   * loudly rather than silently skipping the write, which is the one mercy here.
+   */
+  private async createCheckingIfFirst(
+    build: (isFirstUser: boolean) => NewUserRecord,
+  ): Promise<{ user: UserRecord; isFirstUser: boolean }> {
+    if (this.context.dialect === "sqlite") {
+      /* eslint-disable no-restricted-syntax -- sqlite-only branch: the dialect
+         is checked directly above, and better-sqlite3 rejects an async
+         transaction callback, so this cannot use the shared helpers. */
+      return this.context.drizzle.transaction((tx) => {
+        const isFirstUser =
+          tx.select({ id: users.id }).from(users).all().length === 0;
+        const rows = tx
+          .insert(users)
+          .values(build(isFirstUser))
+          .returning()
+          .all();
+        return { user: rows[0], isFirstUser };
+      });
+      /* eslint-enable no-restricted-syntax */
+    }
+
+    return this.context.drizzle.transaction(async (tx) => {
+      const existing = await tx.select({ id: users.id }).from(users);
+      const isFirstUser = existing.length === 0;
+      const values = build(isFirstUser);
+
+      if (supportsReturning(this.context.dialect)) {
+        // eslint-disable-next-line no-restricted-syntax -- guarded by the check on this line
+        const rows = await tx.insert(users).values(values).returning();
+        return { user: rows[0], isFirstUser };
+      }
+
+      // users is keyed by a text id the caller supplies, so there is something
+      // to read back by even without RETURNING.
+      await tx.insert(users).values(values);
+      const [user] = await tx
+        .select()
+        .from(users)
+        .where(eq(users.id, values.id));
+      return { user, isFirstUser };
+    });
+  }
+
   async update(id: string, update: UserUpdate): Promise<UserRecord | null> {
-    const rows = await this.context.drizzle
-      .update(users)
-      .set(update)
-      .where(eq(users.id, id))
-      .returning();
+    const rows = await updateReturning(
+      this.context,
+      users,
+      update,
+      eq(users.id, id),
+    );
 
     await this.afterWrite();
     return rows[0] ?? null;
   }
 
   async delete(id: string): Promise<boolean> {
-    const rows = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(users)
-      .where(eq(users.id, id))
-      .returning({ id: users.id });
+      .where(eq(users.id, id));
 
     await this.afterWrite();
-    return rows.length > 0;
+    return rowsAffected(result) > 0;
   }
 
   async countAdmins(): Promise<number> {

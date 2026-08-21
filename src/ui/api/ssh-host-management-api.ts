@@ -12,6 +12,11 @@ import {
   getCachedSSHHosts,
   invalidateHostsAndStatusCaches,
 } from "@/lib/hosts-request-cache";
+import { requestRemoteSync } from "@/lib/remote-sync-trigger";
+import {
+  getConnectedRemoteApi,
+  markRemoteSharedHosts,
+} from "@/lib/remote-server-api";
 
 // SSH HOST MANAGEMENT
 // ============================================================================
@@ -23,7 +28,22 @@ export type GetSSHHostsOptions = {
 
 async function loadSSHHostsFromApi(): Promise<SSHHost[]> {
   const hostsResponse = await sshHostApi.get("/db/host");
-  return Array.isArray(hostsResponse.data) ? hostsResponse.data : [];
+  const localHosts = Array.isArray(hostsResponse.data)
+    ? hostsResponse.data
+    : [];
+  const remoteApi = await getConnectedRemoteApi();
+  if (!remoteApi) return localHosts;
+
+  try {
+    const remoteResponse = await remoteApi.get("/host/db/host");
+    const remoteSharedHosts = Array.isArray(remoteResponse.data)
+      ? markRemoteSharedHosts(remoteResponse.data)
+      : [];
+    return [...localHosts, ...remoteSharedHosts];
+  } catch {
+    // Keep the last locally synced host set usable while the server is offline.
+    return localHosts;
+  }
 }
 
 export async function getSSHHosts(
@@ -68,10 +88,12 @@ export async function createSSHHost(hostData: SSHHostData): Promise<SSHHost> {
         headers: { "Content-Type": "multipart/form-data" },
       });
       invalidateHostsAndStatusCaches();
+      void requestRemoteSync();
       return response.data;
     }
     const response = await sshHostApi.post("/db/host", hostData);
     invalidateHostsAndStatusCaches();
+    void requestRemoteSync();
     return response.data;
   } catch (error) {
     throw handleApiError(error, "create SSH host");
@@ -92,10 +114,12 @@ export async function updateSSHHost(
         headers: { "Content-Type": "multipart/form-data" },
       });
       invalidateHostsAndStatusCaches();
+      void requestRemoteSync();
       return response.data;
     }
     const response = await sshHostApi.put(`/db/host/${hostId}`, hostData);
     invalidateHostsAndStatusCaches();
+    void requestRemoteSync();
     return response.data;
   } catch (error) {
     throw handleApiError(error, "update SSH host");
@@ -174,6 +198,60 @@ export async function discoverProxmoxGuests(
   }
 }
 
+export function discoverProxmoxGuestsStream(
+  hostId: number,
+  handlers: {
+    onProgress?: (done: number, total: number) => void;
+    onResult: (result: ProxmoxDiscoverResult) => void;
+    onError: (message: string) => void;
+  },
+): () => void {
+  const baseURL = (authApi.defaults.baseURL || "").replace(/\/$/, "");
+  const source = new EventSource(
+    `${baseURL}/proxmox/discover/stream?hostId=${encodeURIComponent(
+      String(hostId),
+    )}`,
+    { withCredentials: true },
+  );
+  let settled = false;
+  const close = () => {
+    settled = true;
+    source.close();
+  };
+  source.addEventListener("progress", (event) => {
+    try {
+      const data = JSON.parse((event as MessageEvent).data);
+      handlers.onProgress?.(data.done, data.total);
+    } catch {
+      // ignore malformed progress frames
+    }
+  });
+  source.addEventListener("result", (event) => {
+    close();
+    try {
+      handlers.onResult(JSON.parse((event as MessageEvent).data));
+    } catch {
+      handlers.onError("Failed to parse discovery result");
+    }
+  });
+  source.addEventListener("fail", (event) => {
+    close();
+    let message = "Discovery failed";
+    try {
+      message = JSON.parse((event as MessageEvent).data).message || message;
+    } catch {
+      // keep default message
+    }
+    handlers.onError(message);
+  });
+  source.onerror = () => {
+    if (settled) return;
+    close();
+    handlers.onError("Discovery connection lost");
+  };
+  return close;
+}
+
 export async function syncProxmoxGuests(
   hostId: number,
 ): Promise<ProxmoxSyncResult> {
@@ -205,12 +283,25 @@ export async function bulkUpdateSSHHosts(
   }
 }
 
+export async function reorderSSHHosts(
+  positions: { id: number; sortOrder: number }[],
+): Promise<{ updated: number }> {
+  try {
+    const response = await sshHostApi.put("/reorder", { positions });
+    invalidateHostsAndStatusCaches();
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "reorder SSH hosts");
+  }
+}
+
 export async function deleteSSHHost(
   hostId: number,
 ): Promise<Record<string, unknown>> {
   try {
     const response = await sshHostApi.delete(`/db/host/${hostId}`);
     invalidateHostsAndStatusCaches();
+    void requestRemoteSync();
     return response.data;
   } catch (error) {
     handleApiError(error, "delete SSH host");

@@ -35,7 +35,9 @@ export type WidgetTypeId =
   | "service_grid"
   | "dashboard_links"
   | "search_links"
-  | "link_tree";
+  | "link_tree"
+  | "docker_activity"
+  | "ssh_quick_connect";
 
 export interface HomepageItemRow {
   id: number;
@@ -108,13 +110,7 @@ export interface NotesConfig {
 }
 
 export type HostMetricKey =
-  | "cpu"
-  | "memory"
-  | "disk"
-  | "uptime"
-  | "network"
-  | "system"
-  | "processes";
+  "cpu" | "memory" | "disk" | "uptime" | "network" | "system" | "processes";
 
 export interface HostStatusConfig {
   hostId: number;
@@ -155,11 +151,7 @@ export interface RssFeedConfig {
 // ---- New widget configs ----
 
 export type MetricsChartMetric =
-  | "cpu"
-  | "memory"
-  | "disk"
-  | "net_rx"
-  | "net_tx";
+  "cpu" | "memory" | "disk" | "net_rx" | "net_tx";
 export type MetricsChartRange = "15m" | "1h" | "6h" | "24h";
 
 export interface MetricsChartConfig {
@@ -192,18 +184,24 @@ export interface PingStatusConfig {
 }
 
 export type ActivityType =
-  | "terminal"
-  | "file_manager"
-  | "docker"
-  | "tunnel"
-  | "rdp"
-  | "vnc"
-  | "telnet";
+  "terminal" | "file_manager" | "docker" | "tunnel" | "rdp" | "vnc" | "telnet";
 
 export interface RecentActivityConfig {
   maxItems: number;
   filterTypes: ActivityType[];
   showTimestamp: boolean;
+}
+
+export interface DockerActivityConfig {
+  maxItems: number;
+  showHostName: boolean;
+}
+
+export interface SshQuickConnectConfig {
+  hostIds: number[];
+  connectionType: QuickConnectType;
+  showStatus: boolean;
+  layout: "grid" | "list";
 }
 
 export interface TermixUptimeConfig {

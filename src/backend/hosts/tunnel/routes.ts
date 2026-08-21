@@ -1,3 +1,4 @@
+import { getErrorMessage } from "../../utils/error-message.js";
 import express, { type Response } from "express";
 
 import axios from "axios";
@@ -7,6 +8,11 @@ import type {
   AuthenticatedRequest,
 } from "../../../types/index.js";
 import { CONNECTION_STATES } from "../../../types/index.js";
+import {
+  logAudit,
+  getAuditUsername,
+  getRequestMeta,
+} from "../../utils/audit-logger.js";
 import { tunnelLogger } from "../../utils/logger.js";
 import { SystemCrypto } from "../../utils/system-crypto.js";
 import { AuthManager } from "../../utils/auth-manager.js";
@@ -30,7 +36,8 @@ import {
   handleDisconnect,
   sendTunnelStatusSnapshot,
   isSingleHostTunnel,
-  getAllTunnelStatus,
+  getTunnelStatusForUser,
+  canAccessTunnel,
   findHostByTunnelEndpoint,
   connectSSHTunnel,
 } from "./manager.js";
@@ -44,12 +51,12 @@ export function registerTunnelRoutes(app: express.Express): void {
   app.get(
     "/ssh/tunnel/status",
     authenticateJWT,
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       if (!req.userId) {
         return res.status(401).json({ error: "Authentication required" });
       }
 
-      res.json(getAllTunnelStatus());
+      res.json(await getTunnelStatusForUser(req.userId));
     },
   );
 
@@ -69,7 +76,7 @@ export function registerTunnelRoutes(app: express.Express): void {
       });
       res.flushHeaders?.();
 
-      tunnelStatusClients.add(res);
+      tunnelStatusClients.set(res, req.userId);
       sendTunnelStatusSnapshot(res);
 
       const heartbeat = setInterval(() => {
@@ -112,7 +119,7 @@ export function registerTunnelRoutes(app: express.Express): void {
   app.get(
     "/ssh/tunnel/status/:tunnelName",
     authenticateJWT,
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       if (!req.userId) {
         return res.status(401).json({ error: "Authentication required" });
       }
@@ -121,6 +128,13 @@ export function registerTunnelRoutes(app: express.Express): void {
       const tunnelName = Array.isArray(tunnelNameParam)
         ? tunnelNameParam[0]
         : tunnelNameParam;
+
+      // 404 rather than 403 for foreign tunnels: the name itself carries
+      // host metadata, so confirming its existence would leak it.
+      if (!(await canAccessTunnel(req.userId, tunnelName))) {
+        return res.status(404).json({ error: "Tunnel not found" });
+      }
+
       const status = connectionStatus.get(tunnelName);
 
       if (!status) {
@@ -331,10 +345,7 @@ export function registerTunnelRoutes(app: express.Express): void {
                       {
                         operation: "tunnel_endpoint_credential_resolve",
                         endpointHostId: endpointHost.id,
-                        error:
-                          credError instanceof Error
-                            ? credError.message
-                            : "Unknown",
+                        error: getErrorMessage(credError, "Unknown"),
                       },
                     );
                   }
@@ -351,7 +362,7 @@ export function registerTunnelRoutes(app: express.Express): void {
                 },
               );
               throw new Error(
-                `Failed to resolve endpoint host: ${resolveError instanceof Error ? resolveError.message : "Unknown error"}`,
+                `Failed to resolve endpoint host: ${getErrorMessage(resolveError)}`,
                 { cause: resolveError },
               );
             }
@@ -362,6 +373,26 @@ export function registerTunnelRoutes(app: express.Express): void {
         })();
 
         pendingTunnelOperations.set(tunnelName, operation);
+
+        const { ipAddress, userAgent } = getRequestMeta(req);
+        await logAudit({
+          userId,
+          username: await getAuditUsername(userId),
+          action: "tunnel_connect",
+          resourceType: "tunnel",
+          resourceId: tunnelConfig.sourceHostId
+            ? String(tunnelConfig.sourceHostId)
+            : undefined,
+          resourceName: tunnelName,
+          details: JSON.stringify({
+            endpointHost: tunnelConfig.endpointHost,
+            endpointPort: tunnelConfig.endpointPort,
+            sourcePort: tunnelConfig.sourcePort,
+          }),
+          ipAddress,
+          userAgent,
+          success: true,
+        });
 
         res.json({ message: "Connection request received", tunnelName });
 
@@ -374,7 +405,7 @@ export function registerTunnelRoutes(app: express.Express): void {
             broadcastTunnelStatus(tunnelName, {
               connected: false,
               status: CONNECTION_STATES.FAILED,
-              reason: err instanceof Error ? err.message : "Unknown error",
+              reason: getErrorMessage(err),
             });
             tunnelConnecting.delete(tunnelName);
           })

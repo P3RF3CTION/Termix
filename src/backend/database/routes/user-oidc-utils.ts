@@ -1,6 +1,7 @@
 import { authLogger } from "../../utils/logger.js";
 import type { SSOProviderType } from "../../../types/index.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
+import { decryptSsoConfigSecrets } from "../../utils/system-secret-crypto.js";
 import { Agent } from "undici";
 import {
   createCurrentSettingsRepository,
@@ -10,8 +11,22 @@ import {
 const BACKCHANNEL_LOGOUT_EVENT =
   "http://schemas.openid.net/event/backchannel-logout";
 
+/**
+ * Raised when a token cannot be verified because it is not a compact JWS,
+ * as opposed to a signature or claim check that actually failed.
+ */
+export class OIDCTokenFormatError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OIDCTokenFormatError";
+  }
+}
+
 function normalizeIssuer(url: string): string {
-  return url.trim().replace(/\/+$/, "");
+  return url
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/\.well-known\/openid-configuration$/, "");
 }
 
 export type OIDCConfig = {
@@ -27,12 +42,33 @@ export type OIDCConfig = {
   allowed_users: string;
   admin_group: string;
   group_claim?: string;
+  role_map?: string;
   ca_cert?: string;
 };
 
 export function buildFetchOptions(caCert?: string): Record<string, unknown> {
   if (!caCert || !caCert.trim()) return {};
   return { dispatcher: new Agent({ connect: { ca: caCert } }) };
+}
+
+/**
+ * Renders why a fetch failed in a form an administrator can act on.
+ *
+ * undici reports every transport failure as the same "fetch failed" message
+ * and puts the reason that actually matters -- ENOTFOUND, ECONNREFUSED,
+ * UNABLE_TO_VERIFY_LEAF_SIGNATURE, a timeout -- on the cause. Reporting only
+ * the outer message says nothing at all.
+ */
+export function describeFetchFailure(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const code = (cause as { code?: unknown }).code;
+    return code
+      ? `${error.message}: ${cause.message} (${code})`
+      : `${error.message}: ${cause.message}`;
+  }
+  return cause ? `${error.message}: ${String(cause)}` : error.message;
 }
 
 export function getOIDCConfigFromEnv(): OIDCConfig | null {
@@ -65,7 +101,75 @@ export function getOIDCConfigFromEnv(): OIDCConfig | null {
     allowed_users: process.env.OIDC_ALLOWED_USERS || "",
     admin_group: process.env.OIDC_ADMIN_GROUP || "",
     group_claim: process.env.OIDC_GROUP_CLAIM || "",
+    role_map: process.env.OIDC_ROLE_MAP || "",
   };
+}
+
+/**
+ * Normalizes a group name for comparison. Providers are inconsistent about
+ * whether they emit bare names (`devops-interns`) or full paths
+ * (`/devops-interns`, Keycloak's "Full group path" option), so leading slashes
+ * are stripped and case is ignored.
+ */
+function normalizeGroupName(group: string): string {
+  return group.trim().replace(/^\/+/, "").toLowerCase();
+}
+
+/**
+ * Parses `OIDC_ROLE_MAP` into a group -> role-name lookup.
+ *
+ * Format is a comma- or newline-separated list of `group:role` pairs, e.g.
+ * `devops-interns:devops-intern,devops-seniors:devops-senior`. Group keys are
+ * normalized via {@link normalizeGroupName}; role names are passed through
+ * verbatim because they must match `roles.name` exactly.
+ *
+ * Malformed entries are skipped rather than throwing — a typo in one pair must
+ * not lock every user out of login.
+ */
+export function parseOidcRoleMap(raw?: string | null): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!raw || !raw.trim()) return map;
+
+  for (const entry of raw.split(/[\n,]/)) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+
+    // rsplit on the last ":" so group names containing a colon still work.
+    const separator = trimmed.lastIndexOf(":");
+    if (separator <= 0 || separator === trimmed.length - 1) continue;
+
+    const group = normalizeGroupName(trimmed.slice(0, separator));
+    const roleName = trimmed.slice(separator + 1).trim();
+    if (!group || !roleName) continue;
+
+    map.set(group, roleName);
+  }
+
+  return map;
+}
+
+/**
+ * Resolves which mapped roles a user should hold, given their provider groups.
+ *
+ * Returns both the `desired` roles (mapped groups the user is actually in) and
+ * the full set of `managed` roles (every role named in the map). Callers must
+ * only ever add/remove roles within `managed` — roles assigned by hand in
+ * Termix, and the `admin`/`user` roles maintained by the admin-group sync, are
+ * deliberately left alone.
+ */
+export function resolveOidcMappedRoles(
+  groups: string[],
+  roleMap: Map<string, string>,
+): { desired: Set<string>; managed: Set<string> } {
+  const managed = new Set(roleMap.values());
+  const desired = new Set<string>();
+
+  for (const group of groups) {
+    const roleName = roleMap.get(normalizeGroupName(group));
+    if (roleName) desired.add(roleName);
+  }
+
+  return { desired, managed };
 }
 
 /**
@@ -102,6 +206,22 @@ export function extractOidcGroups(
     return Object.keys(raw as Record<string, unknown>);
   }
   return [];
+}
+
+/**
+ * OIDC providers may return group claims in the ID token, userinfo response,
+ * or both. Keep every verified source authoritative instead of letting a
+ * sparse userinfo payload overwrite claims from the ID token.
+ */
+export function extractOidcGroupsFromSources(
+  sources: Record<string, unknown>[],
+  groupClaim?: string,
+): string[] {
+  return [
+    ...new Set(
+      sources.flatMap((source) => extractOidcGroups(source, groupClaim)),
+    ),
+  ];
 }
 
 export function isOIDCUserAllowed(
@@ -149,15 +269,22 @@ export async function verifyOIDCToken(
   clientId: string,
   caCert?: string,
 ): Promise<Record<string, unknown>> {
+  const segments = idToken.split(".");
+  if (segments.length !== 3) {
+    throw new OIDCTokenFormatError(
+      segments.length === 5
+        ? "Token is a JWE (encrypted). Termix cannot verify encrypted tokens; disable token encryption for this client in your OIDC provider."
+        : `Token is not a compact JWS: expected 3 segments, got ${segments.length}.`,
+    );
+  }
+
   const fetchOptions = buildFetchOptions(caCert);
-  const normalizedIssuerUrl = issuerUrl.endsWith("/")
-    ? issuerUrl.slice(0, -1)
-    : issuerUrl;
+  const configuredIssuerUrl = issuerUrl.trim().replace(/\/+$/, "");
+  const normalizedIssuerUrl = normalizeIssuer(issuerUrl);
   const possibleIssuers = [
-    issuerUrl,
     normalizedIssuerUrl,
-    issuerUrl.replace(/\/application\/o\/[^/]+$/, ""),
     normalizedIssuerUrl.replace(/\/application\/o\/[^/]+$/, ""),
+    ...(configuredIssuerUrl === normalizedIssuerUrl ? [issuerUrl] : []),
   ];
 
   const jwksUrls = [
@@ -166,20 +293,30 @@ export async function verifyOIDCToken(
     `${normalizedIssuerUrl.replace(/\/application\/o\/[^/]+$/, "")}/.well-known/jwks.json`,
   ];
 
+  // Every attempt records why it failed. Without this the only thing an
+  // administrator ever sees is "Failed to fetch JWKS from any URL", which
+  // does not distinguish an issuer URL typo from a proxy, a private CA, or
+  // a provider outage.
+  const attempts: string[] = [];
+
+  const discoveryUrl = `${normalizedIssuerUrl}/.well-known/openid-configuration`;
   try {
-    const discoveryUrl = `${normalizedIssuerUrl}/.well-known/openid-configuration`;
     const discoveryResponse = await fetch(discoveryUrl, fetchOptions);
-    if (discoveryResponse.ok) {
+    if (!discoveryResponse.ok) {
+      attempts.push(`${discoveryUrl}: HTTP ${discoveryResponse.status}`);
+    } else {
       const discovery = (await discoveryResponse.json()) as Record<
         string,
         unknown
       >;
-      if (discovery.jwks_uri) {
-        jwksUrls.unshift(discovery.jwks_uri as string);
+      if (typeof discovery.jwks_uri === "string" && discovery.jwks_uri) {
+        jwksUrls.unshift(discovery.jwks_uri);
+      } else {
+        attempts.push(`${discoveryUrl}: no jwks_uri in the discovery document`);
       }
     }
   } catch (discoveryError) {
-    authLogger.error(`OIDC discovery failed: ${discoveryError}`);
+    attempts.push(`${discoveryUrl}: ${describeFetchFailure(discoveryError)}`);
   }
 
   let jwks: Record<string, unknown> | null = null;
@@ -187,26 +324,25 @@ export async function verifyOIDCToken(
   for (const url of jwksUrls) {
     try {
       const response = await fetch(url, fetchOptions);
-      if (response.ok) {
-        const jwksData = (await response.json()) as Record<string, unknown>;
-        if (jwksData && jwksData.keys && Array.isArray(jwksData.keys)) {
-          jwks = jwksData;
-          break;
-        } else {
-          authLogger.error(
-            `Invalid JWKS structure from ${url}: ${JSON.stringify(jwksData)}`,
-          );
-        }
-      } else {
-        // expected - non-ok response, try next URL
+      if (!response.ok) {
+        attempts.push(`${url}: HTTP ${response.status}`);
+        continue;
       }
-    } catch {
-      continue;
+      const jwksData = (await response.json()) as Record<string, unknown>;
+      if (jwksData && Array.isArray(jwksData.keys)) {
+        jwks = jwksData;
+        break;
+      }
+      attempts.push(`${url}: response contains no "keys" array`);
+    } catch (error) {
+      attempts.push(`${url}: ${describeFetchFailure(error)}`);
     }
   }
 
   if (!jwks) {
-    throw new Error("Failed to fetch JWKS from any URL");
+    throw new Error(
+      `Failed to fetch JWKS from any URL. Attempts:\n  ${attempts.join("\n  ")}`,
+    );
   }
 
   if (!jwks.keys || !Array.isArray(jwks.keys)) {
@@ -215,9 +351,8 @@ export async function verifyOIDCToken(
     );
   }
 
-  const header = JSON.parse(
-    Buffer.from(idToken.split(".")[0], "base64").toString(),
-  );
+  const { decodeProtectedHeader, importJWK, jwtVerify } = await import("jose");
+  const header = decodeProtectedHeader(idToken);
   const keyId = header.kid;
 
   const publicKey = jwks.keys.find(
@@ -229,8 +364,9 @@ export async function verifyOIDCToken(
     );
   }
 
-  const { importJWK, jwtVerify } = await import("jose");
-  const key = await importJWK(publicKey);
+  const algorithm =
+    typeof publicKey.alg === "string" ? publicKey.alg : header.alg;
+  const key = await importJWK(publicKey, algorithm);
 
   const { payload } = await jwtVerify(idToken, key, {
     issuer: possibleIssuers,
@@ -283,30 +419,15 @@ function applyProviderDefaults(
   };
 }
 
-function decryptConfigSecret(
+/**
+ * Reads the provider secrets. System-key encrypted values are decrypted;
+ * values still carrying a legacy base64 prefix are decoded so login keeps
+ * working until the provider is next saved.
+ */
+async function decryptConfigSecret(
   config: Record<string, unknown>,
-): Record<string, unknown> {
-  const out = { ...config };
-  for (const field of ["client_secret", "bindPassword"] as const) {
-    const val = out[field] as string | undefined;
-    if (val?.startsWith("encoded:")) {
-      try {
-        out[field] = Buffer.from(val.substring(8), "base64").toString("utf8");
-      } catch {
-        // leave as-is
-      }
-    } else if (val?.startsWith("encrypted:")) {
-      // encrypted: prefix means it was encrypted with DataCrypto; without a
-      // userId/dataKey here we cannot decrypt it. The caller should use the
-      // full admin decrypt path when possible. Fall back to stripping prefix.
-      try {
-        out[field] = Buffer.from(val.substring(10), "base64").toString("utf8");
-      } catch {
-        // leave as-is
-      }
-    }
-  }
-  return out;
+): Promise<Record<string, unknown>> {
+  return decryptSsoConfigSecrets(config);
 }
 
 export async function loadProviderConfig(
@@ -340,10 +461,10 @@ export async function loadProviderConfig(
               );
             }
           } catch {
-            parsed = decryptConfigSecret(parsed);
+            parsed = await decryptConfigSecret(parsed);
           }
         } else {
-          parsed = decryptConfigSecret(parsed);
+          parsed = await decryptConfigSecret(parsed);
         }
         const providerType = row.type as SSOProviderType;
         const config = applyProviderDefaults(
@@ -380,7 +501,7 @@ export async function loadProviderConfig(
       } catch {
         parsed = {};
       }
-      parsed = decryptConfigSecret(parsed);
+      parsed = await decryptConfigSecret(parsed);
       const oidcProviderType = oidcRow.type as SSOProviderType;
       return {
         config: applyProviderDefaults(
@@ -401,7 +522,7 @@ export async function loadProviderConfig(
       await createCurrentSettingsRepository().get("oidc_config");
     if (legacyValue) {
       let config = JSON.parse(legacyValue) as Record<string, unknown>;
-      config = decryptConfigSecret(config);
+      config = await decryptConfigSecret(config);
       return {
         config: config as unknown as OIDCConfig,
         providerType: "oidc",
@@ -432,7 +553,7 @@ export async function resolveProviderByIssuer(issuer: string): Promise<{
       } catch {
         continue;
       }
-      parsed = decryptConfigSecret(parsed);
+      parsed = await decryptConfigSecret(parsed);
       const providerType = row.type as SSOProviderType;
       const config = applyProviderDefaults(
         parsed as unknown as OIDCConfig,

@@ -1,8 +1,12 @@
 import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
 import { getDb, getSqlite } from "../db/index.js";
+import { needsExplicitPersist, resolveDatabaseDialect } from "../db/dialect.js";
+import { primeSettingsCache, readCachedSetting } from "./settings-cache.js";
 import type { DatabaseContext } from "./database-context.js";
 import { WebauthnCredentialRepository } from "./webauthn-credential-repository.js";
+import { AiRepository } from "./ai-repository.js";
 import { AlertRepository } from "./alert-repository.js";
+import { AutomationRepository } from "./automation-repository.js";
 import { ApiKeyRepository } from "./api-key-repository.js";
 import { AuditLogRepository } from "./audit-log-repository.js";
 import { C2sTunnelPresetRepository } from "./c2s-tunnel-preset-repository.js";
@@ -11,14 +15,20 @@ import { CredentialRepository } from "./credential-repository.js";
 import { DashboardServiceLinkRepository } from "./dashboard-service-link-repository.js";
 import { DismissedAlertRepository } from "./dismissed-alert-repository.js";
 import { FileManagerBookmarkRepository } from "./file-manager-bookmark-repository.js";
+import { FleetRepository } from "./fleet-repository.js";
+import { FleetInventoryRepository } from "./fleet-inventory-repository.js";
 import { HomepageItemRepository } from "./homepage-item-repository.js";
 import { HomepageLayoutRepository } from "./homepage-layout-repository.js";
 import { HostFolderRepository } from "./host-folder-repository.js";
 import { HostHealthRepository } from "./host-health-repository.js";
 import { HostMetricsHistoryRepository } from "./host-metrics-history-repository.js";
 import { HostMetricsPreferenceRepository } from "./host-metrics-preference-repository.js";
+import { ProxmoxNodeHistoryRepository } from "./proxmox-node-history-repository.js";
 import { HostRepository } from "./host-repository.js";
 import { HostResolutionRepository } from "./host-resolution-repository.js";
+import { HostSidebarPreferenceRepository } from "./host-sidebar-preference-repository.js";
+import { CredentialSidebarPreferenceRepository } from "./credential-sidebar-preference-repository.js";
+import { UiPreferenceRepository } from "./ui-preference-repository.js";
 import { NetworkTopologyRepository } from "./network-topology-repository.js";
 import { OpenTabRepository } from "./open-tab-repository.js";
 import { OpksshTokenRepository } from "./opkssh-token-repository.js";
@@ -29,6 +39,7 @@ import { SessionRecordingRepository } from "./session-recording-repository.js";
 import { SessionRepository } from "./session-repository.js";
 import { SessionShareRepository } from "./session-share-repository.js";
 import { SettingsRepository } from "./settings-repository.js";
+import { SharedHostAuthOverrideRepository } from "./shared-host-auth-override-repository.js";
 import { SharedHostSecretsRepository } from "./shared-host-secrets-repository.js";
 import { SnippetRepository } from "./snippet-repository.js";
 import { SshCredentialUsageRepository } from "./ssh-credential-usage-repository.js";
@@ -44,26 +55,81 @@ import { UserPreferenceRepository } from "./user-preference-repository.js";
 import { UserRepository } from "./user-repository.js";
 import { VaultProfileRepository } from "./vault-profile-repository.js";
 import { VaultTokenRepository } from "./vault-token-repository.js";
+import { WorkspaceRepository } from "./workspace-repository.js";
 
+/**
+ * The context every repository runs against.
+ *
+ * The dialect has to be resolved, not assumed: it is what `returning.ts` reads
+ * to decide whether it can ask for RETURNING, and whether an upsert spells
+ * itself `onConflictDoUpdate` or `onDuplicateKeyUpdate`. Reporting "sqlite"
+ * while connected to MySQL makes the second of those a TypeError on the first
+ * write.
+ *
+ * Both cross-dialect harnesses build a DatabaseContext themselves, so neither
+ * exercises this function — see tests/database/repositories/factory-context.
+ */
 export function createCurrentRepositoryContext(): DatabaseContext {
   return {
-    dialect: "sqlite",
+    dialect: resolveDatabaseDialect(),
     drizzle: getDb(),
-    sqlite: getSqlite(),
   };
 }
 
+/**
+ * Post-write hook handed to every repository.
+ *
+ * Only meaningful for SQLite, where the database lives in memory and has to be
+ * serialised back to its encrypted file. On Postgres and MySQL the write is
+ * already durable, so no hook is installed at all rather than one that does
+ * nothing — repositories call it as `this.onWrite?.()`.
+ */
 export function createCurrentRepositoryWriteHook(
   reason: string,
-): () => Promise<void> {
+): (() => Promise<void>) | undefined {
+  if (!needsExplicitPersist(resolveDatabaseDialect())) return undefined;
   return () => DatabaseSaveTrigger.forceSave(reason);
 }
 
+/**
+ * Post-write hook for high-frequency, non-critical writes (telemetry
+ * inserts/cleanup, informational timestamp touches).
+ *
+ * Marks the in-memory database dirty and lets DatabaseSaveTrigger's existing
+ * debounce coalesce the actual serialize+encrypt, instead of forcing one on
+ * every single sample. A lost 2-second window of telemetry on crash is
+ * acceptable; blocking the event loop that serves SSH traffic on every metric
+ * sample is not.
+ */
+export function createCurrentRepositoryLazyWriteHook(
+  reason: string,
+): (() => Promise<void>) | undefined {
+  if (!needsExplicitPersist(resolveDatabaseDialect())) return undefined;
+  return () => DatabaseSaveTrigger.triggerSave(reason);
+}
+
+/**
+ * Raw driver handle for the few synchronous call sites that cannot await —
+ * getCurrentSettingValue below, and settings reads during startup. Repositories
+ * must not use this: they take a DatabaseContext, which is drizzle-only.
+ * Porting to another engine means giving these callers an async path first.
+ */
 export function getCurrentRepositorySqlite() {
   return getSqlite();
 }
 
+/**
+ * Synchronous settings read.
+ *
+ * SQLite can be queried synchronously, so it is read directly and stays
+ * authoritative. Other engines have no synchronous query, so the value comes
+ * from the cache primed at startup and kept current by SettingsRepository.
+ */
 export function getCurrentSettingValue(key: string): string | null {
+  if (!needsExplicitPersist(resolveDatabaseDialect())) {
+    return readCachedSetting(key);
+  }
+
   const row = getCurrentRepositorySqlite()
     .prepare("SELECT value FROM settings WHERE key = ?")
     .get(key) as { value?: string } | undefined;
@@ -78,10 +144,24 @@ export function createCurrentWebauthnCredentialRepository(): WebauthnCredentialR
   );
 }
 
+export function createCurrentAiRepository(): AiRepository {
+  return new AiRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook("ai_repository_write"),
+  );
+}
+
 export function createCurrentAlertRepository(): AlertRepository {
   return new AlertRepository(
     createCurrentRepositoryContext(),
     createCurrentRepositoryWriteHook("alert_repository_write"),
+  );
+}
+
+export function createCurrentAutomationRepository(): AutomationRepository {
+  return new AutomationRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook("automation_repository_write"),
   );
 }
 
@@ -148,6 +228,20 @@ export function createCurrentFileManagerBookmarkRepository(): FileManagerBookmar
   );
 }
 
+export function createCurrentFleetRepository(): FleetRepository {
+  return new FleetRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook("fleet_repository_write"),
+  );
+}
+
+export function createCurrentFleetInventoryRepository(): FleetInventoryRepository {
+  return new FleetInventoryRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook("fleet_inventory_repository_write"),
+  );
+}
+
 export function createCurrentHomepageItemRepository(): HomepageItemRepository {
   return new HomepageItemRepository(
     createCurrentRepositoryContext(),
@@ -179,7 +273,9 @@ export function createCurrentHostHealthRepository(): HostHealthRepository {
 export function createCurrentHostMetricsHistoryRepository(): HostMetricsHistoryRepository {
   return new HostMetricsHistoryRepository(
     createCurrentRepositoryContext(),
-    createCurrentRepositoryWriteHook("host_metrics_history_repository_write"),
+    createCurrentRepositoryLazyWriteHook(
+      "host_metrics_history_repository_write",
+    ),
   );
 }
 
@@ -188,6 +284,15 @@ export function createCurrentHostMetricsPreferenceRepository(): HostMetricsPrefe
     createCurrentRepositoryContext(),
     createCurrentRepositoryWriteHook(
       "host_metrics_preference_repository_write",
+    ),
+  );
+}
+
+export function createCurrentProxmoxNodeHistoryRepository(): ProxmoxNodeHistoryRepository {
+  return new ProxmoxNodeHistoryRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryLazyWriteHook(
+      "proxmox_node_history_repository_write",
     ),
   );
 }
@@ -203,6 +308,34 @@ export function createCurrentHostResolutionRepository(): HostResolutionRepositor
   return new HostResolutionRepository(
     createCurrentRepositoryContext(),
     createCurrentRepositoryWriteHook("host_resolution_repository_write"),
+    createCurrentRepositoryLazyWriteHook(
+      "host_resolution_repository_lazy_write",
+    ),
+  );
+}
+
+export function createCurrentHostSidebarPreferenceRepository(): HostSidebarPreferenceRepository {
+  return new HostSidebarPreferenceRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook(
+      "host_sidebar_preference_repository_write",
+    ),
+  );
+}
+
+export function createCurrentCredentialSidebarPreferenceRepository(): CredentialSidebarPreferenceRepository {
+  return new CredentialSidebarPreferenceRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook(
+      "credential_sidebar_preference_repository_write",
+    ),
+  );
+}
+
+export function createCurrentUiPreferenceRepository(): UiPreferenceRepository {
+  return new UiPreferenceRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook("ui_preference_repository_write"),
   );
 }
 
@@ -280,6 +413,15 @@ export function createCurrentSharedHostSecretsRepository(): SharedHostSecretsRep
   return new SharedHostSecretsRepository(
     createCurrentRepositoryContext(),
     createCurrentRepositoryWriteHook("shared_host_secrets_repository_write"),
+  );
+}
+
+export function createCurrentSharedHostAuthOverrideRepository(): SharedHostAuthOverrideRepository {
+  return new SharedHostAuthOverrideRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook(
+      "shared_host_auth_override_repository_write",
+    ),
   );
 }
 
@@ -369,4 +511,77 @@ export function createCurrentVaultTokenRepository(): VaultTokenRepository {
     createCurrentRepositoryContext(),
     createCurrentRepositoryWriteHook("vault_token_repository_write"),
   );
+}
+
+export function createCurrentWorkspaceRepository(): WorkspaceRepository {
+  return new WorkspaceRepository(
+    createCurrentRepositoryContext(),
+    createCurrentRepositoryWriteHook("workspace_repository_write"),
+  );
+}
+
+/**
+ * Loads the settings cache. Must run during startup on engines without a
+ * synchronous read, before anything calls getCurrentSettingValue.
+ */
+export async function primeCurrentSettingsCache(): Promise<void> {
+  const rows = await createCurrentSettingsRepository().listAll();
+  primeSettingsCache(rows);
+}
+
+/**
+ * How often a replica re-reads the settings table.
+ *
+ * Override with SETTINGS_CACHE_REFRESH_SECONDS; 0 disables the refresh.
+ */
+const REFRESH_SECONDS_ENV = "SETTINGS_CACHE_REFRESH_SECONDS";
+const DEFAULT_REFRESH_SECONDS = 30;
+
+let refreshTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Keeps the settings cache from drifting on a multi-replica deployment.
+ *
+ * The cache is per-process and updated in the process that writes. That is
+ * enough for SQLite, where there is only ever one process. On Postgres and
+ * MySQL — which exist here precisely so more than one instance can share the
+ * data — a setting changed on one replica would otherwise never reach the
+ * others, because the synchronous read has no way to go back to the database.
+ *
+ * Periodic re-priming does not make the value immediately consistent. It bounds
+ * how long it can be wrong, which is the difference between a setting that
+ * takes effect on the next tick and one that takes effect at the next restart.
+ */
+export function startSettingsCacheRefresh(
+  env = process.env,
+  refresh: () => Promise<void> = primeCurrentSettingsCache,
+): void {
+  if (refreshTimer) return;
+
+  const seconds = refreshIntervalSeconds(env);
+  if (seconds === null) return;
+
+  refreshTimer = setInterval(() => {
+    void refresh().catch(() => {
+      // A failed refresh leaves the previous values in place, which is the
+      // right outcome: a transient database blip should not blank the cache.
+      // Every caller reads a missing setting as "use the default", so an empty
+      // cache would silently revert configuration across the deployment.
+    });
+  }, seconds * 1000);
+
+  refreshTimer.unref();
+}
+
+/** The configured interval, or null when refreshing is switched off. */
+export function refreshIntervalSeconds(env = process.env): number | null {
+  const seconds = Number(env[REFRESH_SECONDS_ENV] ?? DEFAULT_REFRESH_SECONDS);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+/** Test seam. */
+export function stopSettingsCacheRefresh(): void {
+  if (!refreshTimer) return;
+  clearInterval(refreshTimer);
+  refreshTimer = null;
 }

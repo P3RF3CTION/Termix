@@ -1,3 +1,4 @@
+import { getErrorMessage } from "./error-message.js";
 import crypto from "crypto";
 import axios from "axios";
 import { sql } from "drizzle-orm";
@@ -24,7 +25,18 @@ const FEATURE_ACTIVITY_TYPES = [
 const POSTHOG_HOST = process.env.POSTHOG_HOST || "https://us.i.posthog.com";
 const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+export function getTelemetryEnvOverride(): boolean | null {
+  const envVal = process.env.ENABLE_TELEMETRY;
+  if (envVal === undefined) return null;
+  const normalized = envVal.trim().toLowerCase();
+  if (normalized === "") return null;
+  return normalized === "true";
+}
+
 export async function isAnalyticsEnabled(): Promise<boolean> {
+  const override = getTelemetryEnvOverride();
+  if (override !== null) return override;
+
   return createCurrentSettingsRepository().getBoolean(
     "analytics_enabled",
     true,
@@ -116,12 +128,19 @@ export async function collectAndSendHeartbeat(): Promise<void> {
   } catch (err) {
     analyticsLogger.warn("Failed to send usage heartbeat", {
       operation: "analytics_heartbeat_failed",
-      error: err instanceof Error ? err.message : "Unknown error",
+      error: getErrorMessage(err),
     });
   }
 }
 
 export function startAnalyticsHeartbeat(): void {
+  if (getTelemetryEnvOverride() === false) {
+    analyticsLogger.info("Telemetry disabled by ENABLE_TELEMETRY", {
+      operation: "analytics_disabled_by_env",
+    });
+    return;
+  }
+
   if (!process.env.POSTHOG_API_KEY) {
     analyticsLogger.info("Analytics disabled: POSTHOG_API_KEY not set", {
       operation: "analytics_disabled_no_key",

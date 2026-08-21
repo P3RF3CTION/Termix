@@ -19,8 +19,6 @@ import {
 import type { Credential } from "@/types/ui-types";
 import { FolderPathPicker } from "./FolderPathPicker";
 
-type CredentialWithCertificate = Credential & { certPublicKey?: string };
-
 export function CredentialEditorView({
   credential,
   activeTab,
@@ -51,8 +49,7 @@ export function CredentialEditorView({
         : (credential?.password ?? ""),
     publicKey: credential?.publicKey ?? "",
     passphrase: credential?.passphrase ?? "",
-    certPublicKey:
-      (credential as CredentialWithCertificate | null)?.certPublicKey ?? "",
+    certPublicKey: credential?.certPublicKey ?? "",
   }));
   const { t } = useTranslation();
   const [generatingKey, setGeneratingKey] = useState(false);
@@ -283,9 +280,7 @@ export function CredentialEditorView({
                         try {
                           const result = await generateKeyPair(
                             keyType as
-                              | "ssh-ed25519"
-                              | "ssh-rsa"
-                              | "ecdsa-sha2-nistp256",
+                              "ssh-ed25519" | "ssh-rsa" | "ecdsa-sha2-nistp256",
                             bits,
                             credForm.passphrase === "existing_key_password"
                               ? undefined

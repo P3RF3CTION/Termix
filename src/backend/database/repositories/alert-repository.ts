@@ -1,4 +1,4 @@
-import { and, count, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, lt, or } from "drizzle-orm";
 import {
   alertFirings,
   alertRuleChannels,
@@ -6,7 +6,11 @@ import {
   hosts,
   notificationChannels,
 } from "../db/schema.js";
+import { DataCrypto } from "../../utils/data-crypto.js";
 import type { DatabaseContext } from "./database-context.js";
+import { sqlTimestampDaysAgo } from "./sql-timestamp.js";
+import { rowsAffected } from "./mutation-result.js";
+import { insertReturning, updateReturning } from "./returning.js";
 
 type AlertRuleRecord = typeof alertRules.$inferSelect;
 type NotificationChannelRecord = typeof notificationChannels.$inferSelect;
@@ -80,6 +84,56 @@ export class AlertRepository {
     private readonly onWrite?: () => void | Promise<void>,
   ) {}
 
+  /**
+   * Channel configs carry ntfy tokens and webhook auth headers, so they are
+   * field-encrypted like any other secret. The key is derived from the row id,
+   * which does not exist until after the insert, so a new channel is written
+   * once and then re-encrypted in place with its real id.
+   */
+  private userDataKey(userId: string): Buffer | null {
+    try {
+      return DataCrypto.getUserDataKey(userId);
+    } catch {
+      // Crypto is not initialized (tests, early boot); leave the value as is.
+      return null;
+    }
+  }
+
+  private encryptConfig(
+    config: string,
+    userId: string,
+    recordId: number | string,
+  ): string {
+    const userDataKey = this.userDataKey(userId);
+    if (!userDataKey) return config;
+    return DataCrypto.encryptRecord(
+      "notification_channels",
+      { id: recordId, config },
+      userId,
+      userDataKey,
+    ).config;
+  }
+
+  private decryptConfig(
+    config: string,
+    userId: string,
+    recordId: number | string,
+  ): string {
+    const userDataKey = this.userDataKey(userId);
+    if (!userDataKey) return config;
+    try {
+      return DataCrypto.decryptRecord(
+        "notification_channels",
+        { id: recordId, config },
+        userId,
+        userDataKey,
+      ).config;
+    } catch {
+      // Rows written before channel configs were encrypted are still plaintext.
+      return config;
+    }
+  }
+
   async listNotificationChannels(
     userId: string,
   ): Promise<NotificationChannelRow[]> {
@@ -89,7 +143,11 @@ export class AlertRepository {
       .where(eq(notificationChannels.userId, userId))
       .orderBy(notificationChannels.id);
 
-    return rows.map(mapChannelRow);
+    return rows.map((row) => {
+      const mapped = mapChannelRow(row);
+      mapped.config = this.decryptConfig(mapped.config, userId, mapped.id);
+      return mapped;
+    });
   }
 
   async findNotificationChannelForUser(
@@ -107,7 +165,10 @@ export class AlertRepository {
       )
       .limit(1);
 
-    return rows[0] ? mapChannelRow(rows[0]) : null;
+    if (!rows[0]) return null;
+    const mapped = mapChannelRow(rows[0]);
+    mapped.config = this.decryptConfig(mapped.config, userId, mapped.id);
+    return mapped;
   }
 
   async createNotificationChannel(input: {
@@ -117,19 +178,34 @@ export class AlertRepository {
     config: string;
     enabled: boolean;
   }): Promise<NotificationChannelRow> {
-    const [created] = await this.context.drizzle
-      .insert(notificationChannels)
-      .values({
+    const [created] = await insertReturning(
+      this.context,
+      notificationChannels,
+      {
         userId: input.userId,
         name: input.name,
         type: input.type,
         config: input.config,
         enabled: input.enabled,
-      })
-      .returning();
+      },
+    );
+
+    const encrypted = this.encryptConfig(
+      input.config,
+      input.userId,
+      created.id,
+    );
+    if (encrypted !== input.config) {
+      await this.context.drizzle
+        .update(notificationChannels)
+        .set({ config: encrypted })
+        .where(eq(notificationChannels.id, created.id));
+    }
 
     await this.afterWrite();
-    return mapChannelRow(created);
+    const mapped = mapChannelRow(created);
+    mapped.config = input.config;
+    return mapped;
   }
 
   async updateNotificationChannel(
@@ -146,37 +222,42 @@ export class AlertRepository {
       return this.findNotificationChannelForUser(id, userId);
     }
 
-    const [updated] = await this.context.drizzle
-      .update(notificationChannels)
-      .set(input)
-      .where(
-        and(
-          eq(notificationChannels.id, id),
-          eq(notificationChannels.userId, userId),
-        ),
-      )
-      .returning();
+    const values =
+      input.config !== undefined
+        ? { ...input, config: this.encryptConfig(input.config, userId, id) }
+        : input;
+
+    const [updated] = await updateReturning(
+      this.context,
+      notificationChannels,
+      values,
+      and(
+        eq(notificationChannels.id, id),
+        eq(notificationChannels.userId, userId),
+      ),
+    );
 
     if (!updated) return null;
     await this.afterWrite();
-    return mapChannelRow(updated);
+    const mapped = mapChannelRow(updated);
+    mapped.config = this.decryptConfig(mapped.config, userId, mapped.id);
+    return mapped;
   }
 
   async deleteNotificationChannel(
     id: number,
     userId: string,
   ): Promise<boolean> {
-    const deleted = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(notificationChannels)
       .where(
         and(
           eq(notificationChannels.id, id),
           eq(notificationChannels.userId, userId),
         ),
-      )
-      .returning({ id: notificationChannels.id });
+      );
 
-    if (deleted.length === 0) return false;
+    if (rowsAffected(result) === 0) return false;
     await this.afterWrite();
     return true;
   }
@@ -210,21 +291,18 @@ export class AlertRepository {
     channels: number[];
     now: string;
   }): Promise<AlertRuleWithChannelsRow> {
-    const [created] = await this.context.drizzle
-      .insert(alertRules)
-      .values({
-        userId: input.userId,
-        hostId: input.hostId,
-        name: input.name,
-        enabled: input.enabled,
-        triggerType: input.triggerType,
-        thresholdValue: input.thresholdValue,
-        thresholdDurationSeconds: input.thresholdDurationSeconds,
-        cooldownMinutes: input.cooldownMinutes,
-        createdAt: input.now,
-        updatedAt: input.now,
-      })
-      .returning();
+    const [created] = await insertReturning(this.context, alertRules, {
+      userId: input.userId,
+      hostId: input.hostId,
+      name: input.name,
+      enabled: input.enabled,
+      triggerType: input.triggerType,
+      thresholdValue: input.thresholdValue,
+      thresholdDurationSeconds: input.thresholdDurationSeconds,
+      cooldownMinutes: input.cooldownMinutes,
+      createdAt: input.now,
+      updatedAt: input.now,
+    });
 
     const channels = await this.replaceRuleChannels(
       created.id,
@@ -263,9 +341,10 @@ export class AlertRepository {
       now: string;
     },
   ): Promise<AlertRuleWithChannelsRow | null> {
-    const [updated] = await this.context.drizzle
-      .update(alertRules)
-      .set({
+    const [updated] = await updateReturning(
+      this.context,
+      alertRules,
+      {
         ...(input.name !== undefined ? { name: input.name } : {}),
         ...(input.hostId !== undefined ? { hostId: input.hostId } : {}),
         ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
@@ -282,9 +361,9 @@ export class AlertRepository {
           ? { cooldownMinutes: input.cooldownMinutes }
           : {}),
         updatedAt: input.now,
-      })
-      .where(and(eq(alertRules.id, id), eq(alertRules.userId, userId)))
-      .returning();
+      },
+      and(eq(alertRules.id, id), eq(alertRules.userId, userId)),
+    );
 
     if (!updated) return null;
 
@@ -298,12 +377,11 @@ export class AlertRepository {
   }
 
   async deleteAlertRule(id: number, userId: string): Promise<boolean> {
-    const deleted = await this.context.drizzle
+    const result = await this.context.drizzle
       .delete(alertRules)
-      .where(and(eq(alertRules.id, id), eq(alertRules.userId, userId)))
-      .returning({ id: alertRules.id });
+      .where(and(eq(alertRules.id, id), eq(alertRules.userId, userId)));
 
-    if (deleted.length === 0) return false;
+    if (rowsAffected(result) === 0) return false;
     await this.afterWrite();
     return true;
   }
@@ -359,17 +437,25 @@ export class AlertRepository {
     await this.afterWrite();
   }
 
+  // A rule with host_id IS NULL means "all my hosts", not "all hosts on the
+  // server". Without joining the host back to its owner, every user's wildcard
+  // rule fired for every polled host and leaked other users' host names into
+  // their alerts.
   async listEnabledRulesForHost(hostId: number): Promise<AlertEngineRule[]> {
     const rows = await this.context.drizzle
-      .select()
+      .select({ rule: alertRules })
       .from(alertRules)
+      .innerJoin(hosts, eq(hosts.id, hostId))
       .where(
         and(
           eq(alertRules.enabled, true),
-          or(eq(alertRules.hostId, hostId), isNull(alertRules.hostId)),
+          or(
+            eq(alertRules.hostId, hostId),
+            and(isNull(alertRules.hostId), eq(alertRules.userId, hosts.userId)),
+          ),
         ),
       );
-    return rows.map(mapEngineRule);
+    return rows.map((row) => mapEngineRule(row.rule));
   }
 
   async listEnabledRulesForHostUser(
@@ -411,12 +497,15 @@ export class AlertRepository {
     await this.afterWrite();
   }
 
-  pruneFiringsOlderThan(userId: string, days: number): void {
-    this.context.sqlite
-      ?.prepare(
-        "DELETE FROM alert_firings WHERE user_id = ? AND fired_at < datetime('now', ?)",
-      )
-      .run(userId, `-${days} days`);
+  async pruneFiringsOlderThan(userId: string, days: number): Promise<void> {
+    await this.context.drizzle
+      .delete(alertFirings)
+      .where(
+        and(
+          eq(alertFirings.userId, userId),
+          lt(alertFirings.firedAt, sqlTimestampDaysAgo(days)),
+        ),
+      );
   }
 
   async deleteByUserId(userId: string): Promise<{
@@ -438,10 +527,9 @@ export class AlertRepository {
         .where(eq(notificationChannels.userId, userId))
     ).map((row) => row.id);
 
-    const firingRows = await this.context.drizzle
+    const firingResult = await this.context.drizzle
       .delete(alertFirings)
-      .where(eq(alertFirings.userId, userId))
-      .returning({ id: alertFirings.id });
+      .where(eq(alertFirings.userId, userId));
 
     const linkFilters = [
       ...(ruleIds.length > 0
@@ -451,37 +539,34 @@ export class AlertRepository {
         ? [inArray(alertRuleChannels.channelId, channelIds)]
         : []),
     ];
-    const linkRows =
+    const linkResult =
       linkFilters.length === 0
-        ? []
+        ? null
         : await this.context.drizzle
             .delete(alertRuleChannels)
-            .where(or(...linkFilters))
-            .returning({ id: alertRuleChannels.id });
+            .where(or(...linkFilters));
 
-    const ruleRows = await this.context.drizzle
+    const ruleResult = await this.context.drizzle
       .delete(alertRules)
-      .where(eq(alertRules.userId, userId))
-      .returning({ id: alertRules.id });
-    const channelRows = await this.context.drizzle
+      .where(eq(alertRules.userId, userId));
+    const result = await this.context.drizzle
       .delete(notificationChannels)
-      .where(eq(notificationChannels.userId, userId))
-      .returning({ id: notificationChannels.id });
+      .where(eq(notificationChannels.userId, userId));
 
     if (
-      firingRows.length > 0 ||
-      linkRows.length > 0 ||
-      ruleRows.length > 0 ||
-      channelRows.length > 0
+      rowsAffected(firingResult) > 0 ||
+      rowsAffected(linkResult) > 0 ||
+      rowsAffected(ruleResult) > 0 ||
+      rowsAffected(result) > 0
     ) {
       await this.afterWrite();
     }
 
     return {
-      firingsDeleted: firingRows.length,
-      ruleLinksDeleted: linkRows.length,
-      rulesDeleted: ruleRows.length,
-      channelsDeleted: channelRows.length,
+      firingsDeleted: rowsAffected(firingResult),
+      ruleLinksDeleted: rowsAffected(linkResult),
+      rulesDeleted: rowsAffected(ruleResult),
+      channelsDeleted: rowsAffected(result),
     };
   }
 
@@ -491,6 +576,7 @@ export class AlertRepository {
     const rows = await this.context.drizzle
       .select({
         id: notificationChannels.id,
+        userId: notificationChannels.userId,
         type: notificationChannels.type,
         config: notificationChannels.config,
         enabled: notificationChannels.enabled,
@@ -507,7 +593,11 @@ export class AlertRepository {
         ),
       );
 
-    return rows;
+    // The engine sends without a user in scope, so decrypt against the owner.
+    return rows.map(({ userId, ...channel }) => ({
+      ...channel,
+      config: this.decryptConfig(channel.config, userId, channel.id),
+    }));
   }
 
   async getHostDisplayName(hostId: number): Promise<string | null> {

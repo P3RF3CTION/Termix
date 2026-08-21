@@ -1,24 +1,10 @@
-import { SocksClient } from "socks";
-import type { SocksClientOptions } from "socks";
+import { getErrorMessage } from "./error-message.js";
+import { SocksClient, type SocksClientOptions } from "socks";
 import net from "net";
 import dns from "dns/promises";
 import { sshLogger } from "./logger.js";
+import { isBlockedAddress } from "./safe-outbound-fetch.js";
 import type { ProxyNode } from "../../types/index.js";
-
-function isBlockedAddress(ip: string): boolean {
-  if (ip === "0.0.0.0" || ip === "::1" || ip === "::") return true;
-
-  const parts = ip.split(".").map(Number);
-  if (parts.length !== 4) return false;
-
-  if (parts[0] === 127) return true;
-  if (parts[0] === 10) return true;
-  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-  if (parts[0] === 192 && parts[1] === 168) return true;
-  if (parts[0] === 169 && parts[1] === 254) return true;
-
-  return false;
-}
 
 async function validateHost(host: string): Promise<void> {
   if (net.isIP(host)) {
@@ -43,7 +29,7 @@ export interface SOCKS5Config {
   socks5ProxyChain?: ProxyNode[];
 }
 
-export async function createProxyConnection(
+export async function createSocks5Connection(
   targetHost: string,
   targetPort: number,
   socks5Config: SOCKS5Config,
@@ -69,8 +55,6 @@ export async function createProxyConnection(
 
   return null;
 }
-
-export const createSocks5Connection = createProxyConnection;
 
 async function createSingleProxyConnection(
   targetHost: string,
@@ -103,7 +87,7 @@ async function createSingleProxyConnection(
       proxyPort: socks5Config.socks5Port || 1080,
       targetHost,
       targetPort,
-      errorMessage: error instanceof Error ? error.message : "Unknown error",
+      errorMessage: getErrorMessage(error),
     });
     throw error;
   }
@@ -237,7 +221,7 @@ async function createPureSocksChainConnection(
       chainLength: proxyChain.length,
       targetHost,
       targetPort,
-      errorMessage: error instanceof Error ? error.message : "Unknown error",
+      errorMessage: getErrorMessage(error),
     });
     throw error;
   }
@@ -301,7 +285,7 @@ async function createHopByHopConnection(
       chainLength: proxyChain.length,
       targetHost,
       targetPort,
-      errorMessage: error instanceof Error ? error.message : "Unknown error",
+      errorMessage: getErrorMessage(error),
     });
     throw error;
   }

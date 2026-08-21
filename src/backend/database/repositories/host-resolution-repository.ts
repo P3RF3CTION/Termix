@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
-import { hostAccess, hosts, sshCredentials, sshFolders } from "../db/schema.js";
+import { hosts, sshCredentials, sshFolders } from "../db/schema.js";
 import type { DatabaseContext } from "./database-context.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
 
@@ -20,12 +20,36 @@ export interface HostUpdateStateRecord {
   telnetCredentialId: number | null;
   vaultProfileId: number | null;
   authType: string;
+  parentHostId: number | null;
+  folder: string | null;
 }
 export interface HostListAccessEntry {
   hostId: number;
   permissionLevel: string;
   expiresAt: string | null;
 }
+
+const HOST_PERMISSION_RANK: Record<string, number> = {
+  connect: 1,
+  view: 2,
+  edit: 3,
+  manage: 4,
+};
+
+function preferHostAccess(
+  current: HostListAccessEntry,
+  candidate: HostListAccessEntry,
+): HostListAccessEntry {
+  const currentRank = HOST_PERMISSION_RANK[current.permissionLevel] ?? 0;
+  const candidateRank = HOST_PERMISSION_RANK[candidate.permissionLevel] ?? 0;
+  if (candidateRank !== currentRank) {
+    return candidateRank > currentRank ? candidate : current;
+  }
+  if (current.expiresAt === null) return current;
+  if (candidate.expiresAt === null) return candidate;
+  return candidate.expiresAt > current.expiresAt ? candidate : current;
+}
+
 export type HostListRow = HostResolutionHostRecord & {
   ownerId: string;
   isShared: boolean;
@@ -37,6 +61,11 @@ export class HostResolutionRepository {
   constructor(
     private readonly context: DatabaseContext,
     private readonly onWrite?: () => void | Promise<void>,
+    // Informational only -- touchHostKeyLastVerified fires on every SSH
+    // connect and does not need an immediate encrypted-file rewrite the way
+    // storeHostKey/updateHostKey do. Keeping it separate from onWrite lets
+    // those two stay on the immediate forceSave path.
+    private readonly onLazyWrite?: () => void | Promise<void>,
   ) {}
 
   async findHostById(
@@ -50,6 +79,24 @@ export class HostResolutionRepository {
       .limit(1);
 
     return this.decryptOne("ssh_data", rows[0], userId);
+  }
+
+  /**
+   * Translates a sync identity into this database's own row id.
+   *
+   * Deliberately not scoped to a user: `sync_id` is unique across the table,
+   * and a host shared with the caller belongs to someone else. Whether the
+   * caller may reach the row is decided by the permission check that follows,
+   * not here.
+   */
+  async findHostIdBySyncId(syncId: string): Promise<number | null> {
+    const rows = await this.context.drizzle
+      .select({ id: hosts.id })
+      .from(hosts)
+      .where(eq(hosts.syncId, syncId))
+      .limit(1);
+
+    return rows[0]?.id ?? null;
   }
 
   async findHostByIdForUser(
@@ -77,12 +124,28 @@ export class HostResolutionRepository {
         telnetCredentialId: hosts.telnetCredentialId,
         vaultProfileId: hosts.vaultProfileId,
         authType: hosts.authType,
+        parentHostId: hosts.parentHostId,
+        folder: hosts.folder,
       })
       .from(hosts)
       .where(eq(hosts.id, hostId))
       .limit(1);
 
     return rows[0] ?? null;
+  }
+
+  /**
+   * Minimal (id, parentHostId) rows for every host a user owns, used to walk
+   * ancestor chains when validating a sub-host parent assignment for cycles.
+   * No decryption needed -- parentHostId is a plain, unencrypted integer.
+   */
+  async listOwnHostParentLinks(
+    userId: string,
+  ): Promise<{ id: number; parentHostId: number | null }[]> {
+    return this.context.drizzle
+      .select({ id: hosts.id, parentHostId: hosts.parentHostId })
+      .from(hosts)
+      .where(eq(hosts.userId, userId));
   }
 
   async findHostsByUserId(userId: string): Promise<HostResolutionHostRecord[]> {
@@ -103,9 +166,15 @@ export class HostResolutionRepository {
       .from(hosts)
       .where(eq(hosts.userId, userId));
 
-    const sharedHostIds = Array.from(
-      new Set(accessEntries.map((access) => access.hostId)),
-    );
+    const accessByHostId = new Map<number, HostListAccessEntry>();
+    for (const access of accessEntries) {
+      const current = accessByHostId.get(access.hostId);
+      accessByHostId.set(
+        access.hostId,
+        current ? preferHostAccess(current, access) : access,
+      );
+    }
+    const sharedHostIds = Array.from(accessByHostId.keys());
     const sharedHostRows =
       sharedHostIds.length > 0
         ? await this.context.drizzle
@@ -125,7 +194,7 @@ export class HostResolutionRepository {
         permissionLevel: undefined,
         expiresAt: undefined,
       })),
-      ...accessEntries.flatMap((access) => {
+      ...Array.from(accessByHostId.values()).flatMap((access) => {
         const host = sharedHostsById.get(access.hostId);
         if (!host || host.userId === userId) {
           return [];
@@ -152,6 +221,22 @@ export class HostResolutionRepository {
       .limit(1);
 
     return rows[0]?.ownerId ?? null;
+  }
+
+  /**
+   * Ids of the hosts this user owns, as a set.
+   *
+   * Callers that need to check ownership of many hosts at once (the status
+   * poll being the hot one) would otherwise issue isHostOwnedByUser per host,
+   * which is a query each and repeats on every poll.
+   */
+  async listOwnedHostIds(userId: string): Promise<Set<number>> {
+    const rows = await this.context.drizzle
+      .select({ id: hosts.id })
+      .from(hosts)
+      .where(eq(hosts.userId, userId));
+
+    return new Set(rows.map((row) => row.id));
   }
 
   async isHostOwnedByUser(hostId: number, userId: string): Promise<boolean> {
@@ -262,7 +347,7 @@ export class HostResolutionRepository {
       .update(hosts)
       .set({ hostKeyLastVerified: now })
       .where(eq(hosts.id, hostId));
-    await this.afterWrite();
+    await (this.onLazyWrite?.() ?? this.afterWrite());
   }
 
   async findCredentialByIdForUser(
@@ -283,6 +368,43 @@ export class HostResolutionRepository {
     return this.decryptOne("ssh_credentials", rows[0], userId);
   }
 
+  /**
+   * Batch form of findCredentialByIdForUser.
+   *
+   * The host list resolves a credential for every host it returns; issued one
+   * id at a time that is a query and a decrypt per host, which is the dominant
+   * cost of the list once an install has more than a few hundred of them.
+   */
+  async listCredentialsByIdsForUser(
+    credentialIds: number[],
+    userId: string,
+  ): Promise<Map<number, HostResolutionCredentialRecord>> {
+    const unique = Array.from(new Set(credentialIds));
+    if (unique.length === 0) return new Map();
+
+    const rows = await this.context.drizzle
+      .select()
+      .from(sshCredentials)
+      .where(
+        and(
+          inArray(sshCredentials.id, unique),
+          eq(sshCredentials.userId, userId),
+        ),
+      );
+
+    const userDataKey = DataCrypto.getUserDataKey(userId);
+    if (!userDataKey) return new Map();
+
+    const byId = new Map<number, HostResolutionCredentialRecord>();
+    for (const row of rows) {
+      byId.set(
+        row.id,
+        DataCrypto.decryptRecord("ssh_credentials", row, userId, userDataKey),
+      );
+    }
+    return byId;
+  }
+
   async findCredentialByIdForOwnerDecryptedAs(
     credentialId: number,
     ownerUserId: string,
@@ -300,19 +422,6 @@ export class HostResolutionRepository {
       .limit(1);
 
     return this.decryptOne("ssh_credentials", rows[0], decryptUserId);
-  }
-
-  async findOverrideCredentialId(
-    hostId: number,
-    userId: string,
-  ): Promise<number | null> {
-    const rows = await this.context.drizzle
-      .select({ overrideCredentialId: hostAccess.overrideCredentialId })
-      .from(hostAccess)
-      .where(and(eq(hostAccess.hostId, hostId), eq(hostAccess.userId, userId)))
-      .limit(1);
-
-    return rows[0]?.overrideCredentialId ?? null;
   }
 
   /**

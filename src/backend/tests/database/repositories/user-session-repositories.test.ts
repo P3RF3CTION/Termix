@@ -35,45 +35,6 @@ describe("UserRepository and SessionRepository", () => {
   }> {
     adapter = new TestSqliteDatabase();
     const context = await adapter.connect();
-    context.sqlite?.exec(`
-      CREATE TABLE users (
-        id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        is_admin INTEGER NOT NULL DEFAULT 0,
-        is_oidc INTEGER NOT NULL DEFAULT 0,
-        oidc_identifier TEXT,
-        sso_provider_id INTEGER,
-        client_id TEXT,
-        client_secret TEXT,
-        issuer_url TEXT,
-        authorization_url TEXT,
-        token_url TEXT,
-        identifier_path TEXT,
-        name_path TEXT,
-        scopes TEXT DEFAULT 'openid email profile',
-        totp_secret TEXT,
-        totp_enabled INTEGER NOT NULL DEFAULT 0,
-        totp_backup_codes TEXT,
-        registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        donation_modal_dismissed INTEGER NOT NULL DEFAULT 0
-      );
-
-      CREATE TABLE sessions (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        jwt_token TEXT NOT NULL,
-        device_type TEXT NOT NULL,
-        device_info TEXT NOT NULL,
-        oidc_sub TEXT,
-        oidc_sid TEXT,
-        sso_provider_id INTEGER,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        expires_at TEXT NOT NULL,
-        last_active_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-      );
-    `);
 
     return {
       users: new UserRepository(context, options.onUserWrite),
@@ -230,6 +191,44 @@ describe("UserRepository and SessionRepository", () => {
     expect(await repo.sessions.listByUserId("user-1")).toHaveLength(1);
     expect(await repo.sessions.revoke("session-1")).toBe(true);
     expect(await repo.sessions.findById("session-1")).toBeNull();
+  });
+
+  it("persists session activity at most once per minute", async () => {
+    let writeCount = 0;
+    const repo = await createRepositories({
+      onSessionWrite: () => {
+        writeCount += 1;
+      },
+    });
+    await repo.users.create({
+      id: "user-1",
+      username: "user",
+      passwordHash: "hash",
+      isAdmin: false,
+      isOidc: false,
+    });
+    await repo.sessions.create({
+      id: "session-1",
+      userId: "user-1",
+      jwtToken: "token",
+      deviceType: "desktop",
+      deviceInfo: "Firefox",
+      createdAt: "2026-06-26T00:00:00.000Z",
+      expiresAt: "2026-06-27T00:00:00.000Z",
+      lastActiveAt: "2026-06-26T00:00:00.000Z",
+    });
+
+    expect(
+      await repo.sessions.touch("session-1", "2026-06-26T00:00:30.000Z"),
+    ).toBe(false);
+    expect(
+      await repo.sessions.touch("session-1", "2026-06-26T00:01:00.000Z"),
+    ).toBe(true);
+
+    expect(writeCount).toBe(2);
+    expect((await repo.sessions.findById("session-1"))?.lastActiveAt).toBe(
+      "2026-06-26T00:01:00.000Z",
+    );
   });
 
   it("revokes all user sessions except an optional current session", async () => {

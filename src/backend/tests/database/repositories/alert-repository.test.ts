@@ -1,6 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import crypto from "node:crypto";
+import { sql } from "drizzle-orm";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { TestSqliteDatabase } from "./test-support.js";
 import { AlertRepository } from "../../../database/repositories/alert-repository.js";
+import { DataCrypto } from "../../../utils/data-crypto.js";
 
 describe("AlertRepository", () => {
   let adapter: TestSqliteDatabase | null = null;
@@ -17,68 +20,11 @@ describe("AlertRepository", () => {
   ): Promise<AlertRepository> {
     adapter = new TestSqliteDatabase();
     const context = await adapter.connect();
-    context.sqlite?.exec(`
-      CREATE TABLE users (
-        id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        password_hash TEXT NOT NULL
-      );
-
-      CREATE TABLE ssh_data (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        name TEXT,
-        ip TEXT NOT NULL
-      );
-
-      CREATE TABLE alert_rules (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        host_id INTEGER,
-        name TEXT NOT NULL,
-        enabled INTEGER NOT NULL DEFAULT 1,
-        trigger_type TEXT NOT NULL,
-        threshold_value REAL,
-        threshold_duration_seconds INTEGER,
-        cooldown_minutes INTEGER NOT NULL DEFAULT 15,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE notification_channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        type TEXT NOT NULL,
-        config TEXT NOT NULL,
-        enabled INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE alert_rule_channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        rule_id INTEGER NOT NULL,
-        channel_id INTEGER NOT NULL
-      );
-
-      CREATE TABLE alert_firings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        rule_id INTEGER NOT NULL,
-        host_id INTEGER NOT NULL,
-        host_name TEXT NOT NULL,
-        fired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        resolved_at TEXT,
-        value REAL,
-        message TEXT NOT NULL,
-        severity TEXT NOT NULL DEFAULT 'warning',
-        acknowledged INTEGER NOT NULL DEFAULT 0
-      );
-
+    await adapter.exec(`
       INSERT INTO users (id, username, password_hash)
       VALUES ('user-1', 'alice', 'hash'), ('user-2', 'bob', 'hash');
-      INSERT INTO ssh_data (id, user_id, name, ip)
-      VALUES (1, 'user-1', 'alpha', '127.0.0.1');
+      INSERT INTO ssh_data (id, user_id, name, ip, port, username, auth_type)
+      VALUES (1, 'user-1', 'alpha', '127.0.0.1', 22, 'root', 'password');
     `);
 
     return new AlertRepository(context, onWrite);
@@ -229,7 +175,7 @@ describe("AlertRepository", () => {
     expect(unacknowledged.total).toBe(0);
 
     await repo.acknowledgeAllFirings("user-1");
-    repo.pruneFiringsOlderThan("user-1", 0);
+    await repo.pruneFiringsOlderThan("user-1", 0);
   });
 
   it("loads enabled rules and notification channels for the alert engine", async () => {
@@ -281,6 +227,152 @@ describe("AlertRepository", () => {
         enabled: true,
       },
     ]);
+  });
+
+  it("keeps another user's wildcard rules off a host they do not own", async () => {
+    const repo = await createRepository();
+    await adapter!.exec(`
+      INSERT INTO ssh_data (id, user_id, name, ip, port, username, auth_type)
+      VALUES (2, 'user-2', 'bravo', '127.0.0.2', 22, 'root', 'password');
+    `);
+
+    const ownerRule = await repo.createAlertRule({
+      userId: "user-1",
+      hostId: null,
+      name: "Owner wildcard",
+      enabled: true,
+      triggerType: "cpu_threshold",
+      thresholdValue: 90,
+      thresholdDurationSeconds: 0,
+      cooldownMinutes: 15,
+      channels: [],
+      now: "2026-01-01T00:00:00.000Z",
+    });
+    const otherRule = await repo.createAlertRule({
+      userId: "user-2",
+      hostId: null,
+      name: "Other wildcard",
+      enabled: true,
+      triggerType: "cpu_threshold",
+      thresholdValue: 90,
+      thresholdDurationSeconds: 0,
+      cooldownMinutes: 15,
+      channels: [],
+      now: "2026-01-01T00:00:00.000Z",
+    });
+
+    // Host 1 belongs to user-1, so only user-1's wildcard rule may fire.
+    const forHostOne = await repo.listEnabledRulesForHost(1);
+    expect(forHostOne.map((rule) => rule.id)).toEqual([ownerRule.id]);
+
+    const forHostTwo = await repo.listEnabledRulesForHost(2);
+    expect(forHostTwo.map((rule) => rule.id)).toEqual([otherRule.id]);
+  });
+
+  it("still matches a rule pinned to a specific host", async () => {
+    const repo = await createRepository();
+    const pinned = await repo.createAlertRule({
+      userId: "user-1",
+      hostId: 1,
+      name: "Pinned",
+      enabled: true,
+      triggerType: "disk_threshold",
+      thresholdValue: 90,
+      thresholdDurationSeconds: 0,
+      cooldownMinutes: 15,
+      channels: [],
+      now: "2026-01-01T00:00:00.000Z",
+    });
+
+    expect((await repo.listEnabledRulesForHost(1)).map((r) => r.id)).toEqual([
+      pinned.id,
+    ]);
+  });
+
+  it("encrypts channel configs at rest and returns them decrypted", async () => {
+    const key = crypto.randomBytes(32);
+    const spy = vi
+      .spyOn(DataCrypto, "getUserDataKey")
+      .mockImplementation(() => key);
+
+    try {
+      const repo = await createRepository();
+      const secret = '{"url":"https://ntfy.test","token":"super-secret"}';
+
+      const created = await repo.createNotificationChannel({
+        userId: "user-1",
+        name: "Ntfy",
+        type: "ntfy",
+        config: secret,
+        enabled: true,
+      });
+      expect(created.config).toBe(secret);
+
+      // The stored bytes must not contain the token in the clear.
+      const stored = await adapter!.query<{ config: string }>(
+        sql`SELECT config FROM notification_channels WHERE id = ${created.id}`,
+      );
+      expect(stored[0].config).not.toContain("super-secret");
+
+      // Every read path hands back plaintext.
+      const listed = await repo.listNotificationChannels("user-1");
+      expect(listed[0].config).toBe(secret);
+      expect(
+        (await repo.findNotificationChannelForUser(created.id, "user-1"))
+          ?.config,
+      ).toBe(secret);
+
+      const rule = await repo.createAlertRule({
+        userId: "user-1",
+        hostId: null,
+        name: "CPU",
+        enabled: true,
+        triggerType: "cpu_threshold",
+        thresholdValue: 90,
+        thresholdDurationSeconds: 0,
+        cooldownMinutes: 15,
+        channels: [created.id],
+        now: "2026-01-01T00:00:00.000Z",
+      });
+      const engineChannels = await repo.listEnabledChannelsForRule(rule.id);
+      expect(engineChannels[0].config).toBe(secret);
+
+      const rotated = '{"url":"https://ntfy.test","token":"rotated"}';
+      const updated = await repo.updateNotificationChannel(
+        created.id,
+        "user-1",
+        { config: rotated },
+      );
+      expect(updated?.config).toBe(rotated);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still reads channel configs written before encryption", async () => {
+    const repo = await createRepository();
+    const plaintext = '{"url":"https://legacy.test"}';
+    const created = await repo.createNotificationChannel({
+      userId: "user-1",
+      name: "Legacy",
+      type: "webhook",
+      config: plaintext,
+      enabled: true,
+    });
+
+    const key = crypto.randomBytes(32);
+    const spy = vi
+      .spyOn(DataCrypto, "getUserDataKey")
+      .mockImplementation(() => key);
+    try {
+      const found = await repo.findNotificationChannelForUser(
+        created.id,
+        "user-1",
+      );
+      expect(found?.config).toBe(plaintext);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("loads host display names for alert payloads", async () => {

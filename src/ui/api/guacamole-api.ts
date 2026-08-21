@@ -1,4 +1,21 @@
-import { authApi, handleApiError } from "@/main-axios";
+import {
+  authApi,
+  getRemoteGuacamoleApi,
+  handleApiError,
+  isElectron,
+} from "@/main-axios";
+import type { AxiosInstance } from "axios";
+import type { GuacamoleConfig } from "@/types/guacamole-config";
+
+/**
+ * The embedded desktop backend does not bundle guacd, which is why
+ * resolveConnectionOrigin() pins RDP/VNC/Telnet to "remote". These calls have to
+ * follow: asking the embedded backend reports the guacd *it* cannot reach,
+ * rather than the one on the connected server that serves the session.
+ */
+function guacamoleApi(): AxiosInstance {
+  return isElectron() ? getRemoteGuacamoleApi() : authApi;
+}
 
 export interface GuacamoleTokenRequest {
   protocol: "rdp" | "vnc" | "telnet";
@@ -9,65 +26,7 @@ export interface GuacamoleTokenRequest {
   domain?: string;
   security?: string;
   ignoreCert?: boolean;
-  guacamoleConfig?: {
-    colorDepth?: number;
-    width?: number;
-    height?: number;
-    dpi?: number;
-    resizeMethod?: string;
-    forceLossless?: boolean;
-    disableAudio?: boolean;
-    enableAudioInput?: boolean;
-    enableWallpaper?: boolean;
-    enableTheming?: boolean;
-    enableFontSmoothing?: boolean;
-    enableFullWindowDrag?: boolean;
-    enableDesktopComposition?: boolean;
-    enableMenuAnimations?: boolean;
-    disableBitmapCaching?: boolean;
-    disableOffscreenCaching?: boolean;
-    disableGlyphCaching?: boolean;
-    disableGfx?: boolean;
-    enablePrinting?: boolean;
-    printerName?: string;
-    enableDrive?: boolean;
-    driveName?: string;
-    drivePath?: string;
-    createDrivePath?: boolean;
-    disableDownload?: boolean;
-    disableUpload?: boolean;
-    enableTouch?: boolean;
-    clientName?: string;
-    console?: boolean;
-    initialProgram?: string;
-    serverLayout?: string;
-    timezone?: string;
-    gatewayHostname?: string;
-    gatewayPort?: number;
-    gatewayUsername?: string;
-    gatewayPassword?: string;
-    gatewayDomain?: string;
-    remoteApp?: string;
-    remoteAppDir?: string;
-    remoteAppArgs?: string;
-    normalizeClipboard?: string;
-    disableCopy?: boolean;
-    disablePaste?: boolean;
-    cursor?: string;
-    swapRedBlue?: boolean;
-    readOnly?: boolean;
-    recordingPath?: string;
-    recordingName?: string;
-    createRecordingPath?: boolean;
-    recordingExcludeOutput?: boolean;
-    recordingExcludeMouse?: boolean;
-    recordingIncludeKeys?: boolean;
-    wolSendPacket?: boolean;
-    wolMacAddr?: string;
-    wolBroadcastAddr?: string;
-    wolUdpPort?: number;
-    wolWaitTime?: number;
-  };
+  guacamoleConfig?: GuacamoleConfig;
 }
 
 export interface GuacamoleTokenResponse {
@@ -78,6 +37,18 @@ export interface GuacamoleTokenResponse {
 type GuacamoleConfigSource = {
   guacamoleConfig?: string | Record<string, unknown> | null;
 };
+
+export function parseGuacamoleConfig(
+  config?: string | GuacamoleConfig | null,
+): GuacamoleConfig {
+  if (!config) return {};
+  if (typeof config !== "string") return config;
+  try {
+    return JSON.parse(config) as GuacamoleConfig;
+  } catch {
+    return {};
+  }
+}
 
 export function getGuacamoleDpi(
   source?: GuacamoleConfigSource,
@@ -189,7 +160,7 @@ export async function getGuacamoleToken(
   try {
     const guacParams = toGuacamoleParams(request.guacamoleConfig);
 
-    const response = await authApi.post("/guacamole/token", {
+    const response = await guacamoleApi().post("/guacamole/token", {
       type: request.protocol,
       hostname: request.hostname,
       port: request.port,
@@ -209,18 +180,28 @@ export async function getGuacamoleToken(
 export async function getGuacamoleTokenFromHost(
   hostId: number,
   protocol?: "rdp" | "vnc" | "telnet",
-  promptedCredentials?: { username?: string; password?: string },
+  promptedCredentials?: {
+    username?: string;
+    password?: string;
+    domain?: string;
+  },
 ): Promise<GuacamoleTokenResponse> {
   try {
-    const response = await authApi.post(`/guacamole/connect-host/${hostId}`, {
-      ...(protocol ? { protocol } : {}),
-      ...(promptedCredentials?.username
-        ? { promptedUsername: promptedCredentials.username }
-        : {}),
-      ...(promptedCredentials?.password
-        ? { promptedPassword: promptedCredentials.password }
-        : {}),
-    });
+    const response = await guacamoleApi().post(
+      `/guacamole/connect-host/${hostId}`,
+      {
+        ...(protocol ? { protocol } : {}),
+        ...(promptedCredentials?.username
+          ? { promptedUsername: promptedCredentials.username }
+          : {}),
+        ...(promptedCredentials?.password
+          ? { promptedPassword: promptedCredentials.password }
+          : {}),
+        ...(promptedCredentials
+          ? { promptedDomain: promptedCredentials.domain ?? "" }
+          : {}),
+      },
+    );
     return response.data;
   } catch (error) {
     throw handleApiError(error, "get guacamole token from host");
@@ -230,6 +211,6 @@ export async function getGuacamoleTokenFromHost(
 export async function getGuacdStatus(): Promise<{
   guacd: { status: string };
 }> {
-  const response = await authApi.get("/guacamole/status");
+  const response = await guacamoleApi().get("/guacamole/status");
   return response.data;
 }

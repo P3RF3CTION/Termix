@@ -1,22 +1,28 @@
+import { getErrorMessage } from "../../utils/error-message.js";
 import express from "express";
 import axios from "axios";
 import { Client as SSHClient } from "ssh2";
 import { logger } from "../../utils/logger.js";
 import {
-  createCurrentCredentialRepository,
-  createCurrentHostRepository,
-  createCurrentHostResolutionRepository,
-} from "../../database/repositories/factory.js";
+  logAudit,
+  getAuditUsername,
+  getRequestMeta,
+} from "../../utils/audit-logger.js";
+import { createCurrentHostRepository } from "../../database/repositories/factory.js";
 import { createJumpHostChain } from "../jump-host-chain.js";
+import { resolveHostById } from "../host-resolver.js";
 import { createConnectionLog } from "../connection-log.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
 import { AuthManager } from "../../utils/auth-manager.js";
-import type { AuthenticatedRequest } from "../../../types/index.js";
+import {
+  type AuthenticatedRequest,
+  type ProxyNode,
+  type SSHHost,
+} from "../../../types/index.js";
 import {
   createSocks5Connection,
   type SOCKS5Config,
 } from "../../utils/socks5-helper.js";
-import type { SSHHost, ProxyNode } from "../../../types/index.js";
 import type {
   LogEntry,
   ConnectionStage,
@@ -158,13 +164,8 @@ export function registerDockerSshRoutes(app: express.Express): void {
     );
 
     try {
-      const hostRecord =
-        await createCurrentHostResolutionRepository().findHostById(
-          hostId,
-          userId,
-        );
-
-      if (!hostRecord) {
+      const resolvedHost = await resolveHostById(hostId, userId);
+      if (!resolvedHost) {
         connectionLogs.push(
           createConnectionLog("error", "docker_connecting", "Host not found"),
         );
@@ -173,36 +174,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
           .json({ error: "Host not found", connectionLogs });
       }
 
-      const host = hostRecord as unknown as SSHHost;
-
-      if (host.userId !== userId) {
-        const { PermissionManager } =
-          await import("../../utils/permission-manager.js");
-        const permissionManager = PermissionManager.getInstance();
-        const accessInfo = await permissionManager.canAccessHost(
-          userId,
-          hostId,
-          "connect",
-        );
-
-        if (!accessInfo.hasAccess) {
-          sshLogger.warn("User does not have access to host", {
-            operation: "docker_connect",
-            hostId,
-            userId,
-          });
-          connectionLogs.push(
-            createConnectionLog(
-              "error",
-              "docker_connecting",
-              "Access denied to host",
-            ),
-          );
-          return res
-            .status(403)
-            .json({ error: "Access denied", connectionLogs });
-        }
-      }
+      const host = resolvedHost as SSHHost;
       if (typeof host.jumpHosts === "string" && host.jumpHosts) {
         try {
           host.jumpHosts = JSON.parse(host.jumpHosts);
@@ -266,7 +238,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
         delete pendingTOTPSessions[sessionId];
       }
 
-      let resolvedCredentials: {
+      const resolvedCredentials: {
         password?: string;
         sshKey?: string;
         keyPassword?: string;
@@ -288,55 +260,6 @@ export function registerDockerSshRoutes(app: express.Express): void {
       }
       if (userProvidedKeyPassword) {
         resolvedCredentials.keyPassword = userProvidedKeyPassword;
-      }
-
-      if (host.credentialId) {
-        const ownerId = host.userId;
-
-        if (userId !== ownerId) {
-          try {
-            const { SharedHostSecretsManager } =
-              await import("../../utils/shared-host-secrets-manager.js");
-            const sharedCred =
-              await SharedHostSecretsManager.getInstance().getSecretForUser(
-                host.id,
-                userId,
-                "ssh",
-              );
-
-            if (sharedCred) {
-              resolvedCredentials = {
-                password: sharedCred.password,
-                sshKey: sharedCred.key,
-                keyPassword: sharedCred.keyPassword,
-                authType: sharedCred.authType,
-              };
-            }
-          } catch (error) {
-            sshLogger.error("Failed to resolve shared credential", error, {
-              operation: "docker_connect",
-              hostId,
-              userId,
-            });
-          }
-        } else {
-          const credential =
-            await createCurrentCredentialRepository().findDecryptedByIdForUser(
-              userId,
-              host.credentialId as number,
-            );
-
-          if (credential) {
-            resolvedCredentials = {
-              password: credential.password as string | undefined,
-              sshKey: (credential.key || credential.privateKey) as
-                | string
-                | undefined,
-              keyPassword: credential.keyPassword as string | undefined,
-              authType: credential.authType as string | undefined,
-            };
-          }
-        }
       }
 
       const client = new SSHClient();
@@ -418,16 +341,13 @@ export function registerDockerSshRoutes(app: express.Express): void {
             operation: "docker_connect",
             sessionId,
             hostId,
-            error:
-              opksshError instanceof Error
-                ? opksshError.message
-                : "Unknown error",
+            error: getErrorMessage(opksshError),
           });
           connectionLogs.push(
             createConnectionLog(
               "error",
               "docker_auth",
-              `OPKSSH authentication failed: ${opksshError instanceof Error ? opksshError.message : "Unknown error"}`,
+              `OPKSSH authentication failed: ${getErrorMessage(opksshError)}`,
             ),
           );
           return res.status(500).json({
@@ -448,10 +368,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
             config.passphrase = resolvedCredentials.keyPassword;
           }
         } catch (error) {
-          const message =
-            error instanceof Error
-              ? error.message
-              : "Invalid private key format";
+          const message = getErrorMessage(error, "Invalid private key format");
           sshLogger.error("SSH key processing error", error, {
             operation: "docker_connect",
             sessionId,
@@ -590,6 +507,20 @@ export function registerDockerSshRoutes(app: express.Express): void {
             stream.stderr.on("data", () => {});
           }
         });
+
+        void (async () => {
+          const { ipAddress, userAgent } = getRequestMeta(req);
+          await logAudit({
+            userId,
+            username: await getAuditUsername(userId),
+            action: "docker_connect",
+            resourceType: "host",
+            resourceId: hostId ? String(hostId) : undefined,
+            ipAddress,
+            userAgent,
+            success: true,
+          });
+        })();
 
         res.json({
           success: true,
@@ -994,7 +925,6 @@ export function registerDockerSshRoutes(app: express.Express): void {
           const jumpClient = await createJumpHostChain(
             host.jumpHosts as Array<{ hostId: number }>,
             userId,
-            proxyConfig,
           );
 
           if (!jumpClient) {
@@ -1056,17 +986,14 @@ export function registerDockerSshRoutes(app: express.Express): void {
             createConnectionLog(
               "error",
               "jump",
-              `Jump host connection failed: ${jumpError instanceof Error ? jumpError.message : "Unknown error"}`,
+              `Jump host connection failed: ${getErrorMessage(jumpError)}`,
             ),
           );
           if (!responseSent) {
             responseSent = true;
             return res.status(500).json({
               error:
-                "Jump host connection failed: " +
-                (jumpError instanceof Error
-                  ? jumpError.message
-                  : "Unknown error"),
+                "Jump host connection failed: " + getErrorMessage(jumpError),
               connectionLogs,
             });
           }
@@ -1096,17 +1023,13 @@ export function registerDockerSshRoutes(app: express.Express): void {
             createConnectionLog(
               "error",
               "proxy",
-              `Proxy connection failed: ${proxyError instanceof Error ? proxyError.message : "Unknown error"}`,
+              `Proxy connection failed: ${getErrorMessage(proxyError)}`,
             ),
           );
           if (!responseSent) {
             responseSent = true;
             return res.status(500).json({
-              error:
-                "Proxy connection failed: " +
-                (proxyError instanceof Error
-                  ? proxyError.message
-                  : "Unknown error"),
+              error: "Proxy connection failed: " + getErrorMessage(proxyError),
               connectionLogs,
             });
           }
@@ -1127,12 +1050,12 @@ export function registerDockerSshRoutes(app: express.Express): void {
         createConnectionLog(
           "error",
           "docker_connecting",
-          `Connection error: ${error instanceof Error ? error.message : "Unknown error"}`,
+          `Connection error: ${getErrorMessage(error)}`,
         ),
       );
       res.status(500).json({
         success: false,
-        message: error instanceof Error ? error.message : "Unknown error",
+        message: getErrorMessage(error),
         connectionLogs,
       });
     }
@@ -1332,7 +1255,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
                 operation: "activity_log_error",
                 userId: session.userId,
                 hostId: session.hostId,
-                error: error instanceof Error ? error.message : "Unknown error",
+                error: getErrorMessage(error),
               });
             }
           })();
@@ -1512,7 +1435,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
                 operation: "activity_log_error",
                 userId: session.userId,
                 hostId: session.hostId,
-                error: error instanceof Error ? error.message : "Unknown error",
+                error: getErrorMessage(error),
               });
             }
           })();
@@ -1721,8 +1644,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
           });
         } catch (daemonError) {
           session.activeOperations--;
-          const errorMsg =
-            daemonError instanceof Error ? daemonError.message : "";
+          const errorMsg = getErrorMessage(daemonError, "");
 
           if (errorMsg.includes("Cannot connect to the Docker daemon")) {
             return res.json({
@@ -1770,7 +1692,7 @@ export function registerDockerSshRoutes(app: express.Express): void {
 
       res.status(500).json({
         available: false,
-        error: error instanceof Error ? error.message : "Validation failed",
+        error: getErrorMessage(error, "Validation failed"),
       });
     }
   });

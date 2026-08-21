@@ -1,10 +1,13 @@
+import { getErrorMessage } from "../utils/error-message.js";
 import {
   createCurrentHostResolutionRepository,
   createCurrentVaultProfileRepository,
   createCurrentUserRepository,
 } from "../database/repositories/factory.js";
+import type { HostResolutionHostRecord } from "../database/repositories/host-resolution-repository.js";
 import { logAudit } from "../utils/audit-logger.js";
 import { logger } from "../utils/logger.js";
+import { resolveRecipientSharedHostAuthentication } from "../utils/shared-host-auth-resolver.js";
 import {
   pickResolvedPassword,
   pickResolvedUsername,
@@ -14,6 +17,33 @@ import type { SSHHost } from "../../types/index.js";
 import type { HostAction } from "../utils/permission-manager.js";
 
 const sshLogger = logger;
+
+/**
+ * Resolve a host the client named by its sync identity.
+ *
+ * `id` is an autoincrement belonging to whichever database produced the row.
+ * When the desktop app delegates a connection to a sync server, the two
+ * sequences have no reason to agree, and resolving the client's id here lands
+ * on whatever host happens to own that number — a different machine, with its
+ * own address, credentials and host key. `syncId` is the same string on both
+ * sides, so it names the host the user actually picked.
+ *
+ * Returns null when the sync id is unknown here, rather than falling back to
+ * the numeric id: an unknown host is exactly the case where guessing picks the
+ * wrong machine.
+ */
+export async function resolveHostBySyncId(
+  syncId: string,
+  userId: string,
+): Promise<SSHHost | null> {
+  const hostId =
+    await createCurrentHostResolutionRepository().findHostIdBySyncId(syncId);
+  if (hostId === null) return null;
+
+  // Permissions, decryption, shared-host handling and auditing all belong to
+  // the id-based path; this only decides which row it is pointed at.
+  return resolveHostById(hostId, userId);
+}
 
 /**
  * Resolve a host with its credentials server-side by hostId.
@@ -99,6 +129,17 @@ export async function resolveHostById(
       host.terminalConfig = undefined;
     }
   }
+  if (
+    !ownerEquivalent &&
+    host.terminalConfig &&
+    typeof host.terminalConfig === "object" &&
+    !Array.isArray(host.terminalConfig)
+  ) {
+    host.terminalConfig = {
+      ...(host.terminalConfig as Record<string, unknown>),
+      sudoPassword: null,
+    };
+  }
   if (typeof host.socks5ProxyChain === "string" && host.socks5ProxyChain) {
     try {
       host.socks5ProxyChain = JSON.parse(host.socks5ProxyChain as string);
@@ -113,15 +154,18 @@ export async function resolveHostById(
       host.quickActions = [];
     }
   }
+  if (typeof host.portKnockSequence === "string" && host.portKnockSequence) {
+    try {
+      host.portKnockSequence = JSON.parse(host.portKnockSequence as string);
+    } catch {
+      host.portKnockSequence = [];
+    }
+  }
 
+  let sharedAuthResolution: SharedAuthResolution | undefined;
   if (!ownerEquivalent) {
-    const resolved = await resolveSharedSshSecrets(
-      host,
-      hostId,
-      userId,
-      repository,
-    );
-    if (!resolved) return null;
+    sharedAuthResolution = await resolveRecipientSshAuth(host, hostId, userId);
+    if (!sharedAuthResolution) return null;
   } else {
     let effectiveCredentialId = host.credentialId as number | null | undefined;
     if (
@@ -138,7 +182,7 @@ export async function resolveHostById(
         sshLogger.warn("Failed to resolve folder credential for host", {
           operation: "host_resolver_folder_credential",
           hostId,
-          error: e instanceof Error ? e.message : "Unknown",
+          error: getErrorMessage(e, "Unknown"),
         });
       }
     }
@@ -174,7 +218,7 @@ export async function resolveHostById(
         sshLogger.warn("Failed to resolve credential for host", {
           operation: "host_resolver_credential",
           hostId,
-          error: e instanceof Error ? e.message : "Unknown",
+          error: getErrorMessage(e, "Unknown"),
         });
       }
     }
@@ -187,7 +231,7 @@ export async function resolveHostById(
 
   // Resolve a Vault SSH signer profile (shared settings, no secrets). The
   // certificate itself is obtained per-user at connect time via Vault OIDC.
-  if (host.vaultProfileId) {
+  if (host.vaultProfileId && sharedAuthResolution !== "recipient-override") {
     try {
       const profile = await createCurrentVaultProfileRepository().findById(
         host.vaultProfileId as number,
@@ -200,7 +244,7 @@ export async function resolveHostById(
       sshLogger.warn("Failed to resolve vault profile for host", {
         operation: "host_resolver_vault_profile",
         hostId,
-        error: e instanceof Error ? e.message : "Unknown",
+        error: getErrorMessage(e, "Unknown"),
       });
     }
   }
@@ -209,87 +253,78 @@ export async function resolveHostById(
 }
 
 /**
- * Fill in SSH auth secrets for a shared (non-owner) requester. Order:
- * the recipient's own override credential, then their re-encrypted share
- * snapshot. Secret-less auth types (opkssh, vault, agent, none) pass through
- * untouched. Returns false when a secret-bearing host has no usable source.
+ * Resolve SSH auth for a shared (non-owner) requester without exposing the
+ * owner's password, key, or credential reference. A recipient-owned override
+ * fully replaces the host auth. An owner-enabled shared snapshot is the
+ * fallback; otherwise only secret-less auth types pass.
  */
-async function resolveSharedSshSecrets(
+type SharedAuthResolution =
+  "recipient-override" | "shared-snapshot" | "shared-agent" | "secretless";
+
+async function resolveRecipientSshAuth(
   host: Record<string, unknown>,
   hostId: number,
   userId: string,
-  repository: ReturnType<typeof createCurrentHostResolutionRepository>,
-): Promise<boolean> {
+): Promise<SharedAuthResolution | null> {
+  const ownerAuthHost = { ...host } as HostResolutionHostRecord;
+
+  // The host row is decrypted under its owner's DEK so connection settings are
+  // available. Remove owner SSH auth before resolving anything for a recipient.
+  host.password = null;
+  host.key = null;
+  host.keyPassword = null;
+  host.keyType = null;
+  host.certPublicKey = null;
+  host.credentialId = null;
+
   try {
-    const overrideCredId = await repository.findOverrideCredentialId(
+    const resolution = await resolveRecipientSharedHostAuthentication(
+      ownerAuthHost,
       hostId,
       userId,
+      "ssh",
     );
-    if (overrideCredId) {
-      const cred = (await repository.findCredentialByIdForUser(
-        overrideCredId,
-        userId,
-      )) as Record<string, unknown> | null;
-      if (cred) {
-        host.password = cred.password;
-        host.key = (cred.privateKey || cred.key) as string | null;
-        host.keyPassword = cred.keyPassword;
-        host.keyType = cred.keyType;
+
+    if (resolution.source === "personal-override") {
+      const credential = resolution.credential;
+      host.password = credential.password;
+      host.key = credential.privateKey || credential.key;
+      host.keyPassword = credential.keyPassword;
+      host.keyType = credential.keyType;
+      host.certPublicKey = credential.certPublicKey || null;
+      host.username = credential.username || host.username;
+      host.authType = host.key ? "key" : host.password ? "password" : "none";
+      return "recipient-override";
+    }
+
+    if (resolution.source === "owner-shared") {
+      if (resolution.authType === "agent") {
+        return "shared-agent";
+      }
+      const sharedAuth = resolution.secret;
+      if (sharedAuth) {
+        host.password = sharedAuth.password || null;
+        host.key = sharedAuth.key || null;
+        host.keyPassword = sharedAuth.keyPassword || null;
+        host.keyType = sharedAuth.keyType || null;
         host.username = pickResolvedUsername(
           host.username,
-          cred.username,
+          sharedAuth.username,
           host.overrideCredentialUsername,
         );
         host.authType = host.key ? "key" : host.password ? "password" : "none";
-        return true;
+        return "shared-snapshot";
       }
     }
-  } catch {
-    // fall through to the share snapshot
-  }
 
-  try {
-    const { SharedHostSecretsManager } =
-      await import("../utils/shared-host-secrets-manager.js");
-    const secret =
-      await SharedHostSecretsManager.getInstance().getSecretForUser(
-        hostId,
-        userId,
-        "ssh",
-      );
-    if (secret) {
-      host.password = secret.password;
-      host.key = secret.key;
-      host.keyPassword = secret.keyPassword;
-      host.keyType = secret.keyType;
-      host.username = pickResolvedUsername(
-        host.username,
-        secret.username,
-        host.overrideCredentialUsername,
-      );
-      host.authType = secret.key
-        ? "key"
-        : secret.password
-          ? "password"
-          : "none";
-      return true;
+    if (resolution.source === "secretless") {
+      return "secretless";
     }
-  } catch (e) {
-    sshLogger.warn("Failed to get shared host secret", {
-      operation: "host_resolver_shared_secret",
-      hostId,
-      error: e instanceof Error ? e.message : "Unknown",
-    });
+  } catch {
+    // A missing/deleted override or snapshot behaves like unavailable auth.
   }
 
-  const needsSecrets =
-    !!host.credentialId ||
-    host.authType === "password" ||
-    host.authType === "key" ||
-    host.authType === "credential";
-  if (!needsSecrets) return true;
-
-  return false;
+  return null;
 }
 
 /**
