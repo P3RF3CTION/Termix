@@ -20,6 +20,26 @@ interface WebSocketMessage {
 
 const authManager = AuthManager.getInstance();
 
+// Match a small, explicit set of serial-device path shapes:
+//   POSIX:  /dev/tty*, /dev/serial/by-*, /dev/serial0, /dev/ttyACM0
+//   Windows: COM1 .. COM999
+// Rejects /dev/kmsg, /dev/tty (bare controlling tty), symlinks that would
+// escape, and NUL/newline injection.
+function isAllowedSerialPath(rawPath: string): boolean {
+  if (typeof rawPath !== "string") return false;
+  if (rawPath.length === 0 || rawPath.length > 256) return false;
+  if (/[\0\n\r]/.test(rawPath)) return false;
+  if (/^COM\d{1,3}$/i.test(rawPath)) return true;
+  if (!rawPath.startsWith("/dev/")) return false;
+  if (rawPath === "/dev/tty") return false;
+  return (
+    /^\/dev\/tty(?:S|USB|ACM|AMA|XRUSB|GS)\d{1,3}$/.test(rawPath) ||
+    /^\/dev\/serial\/(?:by-id|by-path)\/[A-Za-z0-9._@:+-]+$/.test(rawPath) ||
+    /^\/dev\/serial\d{1,3}$/.test(rawPath) ||
+    /^\/dev\/rfcomm\d{1,3}$/.test(rawPath)
+  );
+}
+
 const wss = new WebSocketServer({ port: 30011 });
 
 wss.on("error", (error) => {
@@ -125,6 +145,19 @@ wss.on("connection", async (ws: WebSocket, req) => {
         const cfg = data as SerialConnectData;
         if (!cfg?.path || !cfg?.baudRate) {
           send({ type: "error", data: "Missing port path or baud rate" });
+          break;
+        }
+
+        // Reject anything that isn't a well-known serial device path. Without
+        // this, the client can point the SerialPort at any character device
+        // (e.g. /dev/kmsg, another user's plugged-in device, /dev/tty).
+        if (!isAllowedSerialPath(cfg.path)) {
+          sshLogger.warn("Serial connect refused - path not in allowlist", {
+            operation: "serial_open_refused",
+            path: cfg.path,
+            userId,
+          });
+          send({ type: "error", data: "Invalid or disallowed serial device path" });
           break;
         }
 

@@ -163,7 +163,7 @@ export class GuacamoleTokenService {
           ...(username ? { username } : {}),
           ...(password ? { password } : {}),
           port: 3389,
-          "ignore-cert": true,
+          "ignore-cert": false,
           ...(!username && !password ? { "disable-auth": true } : {}),
           ...settingsOptions,
         },

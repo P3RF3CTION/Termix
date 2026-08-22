@@ -14,13 +14,29 @@ function getAllowedOrigins(): string[] {
     .filter(Boolean);
 }
 
-function isLocalRequest(req: Request): boolean {
-  const remoteAddr = req.socket?.remoteAddress || req.ip || "";
-  return (
+// True only if the *direct* TCP peer is loopback and there is no forwarded-for
+// chain — a request coming through a reverse proxy still terminates on
+// loopback, so `req.socket.remoteAddress` alone is not proof of trust.
+function isDirectLoopbackRequest(req: Request): boolean {
+  const remoteAddr = req.socket?.remoteAddress || "";
+  const isLoopback =
     remoteAddr === "127.0.0.1" ||
     remoteAddr === "::1" ||
-    remoteAddr === "::ffff:127.0.0.1"
-  );
+    remoteAddr === "::ffff:127.0.0.1";
+  if (!isLoopback) return false;
+  const forwarded =
+    req.headers["x-forwarded-for"] ||
+    req.headers["x-real-ip"] ||
+    req.headers["forwarded"];
+  return !forwarded;
+}
+
+function isElectronAppRequest(req: Request): boolean {
+  const header = req.headers["x-electron-app"];
+  if (Array.isArray(header)) {
+    return header.some((v) => typeof v === "string" && v.toLowerCase() === "true");
+  }
+  return typeof header === "string" && header.toLowerCase() === "true";
 }
 
 export function createCorsMiddleware(
@@ -47,16 +63,29 @@ export function createCorsMiddleware(
         // No origin = same-origin or non-browser request (curl, internal service calls)
         if (!origin) return callback(null, true);
 
-        // Requests coming from localhost (nginx proxy, internal service calls)
-        if (isLocalRequest(req)) return callback(null, true);
+        // Requests from a direct-loopback client with no forwarded-for chain
+        // (nginx sidecar bug, internal service calls). Not merely
+        // "req.socket is loopback" — the reverse proxy always looks loopback.
+        if (isDirectLoopbackRequest(req)) return callback(null, true);
 
         if (DEV_ORIGINS.includes(origin)) return callback(null, true);
-        if (origin.startsWith(ELECTRON_FILE_ORIGIN))
+
+        // Electron renderer loads via file://. Only accept file:// when the
+        // request carries the bundled app's X-Electron-App marker; otherwise
+        // any other local file-scheme app could piggyback with credentials.
+        if (
+          origin.startsWith(ELECTRON_FILE_ORIGIN) &&
+          isElectronAppRequest(req)
+        ) {
           return callback(null, true);
+        }
 
         const configured = getAllowedOrigins();
-        if (configured.includes("*") || configured.includes(origin))
-          return callback(null, true);
+        // A wildcard entry may only be honoured when credentials are OFF,
+        // which we cannot signal per-request via the `cors` module while
+        // credentials:true is set globally. Refuse `*` here so no browser
+        // ever receives Access-Control-Allow-Origin:* with credentials.
+        if (configured.includes(origin)) return callback(null, true);
 
         const sameOrigin = getRequestOrigin(req);
         if (origin === sameOrigin) return callback(null, true);

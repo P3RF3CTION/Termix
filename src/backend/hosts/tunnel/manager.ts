@@ -46,6 +46,7 @@ import { resolveSshConnectConfigHost } from "../ssh-dns.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
 import { handleSocks5Connect } from "./socks5-relay.js";
 import { notifyAutomationInternalEvent } from "../metrics/automation-bridge.js";
+import { SSHHostKeyVerifier } from "../host-key-verifier.js";
 
 export const activeTunnels = new Map<string, Client>();
 export const retryCounters = new Map<string, number>();
@@ -1531,6 +1532,40 @@ export async function connectSSHTunnel(
     }
   }
 
+  // Attach host key verification. Without it, ssh2 accepts whatever key the
+  // server presents, so a persistent tunnel silently negotiates SSH with an
+  // on-path attacker. `SSHHostKeyVerifier.createHostVerifier` mirrors the
+  // pattern used by terminal/docker/file-manager: check against the stored
+  // fingerprint, TOFU-store on first sight (no prompt available for tunnels).
+  if (tunnelConfig.sourceHostId && tunnelConfig.sourceUserId) {
+    try {
+      connOptions.hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+        tunnelConfig.sourceHostId,
+        String(connOptions.host || tunnelConfig.sourceIP),
+        Number(connOptions.port || tunnelConfig.sourceSSHPort || 22),
+        null,
+        tunnelConfig.sourceUserId,
+        false,
+      );
+    } catch (verifierError) {
+      tunnelLogger.error(
+        "Failed to build host key verifier for tunnel",
+        verifierError,
+        {
+          operation: "tunnel_hostkey_verifier_failed",
+          tunnelName,
+        },
+      );
+      broadcastTunnelStatus(tunnelName, {
+        connected: false,
+        status: CONNECTION_STATES.FAILED,
+        reason: "Failed to initialize host key verifier",
+      });
+      tunnelConnecting.delete(tunnelName);
+      return;
+    }
+  }
+
   try {
     await resolveSshConnectConfigHost(connOptions);
   } catch (error) {
@@ -1731,6 +1766,24 @@ export async function killRemoteTunnelByMarker(
         throw new Error(
           "SOCKS5 proxy connection failed: " + getErrorMessage(socks5Error),
           { cause: socks5Error },
+        );
+      }
+    }
+
+    if (tunnelConfig.sourceHostId && tunnelConfig.sourceUserId) {
+      try {
+        connOptions.hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+          tunnelConfig.sourceHostId,
+          String(connOptions.host || tunnelConfig.sourceIP),
+          Number(connOptions.port || tunnelConfig.sourceSSHPort || 22),
+          null,
+          tunnelConfig.sourceUserId,
+          false,
+        );
+      } catch (verifierError) {
+        throw new Error(
+          "Failed to initialize host key verifier for remote tunnel cleanup",
+          { cause: verifierError },
         );
       }
     }

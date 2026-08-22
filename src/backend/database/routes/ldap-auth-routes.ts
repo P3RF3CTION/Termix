@@ -3,6 +3,7 @@ import type { LDAPProviderConfig } from "../../../types/index.js";
 import { nanoid } from "nanoid";
 import { authLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { parseUserAgent } from "../../utils/user-agent-parser.js";
 import { isOIDCUserAllowed, loadProviderConfig } from "./user-oidc-utils.js";
 import ldap from "ldapjs";
@@ -22,15 +23,50 @@ function ldapEscapeFilter(value: string): string {
   );
 }
 
+function ldapTlsRejectUnauthorized(): boolean {
+  const raw = process.env.LDAP_TLS_REJECT_UNAUTHORIZED;
+  if (raw === undefined) return true;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "false" || normalized === "0" || normalized === "no") {
+    return false;
+  }
+  return true;
+}
+
 function createLDAPClient(
   host: string,
   port: number,
   useTLS: boolean,
 ): ldap.Client {
   const url = `${useTLS ? "ldaps" : "ldap"}://${host}:${port}`;
+  let tlsOptions: Record<string, unknown> | undefined;
+  if (useTLS) {
+    const rejectUnauthorized = ldapTlsRejectUnauthorized();
+    tlsOptions = { rejectUnauthorized };
+    const caPath = process.env.LDAP_TLS_CA_FILE;
+    if (rejectUnauthorized && caPath) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const fs = require("fs");
+        tlsOptions.ca = fs.readFileSync(caPath);
+      } catch (err) {
+        authLogger.warn("Failed to load LDAP_TLS_CA_FILE, continuing without", {
+          operation: "ldap_tls_ca_load_failed",
+          caPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (!rejectUnauthorized) {
+      authLogger.warn(
+        "LDAPS certificate verification is disabled (LDAP_TLS_REJECT_UNAUTHORIZED=false). This exposes bind credentials to on-path attackers.",
+        { operation: "ldaps_tls_verification_disabled", host, port },
+      );
+    }
+  }
   return ldap.createClient({
     url,
-    tlsOptions: useTLS ? { rejectUnauthorized: false } : undefined,
+    tlsOptions,
   });
 }
 
@@ -122,10 +158,27 @@ export function registerLDAPAuthRoutes(router: Router): void {
         .json({ error: "providerId, username, and password are required" });
     }
 
+    const clientIp = req.socket?.remoteAddress || req.ip || "unknown";
+    const rateKey = `ldap:${providerId}:${username}`;
+    const lockStatus = loginRateLimiter.isLocked(clientIp, rateKey);
+    if (lockStatus.locked) {
+      authLogger.warn("LDAP login blocked due to rate limiting", {
+        operation: "ldap_login_blocked",
+        providerId,
+        remainingTime: lockStatus.remainingTime,
+      });
+      return res.status(429).json({
+        error: `Rate limited: Too many login attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
+        remainingTime: lockStatus.remainingTime,
+        code: "LOGIN_RATE_LIMITED",
+      });
+    }
+
     try {
       const provider =
         await createCurrentSsoProviderRepository().findById(providerId);
       if (!provider || provider.type !== "ldap" || !provider.enabled) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
         return res.status(404).json({ error: "LDAP provider not found" });
       }
     } catch (err) {
@@ -174,6 +227,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
       );
 
       if (entries.length === 0) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
         authLogger.warn("LDAP user not found", {
           operation: "ldap_login",
           username,
@@ -224,6 +278,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
       try {
         await ldapBind(userClient, userDN, password);
       } catch {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
         authLogger.warn("LDAP bind failed - wrong password", {
           operation: "ldap_login",
           ldapIdentifier,
@@ -232,6 +287,7 @@ export function registerLDAPAuthRoutes(router: Router): void {
       } finally {
         ldapUnbind(userClient);
       }
+      loginRateLimiter.resetAttempts(clientIp, rateKey);
 
       // Admin group check
       let isAdmin = false;

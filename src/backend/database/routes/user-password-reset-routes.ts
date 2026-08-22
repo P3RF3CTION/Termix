@@ -162,13 +162,25 @@ export function registerUserPasswordResetRoutes(
       return res.status(400).json({ error: "Username is required" });
     }
 
+    // Per-username throttle on initiation — an unbounded initiate lets an
+    // attacker keep rotating the stored code, floods logs, and can defeat
+    // the verify-side lockout by resetting on every attempt.
+    const initiateLock = loginRateLimiter.isResetCodeLocked(username);
+    if (initiateLock.locked) {
+      return res.status(429).json({
+        error: `Rate limited: Too many password reset attempts. Please wait ${initiateLock.remainingTime} seconds before trying again.`,
+        remainingTime: initiateLock.remainingTime,
+        code: "RESET_CODE_RATE_LIMITED",
+      });
+    }
+
     try {
       const user = await createCurrentUserRepository().findByUsername(username);
 
       if (!user) {
-        authLogger.warn(
-          `Password reset attempted for non-existent user: ${username}`,
-        );
+        authLogger.warn("Password reset attempted for non-existent user", {
+          operation: "password_reset_unknown_user",
+        });
         return res.json({
           message:
             "If the user exists, a password reset code has been generated. Check docker logs for the code.",
@@ -183,23 +195,40 @@ export function registerUserPasswordResetRoutes(
       }
 
       const resetCode = crypto.randomInt(100000, 1000000).toString();
+      const codeHash = crypto
+        .createHash("sha256")
+        .update(resetCode)
+        .digest("hex");
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
       await createCurrentSettingsRepository().set(
         `reset_code_${username}`,
         JSON.stringify({
-          code: resetCode,
+          codeHash,
           expiresAt: expiresAt.toISOString(),
         }),
       );
 
-      authLogger.info(
-        `Password reset code generated for user ${username}: ${resetCode} (expires at ${expiresAt.toLocaleString()})`,
-      );
+      // The reset code is intentionally logged only via the dedicated banner
+      // path below (stdout printed at server startup for on-box operators);
+      // never emit it into structured logs or aggregators.
+      if (
+        process.stdout &&
+        typeof (process.stdout as { write?: unknown }).write === "function"
+      ) {
+        process.stdout.write(
+          `\n[PASSWORD RESET] user=${username} code=${resetCode} expires=${expiresAt.toISOString()}\n\n`,
+        );
+      }
+      authLogger.info("Password reset code generated", {
+        operation: "password_reset_generated",
+        username,
+        expiresAt: expiresAt.toISOString(),
+      });
 
       res.json({
         message:
-          "Password reset code has been generated and logged. Check docker logs for the code.",
+          "Password reset code has been generated and printed on the server console. Check the server output (docker logs) for the code.",
       });
     } catch (err) {
       authLogger.error("Failed to initiate password reset", err);
@@ -301,7 +330,23 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      const providedHash = crypto
+        .createHash("sha256")
+        .update(resetCode)
+        .digest("hex");
+      const storedHash: string | undefined =
+        typeof resetData.codeHash === "string"
+          ? resetData.codeHash
+          : typeof resetData.code === "string"
+            ? crypto.createHash("sha256").update(resetData.code).digest("hex")
+            : undefined;
+      const storedHashBuf = storedHash ? Buffer.from(storedHash, "hex") : null;
+      const providedHashBuf = Buffer.from(providedHash, "hex");
+      const matches =
+        !!storedHashBuf &&
+        storedHashBuf.length === providedHashBuf.length &&
+        crypto.timingSafeEqual(storedHashBuf, providedHashBuf);
+      if (!matches) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -398,7 +443,12 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      const storedTokenBuf = Buffer.from(String(tempTokenData.token), "utf8");
+      const providedTokenBuf = Buffer.from(tempToken, "utf8");
+      if (
+        storedTokenBuf.length !== providedTokenBuf.length ||
+        !crypto.timingSafeEqual(storedTokenBuf, providedTokenBuf)
+      ) {
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 

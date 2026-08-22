@@ -17,6 +17,7 @@ interface ProxyCacheEntry {
 const proxyCache = new Map<string, ProxyCacheEntry>();
 const CACHE_SIZE = 50;
 const FETCH_TIMEOUT_MS = 8000;
+const MAX_PROXY_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MB
 
 async function resolvePublicUrl(rawUrl: string): Promise<{
   url: URL;
@@ -61,8 +62,22 @@ async function fetchJson(rawUrl: string): Promise<unknown> {
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        let total = 0;
+        let aborted = false;
+        res.on("data", (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > MAX_PROXY_RESPONSE_BYTES) {
+            if (!aborted) {
+              aborted = true;
+              res.destroy();
+              reject(new Error("Response too large"));
+            }
+            return;
+          }
+          chunks.push(chunk);
+        });
         res.on("end", () => {
+          if (aborted) return;
           try {
             const text = Buffer.concat(chunks).toString("utf-8");
             resolve(JSON.parse(text));

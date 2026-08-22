@@ -102,8 +102,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on(channel, listener);
     return () => ipcRenderer.removeListener(channel, listener);
   },
-
-  invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
 });
 
 contextBridge.exposeInMainWorld("electronClipboard", {

@@ -23,7 +23,7 @@ describe("GuacamoleTokenService", () => {
     expect(decrypted?.connection.settings).toMatchObject({
       hostname: "windows.example.test",
       port: 3389,
-      "ignore-cert": true,
+      "ignore-cert": false,
       "disable-auth": true,
     });
     expect(decrypted?.connection.settings.username).toBeUndefined();

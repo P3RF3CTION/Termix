@@ -16,6 +16,34 @@ interface RssItem {
   description: string | null;
 }
 
+function safeFeedLink(raw: string | undefined): string {
+  if (!raw) return "";
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const lower = trimmed.toLowerCase();
+  // Refuse javascript:, data:, vbscript:, file: and any other non-http scheme
+  // reaching an <a href> in the RSS widget — React does not block these.
+  if (
+    lower.startsWith("javascript:") ||
+    lower.startsWith("data:") ||
+    lower.startsWith("vbscript:") ||
+    lower.startsWith("file:")
+  ) {
+    return "";
+  }
+  try {
+    const parsed = new URL(
+      trimmed,
+      trimmed.startsWith("//") ? "https:" : undefined,
+    );
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.toString();
+  } catch {
+    // Relative or malformed links — drop them rather than pass through raw.
+    return "";
+  }
+}
+
 function fetchXml(url: string): Promise<string> {
   return safeOutboundFetch(url, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -51,7 +79,7 @@ function parseRss(xml: string): RssItem[] {
     const src = match[1];
     items.push({
       title: getText("title", src) ?? "(no title)",
-      link: getLink(src),
+      link: safeFeedLink(getLink(src)),
       pubDate: getText("pubDate", src) ?? getText("updated", src),
       description: getText("description", src) ?? getText("summary", src),
     });
@@ -66,7 +94,7 @@ function parseRss(xml: string): RssItem[] {
       const linkMatch = /<link[^>]+href="([^"]+)"/.exec(src);
       items.push({
         title: getText("title", src) ?? "(no title)",
-        link: linkMatch?.[1] ?? "",
+        link: safeFeedLink(linkMatch?.[1]),
         pubDate: getText("published", src) ?? getText("updated", src),
         description: getText("summary", src) ?? getText("content", src),
       });

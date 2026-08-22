@@ -245,7 +245,7 @@ export function isOIDCUserAllowed(
     if (pattern.includes("*")) {
       const escaped = pattern
         .toLowerCase()
-        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/[.+?^${}()|[\]\\-]/g, "\\$&")
         .replace(/\*/g, ".*");
       const regex = new RegExp(`^${escaped}$`);
       if (values.some((v) => v && regex.test(v.toLowerCase()))) return true;
@@ -371,6 +371,18 @@ export async function verifyOIDCToken(
   const { payload } = await jwtVerify(idToken, key, {
     issuer: possibleIssuers,
     audience: clientId,
+    algorithms: [
+      "RS256",
+      "RS384",
+      "RS512",
+      "PS256",
+      "PS384",
+      "PS512",
+      "ES256",
+      "ES384",
+      "ES512",
+      "EdDSA",
+    ],
   });
 
   return payload;

@@ -12,6 +12,25 @@ const faviconCache = new Map<
 >();
 const CACHE_SIZE = 100;
 const CACHE_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
+const MAX_FAVICON_BYTES = 512 * 1024; // 512 KB
+
+// Only serve well-known raster favicon types. Notably excludes image/svg+xml
+// to avoid the SVG-as-script vector when a favicon is later rendered inside
+// <object>/<iframe>/direct navigation.
+const ALLOWED_FAVICON_TYPES = new Set([
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+
+function normaliseFaviconType(raw: string | undefined): string {
+  if (!raw) return "image/x-icon";
+  const lower = raw.split(";")[0].trim().toLowerCase();
+  return ALLOWED_FAVICON_TYPES.has(lower) ? lower : "image/x-icon";
+}
 
 function evictIfNeeded() {
   if (faviconCache.size >= CACHE_SIZE) {
@@ -25,11 +44,25 @@ function fetchUrl(url: string): Promise<{ data: Buffer; contentType: string }> {
     const mod = url.startsWith("https") ? https : http;
     const req = mod.get(url, { timeout: 5000 }, (res) => {
       const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      let total = 0;
+      let aborted = false;
+      res.on("data", (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > MAX_FAVICON_BYTES) {
+          if (!aborted) {
+            aborted = true;
+            res.destroy();
+            reject(new Error("Favicon response too large"));
+          }
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on("end", () => {
+        if (aborted) return;
         resolve({
           data: Buffer.concat(chunks),
-          contentType: res.headers["content-type"] || "image/x-icon",
+          contentType: normaliseFaviconType(res.headers["content-type"]),
         });
       });
       res.on("error", reject);
@@ -78,6 +111,7 @@ homepageFaviconRouter.get("/", async (req: Request, res: Response) => {
   const cached = faviconCache.get(domain);
   if (cached && cached.expires > Date.now()) {
     res.setHeader("Content-Type", cached.contentType);
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "public, max-age=86400");
     return res.send(cached.data);
   }
@@ -93,6 +127,7 @@ homepageFaviconRouter.get("/", async (req: Request, res: Response) => {
       expires: Date.now() + CACHE_TTL_MS,
     });
     res.setHeader("Content-Type", contentType);
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.send(data);
   } catch (err) {

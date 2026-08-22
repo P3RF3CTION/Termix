@@ -84,8 +84,9 @@ export class SSHHostKeyVerifier {
                 );
 
           if (!host) {
-            sshLogger.warn(
-              "Host not found in database during key verification",
+            sshLogger.error(
+              "Host not found in database during key verification - refusing connection",
+              undefined,
               {
                 operation: "host_key_no_host",
                 hostId,
@@ -94,7 +95,7 @@ export class SSHHostKeyVerifier {
                 userId,
               },
             );
-            verify(true);
+            verify(false);
             return;
           }
 
@@ -206,24 +207,50 @@ export class SSHHostKeyVerifier {
           });
 
           if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
+            const allowAutoAccept =
+              process.env.JUMP_HOST_AUTO_ACCEPT_KEY_CHANGE === "true";
+            if (allowAutoAccept) {
+              await this.updateHostKey(
+                hostId,
+                fingerprint,
+                keyType,
+                algorithm,
+                host.hostKeyChangedCount || 0,
+              );
+              sshLogger.warn(
+                "Jump host key changed - auto-accepted (JUMP_HOST_AUTO_ACCEPT_KEY_CHANGE=true)",
+                {
+                  operation: "host_key_updated",
+                  hostId,
+                  ip,
+                  port,
+                  fingerprint,
+                  keyType,
+                  userId,
+                  isJumpHost: true,
+                },
+              );
+              verify(true);
+              return;
+            }
+
+            sshLogger.error(
+              "Jump host key changed - refusing connection (possible MITM). Verify the new key and reconnect via Terminal to accept.",
+              undefined,
+              {
+                operation: "host_key_change_rejected_jump",
+                hostId,
+                ip,
+                port,
+                oldFingerprint: host.hostKeyFingerprint,
+                newFingerprint: fingerprint,
+                oldKeyType: host.hostKeyType,
+                newKeyType: keyType,
+                userId,
+                isJumpHost: true,
+              },
             );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
+            verify(false);
             return;
           }
 

@@ -81,6 +81,41 @@ router.use(authManager.createAuthMiddleware());
  */
 router.post("/token", async (req, res) => {
   try {
+    // The token endpoint mints a live guacd connect token for any hostname
+    // the caller supplies, which historically let any authenticated user
+    // scan or brute-force internal RDP/VNC/Telnet targets. Restrict to
+    // admins; use /connect-host/:hostId for permissioned connections.
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    try {
+      const { createCurrentUserRepository } = await import(
+        "../../database/repositories/factory.js"
+      );
+      const user = await createCurrentUserRepository().findById(authReq.userId);
+      if (!user?.isAdmin) {
+        guacLogger.warn(
+          "Non-admin attempted to mint arbitrary guacamole token",
+          {
+            operation: "guac_token_forbidden",
+            userId: authReq.userId,
+          },
+        );
+        return res.status(403).json({
+          error: "Forbidden: /guacamole/token requires admin privileges",
+        });
+      }
+    } catch (adminCheckError) {
+      guacLogger.error(
+        "Failed to verify admin for guacamole token",
+        adminCheckError,
+      );
+      return res
+        .status(500)
+        .json({ error: "Failed to verify admin privileges" });
+    }
+
     const { type, hostname, port, username, password, domain, ...rawOptions } =
       req.body;
 
@@ -637,7 +672,7 @@ router.post(
                   ? !!host.rdpIgnoreCert
                   : host.ignoreCert !== undefined
                     ? !!host.ignoreCert
-                    : true,
+                    : false,
               guacConfig,
               guacdOverrides,
             }),

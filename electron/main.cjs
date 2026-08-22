@@ -1204,14 +1204,27 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      // webSecurity is intentionally disabled: the packaged app loads the
+      // renderer from file:// and calls the backend over http(s)://, which
+      // same-origin policy would block. The corresponding trust boundary
+      // is enforced at the preload (no generic ipcRenderer.invoke bridge)
+      // and by refusing <webview> attaches (see will-attach-webview below).
       webSecurity: false,
       preload: path.join(__dirname, "preload.js"),
       partition: termixSessionPartition,
       allowRunningInsecureContent: true,
-      webviewTag: true,
+      // <webview> is not used by the app; disabling it removes an easy
+      // navigation-escape vector for any XSS in the renderer.
+      webviewTag: false,
       offscreen: false,
     },
     show: true,
+  });
+
+  mainWindow.webContents.on("will-attach-webview", (event) => {
+    // Defence-in-depth: refuse any attempted <webview> attach even if the
+    // preference above were re-enabled by mistake.
+    event.preventDefault();
   });
 
   mainWindow.webContents.session.setPermissionRequestHandler(

@@ -1,8 +1,24 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import QRCode from "qrcode";
 import speakeasy from "speakeasy";
+
+const BACKUP_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function generateBackupCode(): string {
+  const bytes = crypto.randomBytes(8);
+  let out = "";
+  for (let i = 0; i < 8; i++) {
+    out += BACKUP_CODE_ALPHABET[bytes[i] % BACKUP_CODE_ALPHABET.length];
+  }
+  return out;
+}
+
+function generateBackupCodes(count = 8): string[] {
+  return Array.from({ length: count }, () => generateBackupCode());
+}
 import { AuthManager } from "../../utils/auth-manager.js";
 import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
 import { FieldCrypto } from "../../utils/field-crypto.js";
@@ -51,7 +67,7 @@ export async function verifyTotpReauth(
         secret: totpSecret,
         encoding: "base32",
         token: credential,
-        window: 2,
+        window: 1,
       });
       if (totpMatch) {
         return true;
@@ -237,16 +253,14 @@ export function registerUserTotpRoutes(
         secret: totpSecret,
         encoding: "base32",
         token: totp_code,
-        window: 2,
+        window: 1,
       });
 
       if (!verified) {
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateBackupCodes(8);
 
       const backupCodesJson = JSON.stringify(backupCodes);
       const storedBackupCodes = userDataKey
@@ -456,9 +470,7 @@ export function registerUserTotpRoutes(
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
 
-      const backupCodes = Array.from({ length: 8 }, () =>
-        Math.random().toString(36).substring(2, 10).toUpperCase(),
-      );
+      const backupCodes = generateBackupCodes(8);
 
       const backupCodesJson = JSON.stringify(backupCodes);
       const storedBackupCodes = userDataKey
@@ -548,8 +560,6 @@ export function registerUserTotpRoutes(
         });
       }
 
-      loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
-
       if (!userRecord.totpEnabled || !userRecord.totpSecret) {
         return res
           .status(400)
@@ -588,26 +598,35 @@ export function registerUserTotpRoutes(
         secret: totpSecret,
         encoding: "base32",
         token: totp_code,
-        window: 2,
+        window: 1,
       });
 
       if (!verified) {
-        let backupCodes = [];
-        try {
-          backupCodes = userRecord.totpBackupCodes
-            ? JSON.parse(userRecord.totpBackupCodes)
-            : [];
-        } catch {
-          backupCodes = [];
-        }
+        const rawBackupCodes = userRecord.totpBackupCodes
+          ? LazyFieldEncryption.safeGetFieldValue(
+              userRecord.totpBackupCodes,
+              userDataKey,
+              userRecord.id,
+              "totpBackupCodes",
+            )
+          : null;
 
-        if (!Array.isArray(backupCodes)) {
+        let backupCodes: string[] = [];
+        try {
+          const parsed = rawBackupCodes ? JSON.parse(rawBackupCodes) : [];
+          if (Array.isArray(parsed)) {
+            backupCodes = parsed.filter(
+              (v): v is string => typeof v === "string",
+            );
+          }
+        } catch {
           backupCodes = [];
         }
 
         const backupIndex = backupCodes.indexOf(totp_code);
 
         if (backupIndex === -1) {
+          loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
           authLogger.warn("TOTP verification failed - invalid code", {
             operation: "totp_verify_failed",
             userId: userRecord.id,
@@ -624,8 +643,15 @@ export function registerUserTotpRoutes(
         }
 
         backupCodes.splice(backupIndex, 1);
+        const updatedJson = JSON.stringify(backupCodes);
+        const storedValue = FieldCrypto.encryptField(
+          updatedJson,
+          userDataKey,
+          userRecord.id,
+          "totpBackupCodes",
+        );
         await createCurrentUserRepository().update(userRecord.id, {
-          totpBackupCodes: JSON.stringify(backupCodes),
+          totpBackupCodes: storedValue,
         });
       }
 

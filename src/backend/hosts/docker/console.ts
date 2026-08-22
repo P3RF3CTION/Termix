@@ -8,6 +8,7 @@ import { createCurrentHostResolutionRepository } from "../../database/repositori
 import { systemLogger } from "../../utils/logger.js";
 import type { SSHHost } from "../../../types/index.js";
 import { applyAgentAuth } from "../terminal-auth-helpers.js";
+import { SSHHostKeyVerifier } from "../host-key-verifier.js";
 import {
   containerCommand,
   getContainerRuntimeConfig,
@@ -165,6 +166,14 @@ async function createJumpHostChain(
       keepaliveCountMax: 120,
       tcpKeepAlive: true,
       tcpKeepAliveInitialDelay: 30000,
+      hostVerifier: await SSHHostKeyVerifier.createHostVerifier(
+        jumpHost.id ?? null,
+        jumpHost.ip,
+        jumpHost.port || 22,
+        null,
+        userId,
+        true,
+      ),
       algorithms: {
         kex: [
           "curve25519-sha256",
@@ -465,6 +474,14 @@ wss.on("connection", async (ws: WebSocket, req) => {
               keepaliveCountMax: 120,
               tcpKeepAlive: true,
               tcpKeepAliveInitialDelay: 30000,
+              hostVerifier: await SSHHostKeyVerifier.createHostVerifier(
+                resolvedHost.id,
+                resolvedHost.ip,
+                resolvedHost.port || 22,
+                null,
+                userId,
+                false,
+              ),
             };
 
             if (resolvedHost.authType === "password" && resolvedHost.password) {

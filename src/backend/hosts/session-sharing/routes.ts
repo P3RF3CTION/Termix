@@ -409,7 +409,10 @@ router.delete(
  */
 router.get("/resolve/:linkToken", async (req: Request, res: Response) => {
   try {
-    const ip = req.ip || req.socket.remoteAddress || "unknown";
+    // req.ip honours X-Forwarded-For under `trust proxy`, which is spoofable
+    // from any unauthenticated caller — use the direct TCP peer instead so
+    // the counter can't be reset by rotating a header.
+    const ip = req.socket.remoteAddress || "unknown";
     if (isResolveRateLimited(ip)) {
       return res.status(429).json({ error: "Too many requests" });
     }

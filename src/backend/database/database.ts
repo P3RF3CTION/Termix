@@ -1,4 +1,5 @@
 import { getErrorMessage } from "../utils/error-message.js";
+import crypto from "crypto";
 import express from "express";
 import http from "http";
 import https from "https";
@@ -73,7 +74,29 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-app.set("trust proxy", true);
+// `trust proxy: true` blindly trusts every X-Forwarded-* header, letting any
+// unauthenticated caller spoof req.ip (which the rate limiter and audit log
+// then use). Prefer an explicit hop count or CIDR list via TRUST_PROXY —
+// e.g. TRUST_PROXY="loopback" or TRUST_PROXY="10.0.0.0/8,172.16.0.0/12".
+{
+  const raw = (process.env.TRUST_PROXY || "").trim();
+  if (raw === "" || raw === "true") {
+    // Default: only trust loopback (a single hop from an on-box reverse proxy)
+    app.set("trust proxy", "loopback");
+  } else if (raw === "false") {
+    app.set("trust proxy", false);
+  } else if (/^\d+$/.test(raw)) {
+    app.set("trust proxy", Number(raw));
+  } else {
+    app.set(
+      "trust proxy",
+      raw
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean),
+    );
+  }
+}
 
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -126,9 +149,13 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadsDir);
   },
-  filename: (req, file, cb) => {
-    const timestamp = Date.now();
-    cb(null, `${timestamp}-${file.originalname}`);
+  filename: (_req, _file, cb) => {
+    // Never mix the client-supplied originalname into the on-disk path — even
+    // with a leading timestamp, that value is untrusted (NUL bytes, ADS
+    // suffixes, log-injection). The upload flow only ever reads the file
+    // back by whatever name we hand out here.
+    const random = crypto.randomBytes(8).toString("hex");
+    cb(null, `${Date.now()}-${random}.sqlite`);
   },
 });
 
@@ -259,9 +286,17 @@ async function fetchGitHubAPI<T>(
   }
 }
 
-app.use(bodyParser.json({ limit: "1gb" }));
-app.use(bodyParser.urlencoded({ limit: "1gb", extended: true }));
-app.use(bodyParser.raw({ limit: "5gb", type: "application/octet-stream" }));
+// Body-parser limits are configurable via env; defaults are sized to real
+// operational needs (JSON payloads, urlencoded forms, and the raw upload
+// path used by the fleet transfer flow) rather than "as large as memory".
+const JSON_BODY_LIMIT = process.env.HTTP_BODY_JSON_LIMIT || "10mb";
+const URLENCODED_BODY_LIMIT = process.env.HTTP_BODY_URLENCODED_LIMIT || "10mb";
+const RAW_BODY_LIMIT = process.env.HTTP_BODY_RAW_LIMIT || "500mb";
+app.use(bodyParser.json({ limit: JSON_BODY_LIMIT }));
+app.use(bodyParser.urlencoded({ limit: URLENCODED_BODY_LIMIT, extended: true }));
+app.use(
+  bodyParser.raw({ limit: RAW_BODY_LIMIT, type: "application/octet-stream" }),
+);
 app.use(cookieParser());
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");

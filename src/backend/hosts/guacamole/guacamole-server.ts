@@ -165,7 +165,7 @@ const clientOptions = {
   connectionDefaultSettings: {
     rdp: {
       security: "any",
-      "ignore-cert": true,
+      "ignore-cert": false,
       "enable-wallpaper": false,
       "enable-font-smoothing": true,
       "enable-desktop-composition": false,
