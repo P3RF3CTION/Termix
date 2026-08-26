@@ -131,6 +131,12 @@ export class RawSqliteUserEncryptionMigrationStore implements UserEncryptionMigr
     fields: string[],
     record: Record<string, unknown>,
   ): void {
+    if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+      throw new Error('Invalid input');
+    }
+    if (!fields.every((field) => /^[a-zA-Z0-9_]+$/.test(field))) {
+      throw new Error('Invalid input');
+    }
     const setClause = fields.map((field) => `${field} = ?`).join(", ");
     const updateQuery =
       table === "users"
