@@ -1,4 +1,5 @@
 import { getCurrentRepositorySqlite } from "../database/repositories/factory.js";
+import { quoteIdent } from "./sql-identifier.js";
 
 export interface UserEncryptionMigrationRecord {
   id: number | string;
@@ -131,11 +132,13 @@ export class RawSqliteUserEncryptionMigrationStore implements UserEncryptionMigr
     fields: string[],
     record: Record<string, unknown>,
   ): void {
-    const setClause = fields.map((field) => `${field} = ?`).join(", ");
+    const setClause = fields
+      .map((field) => `${quoteIdent(field)} = ?`)
+      .join(", ");
     const updateQuery =
       table === "users"
-        ? `UPDATE ${table} SET ${setClause} WHERE id = ?`
-        : `UPDATE ${table} SET ${setClause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
+        ? `UPDATE ${quoteIdent(table)} SET ${setClause} WHERE id = ?`
+        : `UPDATE ${quoteIdent(table)} SET ${setClause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
     const updateValues = fields.map((field) => record[field]);
     updateValues.push(recordId);
 

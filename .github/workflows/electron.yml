@@ -119,8 +119,10 @@ jobs:
 
       - name: Get version
         id: package-version
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          $VERSION = "${{ inputs.version_override }}"
+          $VERSION = "$env:INPUT_VERSION_OVERRIDE"
           if ([string]::IsNullOrEmpty($VERSION)) {
             $VERSION = (Get-Content package.json | ConvertFrom-Json).version
           }
@@ -329,8 +331,10 @@ jobs:
 
       - name: Get version for Flatpak
         id: flatpak-version
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          VERSION="${{ inputs.version_override }}"
+          VERSION="$INPUT_VERSION_OVERRIDE"
           if [ -z "$VERSION" ]; then
             VERSION=$(node -p "require('./package.json').version")
           fi
@@ -573,8 +577,10 @@ jobs:
 
       - name: Get version for Homebrew
         id: homebrew-version
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          VERSION="${{ inputs.version_override }}"
+          VERSION="$INPUT_VERSION_OVERRIDE"
           if [ -z "$VERSION" ]; then
             VERSION=$(node -p "require('./package.json').version")
           fi

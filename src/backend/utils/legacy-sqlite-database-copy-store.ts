@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { databaseLogger } from "./logger.js";
+import { quoteIdent, quoteIdentList } from "./sql-identifier.js";
 
 interface LegacyTableDefinition {
   name: string;
@@ -79,7 +80,7 @@ export class LegacySqliteDatabaseCopyStore {
     tableName: string,
   ): number {
     const rows = originalDb
-      .prepare(`SELECT * FROM ${tableName}`)
+      .prepare(`SELECT * FROM ${quoteIdent(tableName)}`)
       .all() as Record<string, unknown>[];
 
     if (rows.length === 0) {
@@ -89,7 +90,7 @@ export class LegacySqliteDatabaseCopyStore {
     const columns = Object.keys(rows[0]);
     const placeholders = columns.map(() => "?").join(", ");
     const insertStmt = memoryDb.prepare(
-      `INSERT INTO ${tableName} (${columns.join(", ")}) VALUES (${placeholders})`,
+      `INSERT INTO ${quoteIdent(tableName)} (${quoteIdentList(columns)}) VALUES (${placeholders})`,
     );
 
     const insertTransaction = memoryDb.transaction(
@@ -145,10 +146,10 @@ export class LegacySqliteDatabaseCopyStore {
 
     for (const tableName of originalTables) {
       const originalCount = originalDb
-        .prepare(`SELECT COUNT(*) as count FROM ${tableName}`)
+        .prepare(`SELECT COUNT(*) as count FROM ${quoteIdent(tableName)}`)
         .get() as { count: number };
       const memoryCount = memoryDb
-        .prepare(`SELECT COUNT(*) as count FROM ${tableName}`)
+        .prepare(`SELECT COUNT(*) as count FROM ${quoteIdent(tableName)}`)
         .get() as { count: number };
 
       if (originalCount.count !== memoryCount.count) {
