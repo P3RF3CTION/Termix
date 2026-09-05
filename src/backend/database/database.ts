@@ -734,7 +734,19 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `termix-export-${user.username}-${timestamp}.sqlite`;
+    // The username is a user-controlled value with no path-safety check at
+    // registration (isNonEmptyString only). Interpolating it into the temp
+    // filename let `path.join` collapse a `../../` prefix and escape the
+    // temp-exports directory, giving any authenticated user a SQLite-format
+    // arbitrary file write anywhere the process can write. Strip to a
+    // basename and keep only safe filename characters before joining.
+    const safeUsernameSegment =
+      path
+        .basename(user.username || "")
+        .replace(/[^A-Za-z0-9._-]/g, "_")
+        .replace(/^\.+/, "")
+        .slice(0, 64) || "user";
+    const filename = `termix-export-${safeUsernameSegment}-${timestamp}.sqlite`;
     const tempPath = path.join(tempDir, filename);
 
     apiLogger.info("Creating export database", {

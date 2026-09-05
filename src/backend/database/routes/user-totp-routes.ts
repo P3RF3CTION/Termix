@@ -23,8 +23,81 @@ import {
   createCurrentUserRepository,
 } from "../repositories/factory.js";
 import type { UserRecord } from "../repositories/user-repository.js";
+import crypto from "crypto";
 
 type NativeAppRequestChecker = (req: Request) => boolean;
+
+// Track pendingTOTP JWTs that have already been redeemed for a full session.
+// The temp_token itself lives 10 minutes (see users.ts) and, as a stateless
+// JWT, was previously replayable to mint additional sessions from a single
+// successful TOTP exchange. Signature+exp is what jwt.verify checks; this map
+// carries the "already consumed" bit that a stateless token can't hold.
+const consumedTempTokens = new Map<string, number>();
+
+function isTempTokenConsumed(token: string): boolean {
+  const now = Date.now();
+  pruneReplayMaps(now);
+  return consumedTempTokens.has(hashTempToken(token));
+}
+
+// Guard against replay of a valid TOTP code across the ±2-step (~2.5 minute)
+// verification window: the same 30-second code should not be accepted twice.
+// Keyed by userId → set of recently accepted codes with their expiry.
+const usedTOTPCodes = new Map<string, Map<string, number>>();
+
+const TOTP_CODE_REPLAY_TTL_MS = 5 * 60 * 1000;
+const TEMP_TOKEN_CONSUMED_TTL_MS = 15 * 60 * 1000;
+
+function pruneReplayMaps(now: number): void {
+  for (const [token, expiresAt] of consumedTempTokens) {
+    if (expiresAt <= now) consumedTempTokens.delete(token);
+  }
+  for (const [userId, codes] of usedTOTPCodes) {
+    for (const [code, expiresAt] of codes) {
+      if (expiresAt <= now) codes.delete(code);
+    }
+    if (codes.size === 0) usedTOTPCodes.delete(userId);
+  }
+}
+
+function hashTempToken(token: string): string {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+function consumePendingTOTPToken(
+  token: string,
+  decoded: { exp?: number } | null,
+): boolean {
+  const now = Date.now();
+  pruneReplayMaps(now);
+  const digest = hashTempToken(token);
+  if (consumedTempTokens.has(digest)) return false;
+  const expMs =
+    decoded?.exp && Number.isFinite(decoded.exp)
+      ? decoded.exp * 1000
+      : now + TEMP_TOKEN_CONSUMED_TTL_MS;
+  consumedTempTokens.set(digest, expMs);
+  return true;
+}
+
+function recentlyUsedTOTPCode(userId: string, code: string): boolean {
+  const now = Date.now();
+  pruneReplayMaps(now);
+  const codes = usedTOTPCodes.get(userId);
+  if (!codes) return false;
+  const expiresAt = codes.get(code);
+  return typeof expiresAt === "number" && expiresAt > now;
+}
+
+function rememberUsedTOTPCode(userId: string, code: string): void {
+  const now = Date.now();
+  let codes = usedTOTPCodes.get(userId);
+  if (!codes) {
+    codes = new Map();
+    usedTOTPCodes.set(userId, codes);
+  }
+  codes.set(code, now + TOTP_CODE_REPLAY_TTL_MS);
+}
 
 interface UserTotpRoutesDeps {
   authenticateJWT: RequestHandler;
@@ -139,8 +212,22 @@ export function registerUserTotpRoutes(
         length: 32,
       });
 
+      // Encrypt the shared secret before it hits the settings table. Relying on
+      // the next-login lazy migration left the raw base32 on disk for however
+      // long that gap lasted, which is a permanent TOTP bypass for anyone who
+      // could read the users row (backup, admin export, SQLi elsewhere).
+      const setupUserDataKey = authManager.getUserDataKey(userId);
+      const storedSecret = setupUserDataKey
+        ? FieldCrypto.encryptField(
+            secret.base32,
+            setupUserDataKey,
+            userId,
+            "totpSecret",
+          )
+        : secret.base32;
+
       await createCurrentUserRepository().update(userId, {
-        totpSecret: secret.base32,
+        totpSecret: storedSecret,
       });
 
       const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url || "");
@@ -524,6 +611,17 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid temporary token" });
       }
 
+      // Bail out before touching state (DB writes, rate-limit buckets) if the
+      // same temp_token has already been redeemed for a full session — a
+      // stateless JWT would otherwise stay replayable for its 10-minute life.
+      if (isTempTokenConsumed(temp_token)) {
+        authLogger.warn("TOTP verification rejected - temp token replayed", {
+          operation: "totp_verify_replay_token",
+          userId: decoded.userId,
+        });
+        return res.status(401).json({ error: "Invalid temporary token" });
+      }
+
       const userRecord = await createCurrentUserRepository().findById(
         decoded.userId,
       );
@@ -589,11 +687,21 @@ export function registerUserTotpRoutes(
       });
 
       if (!verified) {
-        let backupCodes = [];
+        // Backup codes are encrypted with the user DEK (see /totp/enable and
+        // /totp/backup-codes). Reading the column raw and JSON-parsing the
+        // envelope produced [] every time, silently locking users out of the
+        // recovery path and, on the plaintext-legacy branch below, writing the
+        // remaining codes back in cleartext.
+        const rawBackupCodes = LazyFieldEncryption.safeGetFieldValue(
+          userRecord.totpBackupCodes,
+          userDataKey,
+          userRecord.id,
+          "totpBackupCodes",
+        );
+
+        let backupCodes: unknown = [];
         try {
-          backupCodes = userRecord.totpBackupCodes
-            ? JSON.parse(userRecord.totpBackupCodes)
-            : [];
+          backupCodes = rawBackupCodes ? JSON.parse(rawBackupCodes) : [];
         } catch {
           backupCodes = [];
         }
@@ -602,7 +710,8 @@ export function registerUserTotpRoutes(
           backupCodes = [];
         }
 
-        const backupIndex = backupCodes.indexOf(totp_code);
+        const backupCodesArray = backupCodes as string[];
+        const backupIndex = backupCodesArray.indexOf(totp_code);
 
         if (backupIndex === -1) {
           authLogger.warn("TOTP verification failed - invalid code", {
@@ -620,10 +729,47 @@ export function registerUserTotpRoutes(
           });
         }
 
-        backupCodes.splice(backupIndex, 1);
+        backupCodesArray.splice(backupIndex, 1);
+        const updatedJson = JSON.stringify(backupCodesArray);
+        const storedValue = FieldCrypto.encryptField(
+          updatedJson,
+          userDataKey,
+          userRecord.id,
+          "totpBackupCodes",
+        );
         await createCurrentUserRepository().update(userRecord.id, {
-          totpBackupCodes: JSON.stringify(backupCodes),
+          totpBackupCodes: storedValue,
         });
+      } else {
+        // TOTP code was valid, not a backup code. Guard against replay across
+        // the ±window: the same 30-second code accepted here must not be
+        // accepted a second time in the ~2.5 minutes it is still in-range.
+        if (recentlyUsedTOTPCode(userRecord.id, totp_code)) {
+          authLogger.warn("TOTP verification rejected - code already used", {
+            operation: "totp_verify_replay",
+            userId: userRecord.id,
+          });
+          return res.status(401).json({
+            error: "Invalid TOTP code",
+            remainingAttempts: loginRateLimiter.getRemainingTOTPAttempts(
+              userRecord.id,
+            ),
+          });
+        }
+        rememberUsedTOTPCode(userRecord.id, totp_code);
+      }
+
+      // The temp_token is a stateless JWT that lives for 10 minutes. Without a
+      // consumed marker it can be replayed to mint additional sessions in that
+      // window from the same successful TOTP exchange.
+      if (!consumePendingTOTPToken(temp_token, decoded)) {
+        authLogger.warn("TOTP verification rejected - temp token replayed", {
+          operation: "totp_verify_replay_token",
+          userId: userRecord.id,
+        });
+        return res
+          .status(401)
+          .json({ error: "Invalid temporary token" });
       }
 
       loginRateLimiter.resetTOTPAttempts(userRecord.id);
