@@ -1,4 +1,5 @@
 import { getCurrentRepositorySqlite } from "../database/repositories/factory.js";
+import { quoteIdent } from "./sql-identifier.js";
 
 export interface UserEncryptionMigrationRecord {
   id: number | string;
@@ -131,17 +132,24 @@ export class RawSqliteUserEncryptionMigrationStore implements UserEncryptionMigr
     fields: string[],
     record: Record<string, unknown>,
   ): void {
+    // Zwei Schichten, bewusst beide: die Allowlist weist alles zurueck, was
+    // kein schlichter Bezeichner ist (fail closed), quoteIdent setzt den
+    // verbliebenen Namen korrekt in Anfuehrungszeichen. Die Allowlist allein
+    // liesse ein SQL-Schluesselwort als Spaltenname zerbrechen, quoteIdent
+    // allein wuerde jeden beliebigen Namen klaglos einbauen.
     if (!/^[a-zA-Z0-9_]+$/.test(table)) {
-      throw new Error('Invalid input');
+      throw new Error("Invalid input");
     }
     if (!fields.every((field) => /^[a-zA-Z0-9_]+$/.test(field))) {
-      throw new Error('Invalid input');
+      throw new Error("Invalid input");
     }
-    const setClause = fields.map((field) => `${field} = ?`).join(", ");
+    const setClause = fields
+      .map((field) => `${quoteIdent(field)} = ?`)
+      .join(", ");
     const updateQuery =
       table === "users"
-        ? `UPDATE ${table} SET ${setClause} WHERE id = ?`
-        : `UPDATE ${table} SET ${setClause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
+        ? `UPDATE ${quoteIdent(table)} SET ${setClause} WHERE id = ?`
+        : `UPDATE ${quoteIdent(table)} SET ${setClause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
     const updateValues = fields.map((field) => record[field]);
     updateValues.push(recordId);
 

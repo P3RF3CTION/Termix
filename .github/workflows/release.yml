@@ -51,9 +51,10 @@ jobs:
       - name: Resolve versions
         id: info
         env:
+          INPUT_MODE: ${{ inputs.mode }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ inputs.mode }}" = "Overwrite release" ]; then
+          if [ "$INPUT_MODE" = "Overwrite release" ]; then
             DEV_BRANCH=""
             VERSION=$(node -p "require('./package.json').version")
           else
@@ -112,6 +113,8 @@ jobs:
         run: node scripts/sync-version.cjs --version "${{ needs.prep.outputs.version }}"
 
       - name: Commit changes to dev branch
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
         run: |
           git config user.name "LukeGus"
           git config user.email "bugattiguy527@gmail.com"
@@ -121,7 +124,7 @@ jobs:
             exit 0
           fi
 
-          if [ "${{ inputs.mode }}" = "Dry run" ]; then
+          if [ "$INPUT_MODE" = "Dry run" ]; then
             echo "DRY RUN: would commit and push the following changes to ${{ needs.prep.outputs.dev_branch }}:"
             git --no-pager diff --stat
             exit 0
@@ -240,19 +243,20 @@ jobs:
       - name: Open and squash-merge PR to main
         id: merge
         env:
+          INPUT_MODE: ${{ inputs.mode }}
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           DEV_BRANCH="${{ needs.prep.outputs.dev_branch }}"
           TITLE="release-${{ needs.prep.outputs.version }}"
 
-          if [ "${{ inputs.mode }}" = "Overwrite release" ]; then
+          if [ "$INPUT_MODE" = "Overwrite release" ]; then
             echo "OVERWRITE: no merge; building from main as-is."
             echo "build_ref=main" >> "$GITHUB_OUTPUT"
             echo "main_sha=$(gh api repos/${{ github.repository }}/commits/main -q .sha)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ "${{ inputs.mode }}" = "Dry run" ]; then
+          if [ "$INPUT_MODE" = "Dry run" ]; then
             echo "DRY RUN: would open and squash-merge a PR from $DEV_BRANCH into main."
             echo "DRY RUN: downstream jobs will build from $DEV_BRANCH instead of main."
             echo "build_ref=$DEV_BRANCH" >> "$GITHUB_OUTPUT"
@@ -462,6 +466,8 @@ jobs:
 
       - name: Commit and push docs branch
         working-directory: docs-repo
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
         run: |
           git config user.name "LukeGus"
           git config user.email "bugattiguy527@gmail.com"
@@ -471,7 +477,7 @@ jobs:
             exit 0
           fi
 
-          if [ "${{ inputs.mode }}" = "Dry run" ]; then
+          if [ "$INPUT_MODE" = "Dry run" ]; then
             echo "DRY RUN: would commit and push the following docs changes to dev-${{ needs.prep.outputs.version }}:"
             git --no-pager diff --stat
             exit 0

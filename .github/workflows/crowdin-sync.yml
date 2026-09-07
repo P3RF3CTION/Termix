@@ -19,8 +19,10 @@ jobs:
     steps:
       - name: Resolve target branch
         id: branch
+        env:
+          INPUT_BRANCH: ${{ inputs.branch }}
         run: |
-          BRANCH="${{ inputs.branch }}"
+          BRANCH="$INPUT_BRANCH"
           if [ -z "$BRANCH" ]; then
             BRANCH="${{ github.event.repository.default_branch }}"
           fi

@@ -64,9 +64,12 @@ jobs:
 
       - name: Determine tags
         id: tags
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUILD_TYPE: ${{ inputs.build_type }}
         run: |
-          VERSION=${{ inputs.version }}
-          BUILD_TYPE=${{ inputs.build_type }}
+          VERSION="$INPUT_VERSION"
+          BUILD_TYPE="$INPUT_BUILD_TYPE"
 
           TAGS=()
           ALL_TAGS=()
