@@ -39,8 +39,13 @@ const repository = vi.hoisted(() => ({
   deleteSchedule: vi.fn(),
 }));
 
+const userRepository = vi.hoisted(() => ({
+  findById: vi.fn(async () => ({ isAdmin: false })),
+}));
+
 vi.mock("../../../database/repositories/factory.js", () => ({
   createCurrentAutomationRepository: () => repository,
+  createCurrentUserRepository: () => userRepository,
 }));
 
 const run = vi.hoisted(() => vi.fn());
@@ -357,6 +362,51 @@ describe("POST /", () => {
     expect((body.definition.trigger as { tokenHash: string }).tokenHash).toBe(
       "",
     );
+  });
+
+  it("rejects allowPrivateNetwork on an HTTP step from a non-admin caller", async () => {
+    userRepository.findById.mockResolvedValueOnce({ isAdmin: false });
+    const res = await invoke("post", "/", {
+      body: {
+        name: "SSRF attempt",
+        definition: definition({
+          steps: [
+            {
+              id: "s",
+              type: "http",
+              method: "GET",
+              url: "http://169.254.169.254/latest/meta-data/",
+              allowPrivateNetwork: true,
+            },
+          ],
+        } as Partial<AutomationDefinition>),
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(String(res.jsonBody?.error)).toMatch(/private[- ]network/i);
+    expect(state.rows).toHaveLength(0);
+  });
+
+  it("permits allowPrivateNetwork on an HTTP step from an admin caller", async () => {
+    userRepository.findById.mockResolvedValueOnce({ isAdmin: true });
+    const res = await invoke("post", "/", {
+      body: {
+        name: "LAN ntfy",
+        definition: definition({
+          steps: [
+            {
+              id: "s",
+              type: "http",
+              method: "POST",
+              url: "http://192.168.1.10:8080/",
+              allowPrivateNetwork: true,
+            },
+          ],
+        } as Partial<AutomationDefinition>),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(state.rows).toHaveLength(1);
   });
 
   it("stores the automation against the caller, not a supplied user id", async () => {

@@ -8,6 +8,7 @@ import type {
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
 import { WidgetTitle } from "./WidgetTitle";
+import { safeUrl } from "@/lib/safe-url";
 
 function TreeLink({
   link,
@@ -41,11 +42,12 @@ function TreeLink({
     </div>
   );
 
-  if (isReadOnly || !link.url) return content;
+  const href = safeUrl(link.url);
+  if (isReadOnly || !href) return content;
 
   return (
     <a
-      href={link.url}
+      href={href}
       target="_blank"
       rel="noopener noreferrer"
       className="block no-underline"

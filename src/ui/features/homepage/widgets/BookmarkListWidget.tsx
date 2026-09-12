@@ -5,6 +5,7 @@ import type {
   WidgetComponentProps,
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
+import { safeUrl } from "@/lib/safe-url";
 
 function BookmarkListWidget({
   config,
@@ -29,19 +30,26 @@ function BookmarkListWidget({
             No bookmarks
           </span>
         )}
-        {links.map((link, i) =>
-          isReadOnly ? (
-            <div
-              key={i}
-              className="flex items-center gap-2 text-xs text-foreground py-1"
-            >
-              <Bookmark size={10} className="text-muted-foreground shrink-0" />
-              <span className="truncate">{link.label || link.url}</span>
-            </div>
-          ) : (
+        {links.map((link, i) => {
+          const href = safeUrl(link.url);
+          if (isReadOnly || !href) {
+            return (
+              <div
+                key={i}
+                className="flex items-center gap-2 text-xs text-foreground py-1"
+              >
+                <Bookmark
+                  size={10}
+                  className="text-muted-foreground shrink-0"
+                />
+                <span className="truncate">{link.label || link.url}</span>
+              </div>
+            );
+          }
+          return (
             <a
               key={i}
-              href={link.url}
+              href={href}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 text-xs text-foreground hover:text-primary py-1 no-underline group"
@@ -53,8 +61,8 @@ function BookmarkListWidget({
                 className="text-muted-foreground/0 group-hover:text-muted-foreground/60 shrink-0"
               />
             </a>
-          ),
-        )}
+          );
+        })}
       </div>
     </div>
   );

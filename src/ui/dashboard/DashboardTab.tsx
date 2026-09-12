@@ -72,6 +72,7 @@ import {
   isValidServiceLinkUrl,
   normalizeServiceLinkUrl,
 } from "@/lib/service-link-url";
+import { safeUrl } from "@/lib/safe-url";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -720,33 +721,36 @@ function ServiceLinksCard({
             {t("dashboardTab.serviceLinksEmpty")}
           </div>
         )}
-        {links.map((link) => (
-          <div
-            key={link.id}
-            className="flex items-center justify-between px-4 py-2 border-b border-border last:border-0 group/link"
-          >
-            <a
-              href={link.url}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="flex items-center gap-2 min-w-0 flex-1 hover:text-accent-brand transition-colors"
+        {links.map((link) => {
+          const href = safeUrl(link.url);
+          return (
+            <div
+              key={link.id}
+              className="flex items-center justify-between px-4 py-2 border-b border-border last:border-0 group/link"
             >
-              <ExternalLink className="size-3 text-muted-foreground shrink-0" />
-              <span className="text-xs font-semibold truncate">
-                {link.label}
-              </span>
-              <span className="text-[10px] text-muted-foreground truncate">
-                {link.url}
-              </span>
-            </a>
-            <button
-              onClick={() => onDelete(link.id)}
-              className="ml-2 opacity-0 group-hover/link:opacity-100 transition-opacity size-5 flex items-center justify-center hover:text-destructive"
-            >
-              <Trash2 className="size-3" />
-            </button>
-          </div>
-        ))}
+              <a
+                href={href || undefined}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="flex items-center gap-2 min-w-0 flex-1 hover:text-accent-brand transition-colors"
+              >
+                <ExternalLink className="size-3 text-muted-foreground shrink-0" />
+                <span className="text-xs font-semibold truncate">
+                  {link.label}
+                </span>
+                <span className="text-[10px] text-muted-foreground truncate">
+                  {link.url}
+                </span>
+              </a>
+              <button
+                onClick={() => onDelete(link.id)}
+                className="ml-2 opacity-0 group-hover/link:opacity-100 transition-opacity size-5 flex items-center justify-center hover:text-destructive"
+              >
+                <Trash2 className="size-3" />
+              </button>
+            </div>
+          );
+        })}
       </div>
       <div className="flex items-center gap-2 px-4 py-2 border-t border-border shrink-0">
         <input
