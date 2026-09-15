@@ -8,6 +8,7 @@ import type {
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
 import { WidgetTitle } from "./WidgetTitle";
+import { safeUrl } from "@/lib/safe-url";
 
 function getAccentColor(): string {
   return (
@@ -76,11 +77,12 @@ function ServiceTile({
     </div>
   );
 
-  if (isReadOnly || !item.url) return content;
+  const href = safeUrl(item.url);
+  if (isReadOnly || !href) return content;
 
   return (
     <a
-      href={item.url}
+      href={href}
       target="_blank"
       rel="noopener noreferrer"
       className="block w-full h-full no-underline"

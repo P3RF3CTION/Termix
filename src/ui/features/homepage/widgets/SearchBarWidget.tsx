@@ -9,6 +9,7 @@ import type {
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
 import { WidgetTitle } from "./WidgetTitle";
+import { safeUrl } from "@/lib/safe-url";
 
 const ENGINE_URLS: Record<SearchEngine, string> = {
   google: "https://www.google.com/search?q={q}",
@@ -48,9 +49,12 @@ function SearchBarWidget({
     e.preventDefault();
     if (!query.trim()) return;
     const url = buildUrl(engine, customUrl, query.trim());
-    if (!url) return;
-    if (openInNewTab) window.open(url, "_blank", "noopener,noreferrer");
-    else window.location.href = url;
+    // A custom template with `javascript:` would run in Termix's origin.
+    // Reject anything that isn't a plain http(s) navigation target.
+    const target = safeUrl(url);
+    if (!target) return;
+    if (openInNewTab) window.open(target, "_blank", "noopener,noreferrer");
+    else window.location.href = target;
     setQuery("");
   };
 

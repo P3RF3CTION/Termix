@@ -21,6 +21,7 @@ import { sendAutomationNotification } from "../notify.js";
 import { automationFetch } from "../http.js";
 import { renderRecord, renderTemplate } from "../template.js";
 import { resolveTargets, type ResolvedTarget } from "./host-targets.js";
+import { createCurrentUserRepository } from "../../database/repositories/factory.js";
 import {
   fail,
   ok,
@@ -140,12 +141,32 @@ async function runHttp(
     return ok(`Would ${step.method} ${url}`);
   }
 
+  // Defense in depth: validation gates who can *save* `allowPrivateNetwork`,
+  // but pre-existing rows and any future validation slip stay dangerous
+  // because the response body is echoed back into the run log. Recheck the
+  // owner's admin flag at run time and drop the opt-out for everyone else --
+  // an admin who later loses that role also loses the ability to hit LAN
+  // targets through their old automations.
+  let allowPrivateNetwork = step.allowPrivateNetwork;
+  if (allowPrivateNetwork) {
+    try {
+      const owner = await createCurrentUserRepository().findById(
+        context.userId,
+      );
+      if (!owner?.isAdmin) {
+        allowPrivateNetwork = false;
+      }
+    } catch {
+      allowPrivateNetwork = false;
+    }
+  }
+
   try {
     const response = await automationFetch(url, {
       method: step.method,
       headers,
       body,
-      allowPrivateNetwork: step.allowPrivateNetwork,
+      allowPrivateNetwork,
       timeoutMs: stepTimeout(context, step.timeoutMs, DEFAULT_STEP_TIMEOUT_MS),
     });
 

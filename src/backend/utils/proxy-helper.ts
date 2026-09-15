@@ -14,8 +14,17 @@ async function validateHost(host: string): Promise<void> {
     return;
   }
 
-  const { address } = await dns.lookup(host);
-  if (isBlockedAddress(address)) {
+  // `dns.lookup(host)` returns only the first A/AAAA record, so a hostname
+  // whose second record is 127.0.0.1 would pass this check and then reach
+  // loopback once net.connect / SocksClient did their own resolution.
+  // Enumerate everything the resolver returns and refuse if any address is
+  // on the SSRF blocklist. verbatim keeps the order the resolver gave us
+  // instead of reordering IPv4 first, matching what the actual dial will do.
+  const addresses = await dns.lookup(host, { all: true, verbatim: true });
+  if (addresses.length === 0) {
+    throw new Error("Proxy target could not be resolved");
+  }
+  if (addresses.some(({ address }) => isBlockedAddress(address))) {
     throw new Error("Proxy target address is not allowed");
   }
 }

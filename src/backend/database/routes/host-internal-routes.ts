@@ -1,7 +1,28 @@
 import type { Request, Response, Router } from "express";
+import { timingSafeEqual } from "node:crypto";
 import { SystemCrypto } from "../../utils/system-crypto.js";
 import { sshLogger } from "../../utils/logger.js";
 import { createCurrentHostResolutionRepository } from "../repositories/factory.js";
+
+/**
+ * The internal token is compared byte-wise with early exit if `===` is used,
+ * which is measurable over the network with enough samples. `timingSafeEqual`
+ * refuses buffers of different lengths, so the length check happens first --
+ * cheap, and it also short-circuits the trivial "not even the right shape"
+ * case without leaking anything a client could not already learn from a
+ * missing header.
+ */
+function internalTokensEqual(
+  provided: unknown,
+  expected: string | undefined | null,
+): boolean {
+  if (typeof provided !== "string" || typeof expected !== "string")
+    return false;
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 export function registerHostInternalRoutes(router: Router): void {
   /**
@@ -26,7 +47,7 @@ export function registerHostInternalRoutes(router: Router): void {
       const systemCrypto = SystemCrypto.getInstance();
       const expectedToken = await systemCrypto.getInternalAuthToken();
 
-      if (internalToken !== expectedToken) {
+      if (!internalTokensEqual(internalToken, expectedToken)) {
         sshLogger.warn(
           "Unauthorized attempt to access internal SSH host endpoint",
           {
@@ -122,7 +143,7 @@ export function registerHostInternalRoutes(router: Router): void {
       const systemCrypto = SystemCrypto.getInstance();
       const expectedToken = await systemCrypto.getInternalAuthToken();
 
-      if (internalToken !== expectedToken) {
+      if (!internalTokensEqual(internalToken, expectedToken)) {
         return res
           .status(401)
           .json({ error: "Invalid internal authentication token" });

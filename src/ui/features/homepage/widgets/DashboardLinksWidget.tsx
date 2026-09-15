@@ -9,6 +9,7 @@ import type {
 import { GRID_SIZE } from "@/types/homepage-types";
 import { getServiceLinks, type ServiceLink } from "@/api/dashboard-api";
 import { WidgetTitle } from "./WidgetTitle";
+import { safeUrl } from "@/lib/safe-url";
 
 function getFaviconUrl(url: string): string {
   try {
@@ -51,11 +52,12 @@ function LinkTile({
     </div>
   );
 
-  if (isReadOnly || !link.url) return content;
+  const href = safeUrl(link.url);
+  if (isReadOnly || !href) return content;
 
   return (
     <a
-      href={link.url}
+      href={href}
       target="_blank"
       rel="noopener noreferrer"
       className="block no-underline"
