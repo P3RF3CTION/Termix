@@ -767,9 +767,7 @@ export function registerUserTotpRoutes(
           operation: "totp_verify_replay_token",
           userId: userRecord.id,
         });
-        return res
-          .status(401)
-          .json({ error: "Invalid temporary token" });
+        return res.status(401).json({ error: "Invalid temporary token" });
       }
 
       loginRateLimiter.resetTOTPAttempts(userRecord.id);

@@ -86,12 +86,7 @@ describe("FieldCrypto.encryptField / decryptField", () => {
       "password",
     );
     expect(() =>
-      FieldCrypto.decryptField(
-        encrypted,
-        masterKey,
-        "row-target",
-        "password",
-      ),
+      FieldCrypto.decryptField(encrypted, masterKey, "row-target", "password"),
     ).toThrow(/recordId mismatch/);
   });
 });
