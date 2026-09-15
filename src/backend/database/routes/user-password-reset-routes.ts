@@ -204,7 +204,19 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      const resetCode = crypto.randomInt(100000, 1000000).toString();
+      // The reset code is delivered through the docker log; an operator with
+      // log access is the only intended reader. A 6-digit numeric code has
+      // ~20 bits of entropy, so an unsalted SHA-256 of it in the settings
+      // table can be enumerated in milliseconds if that table ever leaks
+      // (backup, replica, SQLi elsewhere). A URL-safe 16-char code
+      // (~95 bits) keeps the same "read a value from a log line" delivery
+      // model while making offline recovery of the code from its stored
+      // hash infeasible.
+      const resetCode = crypto
+        .randomBytes(12)
+        .toString("base64url")
+        .replace(/[^A-Za-z0-9]/g, "")
+        .slice(0, 16);
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
       await createCurrentSettingsRepository().set(
@@ -342,7 +354,14 @@ export function registerUserPasswordResetRoutes(
       const tempToken = nanoid();
       const tempTokenExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
-      await createCurrentSettingsRepository().set(
+      // Consume the reset code the moment it is redeemed. Leaving it around
+      // for its full 15-minute TTL let anyone who saw the log line hit this
+      // endpoint again and mint a fresh tempToken; each call overwrote the
+      // stored one, which could hijack a reset a legitimate user had already
+      // started in a different tab.
+      const settingsRepository = createCurrentSettingsRepository();
+      await settingsRepository.delete(`reset_code_${username}`);
+      await settingsRepository.set(
         `temp_reset_token_${username}`,
         JSON.stringify({
           tokenHash: hashResetSecret(tempToken),

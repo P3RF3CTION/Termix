@@ -73,6 +73,22 @@ describe("FieldCrypto.encryptField / decryptField", () => {
       FieldCrypto.decryptField(JSON.stringify(parsed), masterKey, "r", "f"),
     ).toThrow(/recordId/);
   });
+
+  it("refuses to decrypt when the caller's recordId disagrees with the envelope", () => {
+    // Guards against same-user ciphertext swap: an envelope written for one
+    // row must not silently decrypt when handed to a different row with the
+    // same DEK, or a copy of ssh_data.password from host X into host Y would
+    // yield X's plaintext on a lookup against Y.
+    const encrypted = FieldCrypto.encryptField(
+      "value",
+      masterKey,
+      "row-source",
+      "password",
+    );
+    expect(() =>
+      FieldCrypto.decryptField(encrypted, masterKey, "row-target", "password"),
+    ).toThrow(/recordId mismatch/);
+  });
 });
 
 describe("FieldCrypto.shouldEncryptField", () => {

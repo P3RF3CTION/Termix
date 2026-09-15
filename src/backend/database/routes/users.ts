@@ -14,6 +14,7 @@ import {
 } from "../../utils/user-agent-parser.js";
 import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { getRequestOriginWithForceHTTPS } from "../../utils/request-origin.js";
+import { isAllowedOrigin } from "../../utils/cors-config.js";
 import {
   getDesktopOidcCallbackUrl,
   isOidcTokenCallback,
@@ -713,8 +714,20 @@ router.get("/oidc/authorize", async (req, res) => {
       }
       frontendOrigin = callbackUrl.toString();
     } else if (referer) {
-      const refererUrl = new URL(referer);
-      frontendOrigin = `${refererUrl.protocol}//${refererUrl.host}`;
+      // The Referer is attacker-controllable through a top-level navigation
+      // to /users/oidc/authorize, so the callback would happily 302 the
+      // victim to that arbitrary origin after a real IdP login. Restrict
+      // the trusted Referer to the same origins CORS already allows for
+      // this backend; anything else falls back to the backend's own origin.
+      try {
+        const refererUrl = new URL(referer);
+        const refererOrigin = `${refererUrl.protocol}//${refererUrl.host}`;
+        frontendOrigin = isAllowedOrigin(refererOrigin, req)
+          ? refererOrigin
+          : origin;
+      } catch {
+        frontendOrigin = origin;
+      }
     } else {
       frontendOrigin = origin;
     }

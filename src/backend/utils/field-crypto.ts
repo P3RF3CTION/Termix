@@ -124,6 +124,20 @@ class FieldCrypto {
         `Encrypted field missing recordId context - data corruption or legacy format not supported`,
       );
     }
+
+    // Bind the envelope's recordId to the caller's recordId. The HKDF context
+    // is derived from the envelope only, so without this check an attacker
+    // with write access to a same-user row could copy a ciphertext blob
+    // across rows (say, swap `ssh_data.password` from host X into host Y):
+    // the tag verifies under the same DEK and the row would yield the source
+    // row's plaintext on use. Cross-user swaps already fail on DEK mismatch;
+    // this closes the same-user case.
+    if (encrypted.recordId !== recordId) {
+      throw new Error(
+        `Encrypted field recordId mismatch: envelope=${encrypted.recordId} caller=${recordId}`,
+      );
+    }
+
     const context = `${encrypted.recordId}:${fieldName}`;
     const fieldKey = Buffer.from(
       crypto.hkdfSync("sha256", masterKey, salt, context, this.KEY_LENGTH),
