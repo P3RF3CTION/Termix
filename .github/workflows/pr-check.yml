@@ -6,7 +6,12 @@ on:
 
 jobs:
   lint-and-build:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Blacksmith runners are installed for the upstream repository only. In a
+    # fork the job is never picked up and fails after 24h with "exceeded the
+    # maximum execution time while awaiting a runner" - a red check that never
+    # ran anything. Upstream keeps Blacksmith; every fork falls back to a
+    # GitHub-hosted runner so the PR checks actually execute.
+    runs-on: ${{ github.repository_owner == 'Termix-SSH' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
 
     env:
       NODE_OPTIONS: "--max-old-space-size=4096"
@@ -40,7 +45,12 @@ jobs:
 
   database-dialects:
     name: Postgres and MySQL
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Blacksmith runners are installed for the upstream repository only. In a
+    # fork the job is never picked up and fails after 24h with "exceeded the
+    # maximum execution time while awaiting a runner" - a red check that never
+    # ran anything. Upstream keeps Blacksmith; every fork falls back to a
+    # GitHub-hosted runner so the PR checks actually execute.
+    runs-on: ${{ github.repository_owner == 'Termix-SSH' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
 
     # The test suite only ever sees SQLite. Everything that differs per engine —
     # the RETURNING replacements, the read-then-write transactions, the
