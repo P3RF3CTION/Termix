@@ -2,6 +2,7 @@ import { getErrorMessage } from "../../utils/error-message.js";
 import { getTrustProxySetting } from "../../utils/trusted-proxies.js";
 import express from "express";
 import net from "net";
+import { timingSafeEqual } from "node:crypto";
 import { createCorsMiddleware } from "../../utils/cors-config.js";
 import { createSecurityHeadersMiddleware } from "../../utils/security-headers.js";
 import { createCompressionMiddleware } from "../../utils/compression-config.js";
@@ -1036,7 +1037,20 @@ app.post("/internal/login-alert", async (req, res) => {
     .SystemCrypto;
   const expectedToken = await systemCrypto.getInstance().getInternalAuthToken();
   const token = req.headers["x-internal-auth"];
-  if (!token || token !== expectedToken) {
+  // Byte-wise compare with `===` is measurable over the network. Buffer the
+  // two sides and hand them to timingSafeEqual, which requires matching
+  // lengths -- the length check happens explicitly so an early return on
+  // mismatch doesn't itself leak.
+  const provided = typeof token === "string" ? token : "";
+  const expected = typeof expectedToken === "string" ? expectedToken : "";
+  const providedBuf = Buffer.from(provided, "utf8");
+  const expectedBuf = Buffer.from(expected, "utf8");
+  if (
+    !provided ||
+    !expected ||
+    providedBuf.length !== expectedBuf.length ||
+    !timingSafeEqual(providedBuf, expectedBuf)
+  ) {
     return res.status(403).json({ error: "Forbidden" });
   }
   const { hostId, userId, sshUser, fromIp } = req.body as {

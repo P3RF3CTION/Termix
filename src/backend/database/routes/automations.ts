@@ -14,7 +14,10 @@ import {
   getRequestMeta,
   logAudit,
 } from "../../utils/audit-logger.js";
-import { createCurrentAutomationRepository } from "../repositories/factory.js";
+import {
+  createCurrentAutomationRepository,
+  createCurrentUserRepository,
+} from "../repositories/factory.js";
 import type { AutomationRow } from "../repositories/automation-repository.js";
 import { AutomationEngine } from "../../automations/engine.js";
 import {
@@ -75,11 +78,25 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+export interface ValidateDefinitionOptions {
+  /**
+   * The caller is an admin. Only admins may set `allowPrivateNetwork: true`
+   * on an HTTP step: with that flag, the step reaches internal addresses
+   * (loopback, RFC1918, link-local, cloud metadata at 169.254.169.254) and
+   * the response body is echoed back in the run log -- a straight SSRF
+   * primitive from any authenticated user to any internal service.
+   */
+  isAdmin?: boolean;
+}
+
 /**
  * Validates a definition before it is stored. The engine treats the stored
  * blob as trusted, so everything it relies on is checked once here.
  */
-export function validateDefinition(value: unknown): {
+export function validateDefinition(
+  value: unknown,
+  opts: ValidateDefinitionOptions = {},
+): {
   ok: boolean;
   error?: string;
   definition?: AutomationDefinition;
@@ -135,7 +152,7 @@ export function validateDefinition(value: unknown): {
   }
 
   const seen = new Set<string>();
-  const stepError = validateSteps(steps as Step[], seen);
+  const stepError = validateSteps(steps as Step[], seen, opts);
   if (stepError) return { ok: false, error: stepError };
 
   return {
@@ -148,7 +165,11 @@ export function validateDefinition(value: unknown): {
   };
 }
 
-function validateSteps(steps: Step[], seen: Set<string>): string | null {
+function validateSteps(
+  steps: Step[],
+  seen: Set<string>,
+  opts: ValidateDefinitionOptions,
+): string | null {
   for (const step of steps) {
     if (!step || typeof step !== "object") return "Step must be an object";
     if (!isNonEmptyString(step.id)) return "Every step needs an id";
@@ -162,14 +183,28 @@ function validateSteps(steps: Step[], seen: Set<string>): string | null {
       if (!step.condition || !OPERATORS.has(step.condition.operator)) {
         return "Condition needs a valid operator";
       }
-      const thenError = validateSteps(step.then ?? [], seen);
+      const thenError = validateSteps(step.then ?? [], seen, opts);
       if (thenError) return thenError;
-      const elseError = validateSteps(step.else ?? [], seen);
+      const elseError = validateSteps(step.else ?? [], seen, opts);
       if (elseError) return elseError;
     }
 
-    if (step.type === "http" && !isNonEmptyString(step.url)) {
-      return "HTTP steps need a URL";
+    if (step.type === "http") {
+      if (!isNonEmptyString(step.url)) {
+        return "HTTP steps need a URL";
+      }
+      // The response body is echoed into the run log, so an HTTP step that
+      // reaches loopback / RFC1918 / 169.254.169.254 is a straight SSRF
+      // read primitive. Admins can still target LAN services (self-hosted
+      // ntfy, Gotify) they own; everyone else is limited to the safe
+      // outbound guard.
+      if (
+        (step as unknown as { allowPrivateNetwork?: unknown })
+          .allowPrivateNetwork === true &&
+        !opts.isAdmin
+      ) {
+        return "Only administrators may enable private-network HTTP steps";
+      }
     }
     if (step.type === "run_command" && !isNonEmptyString(step.command)) {
       return "Command steps need a command";
@@ -182,6 +217,15 @@ function validateSteps(steps: Step[], seen: Set<string>): string | null {
     }
   }
   return null;
+}
+
+async function callerIsAdmin(userId: string): Promise<boolean> {
+  try {
+    const user = await createCurrentUserRepository().findById(userId);
+    return !!user?.isAdmin;
+  } catch {
+    return false;
+  }
 }
 
 /** Never leak a webhook token hash to the client. */
@@ -343,7 +387,8 @@ router.post(
       return res.status(400).json({ error: "Name is required" });
     }
 
-    const validated = validateDefinition(definition);
+    const isAdmin = await callerIsAdmin(userId);
+    const validated = validateDefinition(definition, { isAdmin });
     if (!validated.ok || !validated.definition) {
       return res.status(400).json({ error: validated.error });
     }
@@ -453,7 +498,8 @@ router.put(
 
     let parsedDefinition: AutomationDefinition | null = null;
     if (req.body?.definition !== undefined) {
-      const validated = validateDefinition(req.body.definition);
+      const isAdmin = await callerIsAdmin(userId);
+      const validated = validateDefinition(req.body.definition, { isAdmin });
       if (!validated.ok || !validated.definition) {
         return res.status(400).json({ error: validated.error });
       }

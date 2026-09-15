@@ -1,7 +1,11 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
 import bcrypt from "bcryptjs";
-import { generateBackupCodes } from "../../utils/backup-codes.js";
+import {
+  findMatchingBackupCode,
+  generateBackupCodes,
+  hashBackupCodes,
+} from "../../utils/backup-codes.js";
 import QRCode from "qrcode";
 import speakeasy from "speakeasy";
 import { AuthManager } from "../../utils/auth-manager.js";
@@ -150,7 +154,10 @@ export async function verifyTotpReauth(
     backupCodes = [];
   }
   if (Array.isArray(backupCodes)) {
-    const backupIndex = backupCodes.indexOf(credential);
+    // Iterates every entry regardless of an early hit -- lets a mixed list of
+    // legacy plaintext and freshly-hashed entries be compared without leaking
+    // which format matched through timing.
+    const backupIndex = findMatchingBackupCode(backupCodes, credential);
     if (backupIndex !== -1) {
       backupCodes.splice(backupIndex, 1);
       const updatedJson = JSON.stringify(backupCodes);
@@ -212,15 +219,16 @@ export function registerUserTotpRoutes(
         length: 32,
       });
 
-      // Encrypt the shared secret before it hits the settings table. Relying on
-      // the next-login lazy migration left the raw base32 on disk for however
-      // long that gap lasted, which is a permanent TOTP bypass for anyone who
-      // could read the users row (backup, admin export, SQLi elsewhere).
-      const setupUserDataKey = authManager.getUserDataKey(userId);
-      const storedSecret = setupUserDataKey
+      // Store encrypted with the user DEK when available -- the enable/verify
+      // paths already assume the column is field-encrypted (they run
+      // safeGetFieldValue on it). Lazy migration would only rewrap on next
+      // read, so a crash, backup, or replication between /setup and /enable
+      // would expose a working TOTP seed.
+      const userDataKey = authManager.getUserDataKey(userId);
+      const storedSecret = userDataKey
         ? FieldCrypto.encryptField(
             secret.base32,
-            setupUserDataKey,
+            userDataKey,
             userId,
             "totpSecret",
           )
@@ -333,8 +341,12 @@ export function registerUserTotpRoutes(
       }
 
       const backupCodes = generateBackupCodes();
+      // Hash before persisting: a DB read (backup, snapshot, or a SQLi
+      // elsewhere) must not hand the attacker eight working 2FA bypass
+      // codes. Field encryption still wraps the JSON on top.
+      const storedHashedCodes = hashBackupCodes(backupCodes);
 
-      const backupCodesJson = JSON.stringify(backupCodes);
+      const backupCodesJson = JSON.stringify(storedHashedCodes);
       const storedBackupCodes = userDataKey
         ? FieldCrypto.encryptField(
             backupCodesJson,
@@ -543,8 +555,9 @@ export function registerUserTotpRoutes(
       }
 
       const backupCodes = generateBackupCodes();
+      const storedHashedCodes = hashBackupCodes(backupCodes);
 
-      const backupCodesJson = JSON.stringify(backupCodes);
+      const backupCodesJson = JSON.stringify(storedHashedCodes);
       const storedBackupCodes = userDataKey
         ? FieldCrypto.encryptField(
             backupCodesJson,
@@ -687,17 +700,18 @@ export function registerUserTotpRoutes(
       });
 
       if (!verified) {
-        // Backup codes are encrypted with the user DEK (see /totp/enable and
-        // /totp/backup-codes). Reading the column raw and JSON-parsing the
-        // envelope produced [] every time, silently locking users out of the
-        // recovery path and, on the plaintext-legacy branch below, writing the
-        // remaining codes back in cleartext.
-        const rawBackupCodes = LazyFieldEncryption.safeGetFieldValue(
-          userRecord.totpBackupCodes,
-          userDataKey,
-          userRecord.id,
-          "totpBackupCodes",
-        );
+        // Read through the field-encryption layer -- reading the raw column
+        // silently throws on a decrypted-then-re-encrypted value, and would
+        // also permanently downgrade the column below by re-persisting the
+        // decrypted array as plaintext.
+        const rawBackupCodes = userRecord.totpBackupCodes
+          ? LazyFieldEncryption.safeGetFieldValue(
+              userRecord.totpBackupCodes,
+              userDataKey,
+              userRecord.id,
+              "totpBackupCodes",
+            )
+          : null;
 
         let backupCodes: unknown = [];
         try {
@@ -710,8 +724,7 @@ export function registerUserTotpRoutes(
           backupCodes = [];
         }
 
-        const backupCodesArray = backupCodes as string[];
-        const backupIndex = backupCodesArray.indexOf(totp_code);
+        const backupIndex = findMatchingBackupCode(backupCodes, totp_code);
 
         if (backupIndex === -1) {
           authLogger.warn("TOTP verification failed - invalid code", {
@@ -729,14 +742,16 @@ export function registerUserTotpRoutes(
           });
         }
 
-        backupCodesArray.splice(backupIndex, 1);
-        const updatedJson = JSON.stringify(backupCodesArray);
-        const storedValue = FieldCrypto.encryptField(
-          updatedJson,
-          userDataKey,
-          userRecord.id,
-          "totpBackupCodes",
-        );
+        (backupCodes as unknown[]).splice(backupIndex, 1);
+        const updatedJson = JSON.stringify(backupCodes);
+        const storedValue = userDataKey
+          ? FieldCrypto.encryptField(
+              updatedJson,
+              userDataKey,
+              userRecord.id,
+              "totpBackupCodes",
+            )
+          : updatedJson;
         await createCurrentUserRepository().update(userRecord.id, {
           totpBackupCodes: storedValue,
         });

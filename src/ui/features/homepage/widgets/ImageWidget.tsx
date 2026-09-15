@@ -8,6 +8,7 @@ import type {
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
 import { WidgetTitle } from "./WidgetTitle";
+import { safeUrl } from "@/lib/safe-url";
 
 const FIT_MAP = {
   contain: "object-contain",
@@ -29,13 +30,14 @@ function ImageWidget({
     <WidgetTitle title={widget.title} icon={<ImageIcon size={11} />} />
   ) : null;
 
+  const safeImgSrc = safeUrl(imageUrl);
   const content = (
     <div className="flex flex-col w-full h-full overflow-hidden">
       {titleBar}
       <div className="flex-1 flex items-center justify-center overflow-hidden">
-        {imageUrl && !failed ? (
+        {safeImgSrc && !failed ? (
           <img
-            src={imageUrl}
+            src={safeImgSrc}
             alt={alt ?? ""}
             className={`w-full h-full ${FIT_MAP[fit]}`}
             onError={() => setFailed(true)}
@@ -50,11 +52,12 @@ function ImageWidget({
     </div>
   );
 
-  if (isReadOnly || !linkUrl) return content;
+  const safeHref = safeUrl(linkUrl);
+  if (isReadOnly || !safeHref) return content;
 
   return (
     <a
-      href={linkUrl}
+      href={safeHref}
       target="_blank"
       rel="noopener noreferrer"
       className="block w-full h-full"

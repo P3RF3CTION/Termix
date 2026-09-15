@@ -8,6 +8,7 @@ import type {
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
 import { WidgetTitle } from "./WidgetTitle";
+import { safeUrl } from "@/lib/safe-url";
 
 interface RssItem {
   title: string;
@@ -104,36 +105,39 @@ function RssFeedWidget({
             No items
           </div>
         ) : (
-          items.map((item, i) => (
-            <div key={i} className="border-b border-border/60 last:border-0">
-              <a
-                href={item.link}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={`flex flex-col px-3 py-2 gap-0.5 hover:bg-muted/40 transition-colors no-underline ${isReadOnly ? "pointer-events-none" : ""}`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <span className="text-xs font-medium text-foreground line-clamp-2 leading-snug flex-1">
-                    {item.title}
-                  </span>
-                  <ExternalLink
-                    size={9}
-                    className="text-muted-foreground/40 shrink-0 mt-0.5"
-                  />
-                </div>
-                {showDescription && item.description && (
-                  <span className="text-[10px] text-muted-foreground/70 line-clamp-2">
-                    {item.description.replace(/<[^>]+>/g, "")}
-                  </span>
-                )}
-                {item.pubDate && (
-                  <span className="text-[9px] text-muted-foreground/50">
-                    {formatDate(item.pubDate)}
-                  </span>
-                )}
-              </a>
-            </div>
-          ))
+          items.map((item, i) => {
+            const href = safeUrl(item.link);
+            return (
+              <div key={i} className="border-b border-border/60 last:border-0">
+                <a
+                  href={href || undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={`flex flex-col px-3 py-2 gap-0.5 hover:bg-muted/40 transition-colors no-underline ${isReadOnly || !href ? "pointer-events-none" : ""}`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-xs font-medium text-foreground line-clamp-2 leading-snug flex-1">
+                      {item.title}
+                    </span>
+                    <ExternalLink
+                      size={9}
+                      className="text-muted-foreground/40 shrink-0 mt-0.5"
+                    />
+                  </div>
+                  {showDescription && item.description && (
+                    <span className="text-[10px] text-muted-foreground/70 line-clamp-2">
+                      {item.description.replace(/<[^>]+>/g, "")}
+                    </span>
+                  )}
+                  {item.pubDate && (
+                    <span className="text-[9px] text-muted-foreground/50">
+                      {formatDate(item.pubDate)}
+                    </span>
+                  )}
+                </a>
+              </div>
+            );
+          })
         )}
       </div>
     </div>
