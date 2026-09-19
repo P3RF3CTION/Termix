@@ -8,10 +8,13 @@ import {
   normalizeBasePath,
 } from "../../utils/request-origin.js";
 
-function request(headers: Record<string, string | string[] | undefined>) {
+function request(
+  headers: Record<string, string | string[] | undefined>,
+  socket: { remoteAddress?: string } = { remoteAddress: "127.0.0.1" },
+) {
   return {
     headers,
-    socket: {},
+    socket,
   } as Parameters<typeof getRequestBasePath>[0];
 }
 
@@ -253,5 +256,23 @@ describe("getRequestOrigin", () => {
         }),
       ),
     ).toBe("https://termix.test.de");
+  });
+
+  it("ignores X-Forwarded-* headers when the socket peer is not a trusted proxy", () => {
+    // A caller reaching the backend directly (not through the bundled nginx)
+    // cannot promote itself to a public origin by sending its own X-Forwarded-*
+    // headers - the same-origin CORS check must not treat that as legitimate.
+    expect(
+      getRequestOrigin(
+        request(
+          {
+            host: "backend.internal",
+            "x-forwarded-proto": "https",
+            "x-forwarded-host": "termix.attacker.example",
+          },
+          { remoteAddress: "198.51.100.9" },
+        ),
+      ),
+    ).toBe("http://backend.internal");
   });
 });

@@ -179,6 +179,21 @@ async function deleteOIDCStateSettings(state: string): Promise<void> {
   await settingsRepository.delete(`oidc_remember_me_${state}`);
   await settingsRepository.delete(`oidc_provider_${state}`);
   await settingsRepository.delete(`oidc_pkce_verifier_${state}`);
+  await settingsRepository.delete(`oidc_state_binding_${state}`);
+}
+
+/**
+ * OIDC `state` alone is not per-browser: an attacker can start their own auth
+ * flow, then feed the callback URL (with THEIR state + code) to a victim. To
+ * bind the flow to the browser that requested it, we drop an HttpOnly cookie
+ * at /oidc/authorize and store its hash next to the state; /oidc/callback
+ * refuses the code unless the cookie the browser sends back hashes to the
+ * same value. This is the OWASP-recommended "double submit / per-flow cookie"
+ * defense against OAuth state-fixation.
+ */
+const OIDC_STATE_COOKIE_PREFIX = "termix_oidc_flow_";
+function hashOidcBinding(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -758,6 +773,30 @@ router.get("/oidc/authorize", async (req, res) => {
       );
     }
 
+    // Bind this flow to the browser that started it. Skipped for the desktop
+    // and mobile deep-link paths, which finish outside a browser context.
+    const isDesktopOrMobileFlow =
+      Boolean(desktopCallbackPort) ||
+      (typeof appCallbackUrl === "string" && appCallbackUrl.length > 0);
+    if (!isDesktopOrMobileFlow) {
+      const bindingSecret = crypto.randomBytes(32).toString("base64url");
+      await settingsRepository.set(
+        `oidc_state_binding_${state}`,
+        hashOidcBinding(bindingSecret),
+      );
+      const cookieName = `${OIDC_STATE_COOKIE_PREFIX}${state}`;
+      const isSecure =
+        origin.startsWith("https://") ||
+        process.env.OIDC_FORCE_HTTPS === "true";
+      res.cookie(cookieName, bindingSecret, {
+        httpOnly: true,
+        secure: isSecure,
+        sameSite: "lax",
+        path: "/",
+        maxAge: 15 * 60 * 1000,
+      });
+    }
+
     const authUrl = new URL(config.authorization_url);
     authUrl.searchParams.set("client_id", config.client_id);
     authUrl.searchParams.set("redirect_uri", backendCallbackUri);
@@ -819,6 +858,41 @@ router.get("/oidc/callback", async (req, res) => {
   const backendCallbackUri = storedBackendCallback;
   const frontendOrigin = storedFrontendOrigin;
   const storedRememberMe = storedRememberMeValue === "true";
+
+  // Reject callbacks that don't come from the browser that started the flow.
+  // The desktop / mobile deep-link paths never set this binding (they finish
+  // outside a browser session), so their absence there is expected.
+  const storedBinding = await settingsRepository.get(
+    `oidc_state_binding_${state}`,
+  );
+  if (storedBinding) {
+    const cookieName = `${OIDC_STATE_COOKIE_PREFIX}${state}`;
+    const cookieValue = (req as unknown as { cookies?: Record<string, string> })
+      .cookies?.[cookieName];
+    let bindingOk = false;
+    if (typeof cookieValue === "string" && cookieValue.length > 0) {
+      try {
+        const expected = Buffer.from(storedBinding, "utf8");
+        const actual = Buffer.from(hashOidcBinding(cookieValue), "utf8");
+        bindingOk =
+          expected.length === actual.length &&
+          crypto.timingSafeEqual(expected, actual);
+      } catch {
+        bindingOk = false;
+      }
+    }
+    if (!bindingOk) {
+      authLogger.warn("OIDC callback rejected - state not bound to browser", {
+        operation: "oidc_state_binding_mismatch",
+      });
+      await deleteOIDCStateSettings(state);
+      res.clearCookie(cookieName, { path: "/" });
+      return res
+        .status(400)
+        .json({ error: "OIDC callback does not match this browser session" });
+    }
+    res.clearCookie(cookieName, { path: "/" });
+  }
 
   try {
     const storedNonce = await settingsRepository.get(`oidc_state_${state}`);

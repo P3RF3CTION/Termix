@@ -84,8 +84,8 @@ export class SSHHostKeyVerifier {
                 );
 
           if (!host) {
-            sshLogger.warn(
-              "Host not found in database during key verification",
+            sshLogger.error(
+              "Host not found in database during key verification - rejecting",
               {
                 operation: "host_key_no_host",
                 hostId,
@@ -94,7 +94,11 @@ export class SSHHostKeyVerifier {
                 userId,
               },
             );
-            verify(true);
+            // Fail closed: a host row missing at verification time either means
+            // the record was deleted mid-connection or the caller passed a
+            // stale/wrong hostId. Accepting whatever the remote presents in
+            // that state defeats the pinning we do for the interactive path.
+            verify(false);
             return;
           }
 
@@ -116,17 +120,22 @@ export class SSHHostKeyVerifier {
             }
 
             if (!ws) {
-              sshLogger.warn(
-                "No WebSocket available for host key verification prompt",
+              sshLogger.error(
+                "No WebSocket available for host key verification prompt - rejecting new key",
                 {
                   operation: "host_key_no_ws",
                   hostId,
                   ip,
                   port,
                   userId,
+                  message:
+                    "First-use trust for a new host key requires an interactive session. Open the host in Terminal to pin its fingerprint before any background caller can use it.",
                 },
               );
-              verify(true);
+              // Fail closed: only an interactive Terminal (with an attached
+              // WebSocket) may bootstrap trust in a new host key. A background
+              // caller (metrics, tunnel autostart, docker console) must not.
+              verify(false);
               return;
             }
 
@@ -205,28 +214,6 @@ export class SSHHostKeyVerifier {
             changeCount: host.hostKeyChangedCount || 0,
           });
 
-          if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
-            );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
-            return;
-          }
-
           if (!ws) {
             sshLogger.error(
               "Host key changed - please connect via Terminal to verify the new key",
@@ -236,10 +223,16 @@ export class SSHHostKeyVerifier {
                 ip,
                 port,
                 userId,
+                isJumpHost,
                 message:
-                  "SSH host key has changed. For security, please open a Terminal connection to this host first to verify and accept the new key fingerprint.",
+                  "SSH host key has changed. For security, please open a Terminal connection to this host first to verify and accept the new key fingerprint. Jump hosts are treated like every other host here - a silent auto-replace of a pinned key would let a jump-host MITM harvest credentials for the downstream host.",
               },
             );
+            // A changed pinned key is never auto-accepted, jump host or not.
+            // Auto-storing the new fingerprint here would let anyone taking over
+            // the jump host's network path (BGP hijack, ARP, DNS poisoning)
+            // impersonate it on the next reconnect and observe every downstream
+            // credential Termix forwards through it.
             verify(false);
             return;
           }
