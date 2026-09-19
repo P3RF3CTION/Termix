@@ -1,6 +1,6 @@
 import type { Request } from "express";
 import type { IncomingMessage } from "http";
-import { resolveRequestClientIp } from "./trusted-proxies.js";
+import { isTrustedProxy, resolveRequestClientIp } from "./trusted-proxies.js";
 
 function firstHeaderValue(value: string | string[] | undefined): string {
   if (!value) return "";
@@ -86,8 +86,20 @@ export function getClientIp(req: Request | IncomingMessage): string {
 }
 
 export function getRequestOrigin(req: Request | IncomingMessage): string {
+  // X-Forwarded-* headers are only meaningful when the socket peer is a
+  // configured trusted proxy. Anything else (a caller reaching the backend
+  // port directly on the LAN, a sidecar, a misconfigured deployment) could
+  // pick whatever host/proto it liked and have same-origin CORS/WebSocket
+  // gates believe it. Fall back to the socket-observed values when the peer
+  // is not trusted, matching how `resolveRequestClientIp` treats XFF.
+  const peer = (req.socket as { remoteAddress?: string } | undefined)
+    ?.remoteAddress;
+  const trustedPeer = isTrustedProxy(peer);
+
   let protocol: string;
-  const protoHeader = req.headers["x-forwarded-proto"];
+  const protoHeader = trustedPeer
+    ? req.headers["x-forwarded-proto"]
+    : undefined;
 
   if (protoHeader) {
     const raw =
@@ -104,9 +116,12 @@ export function getRequestOrigin(req: Request | IncomingMessage): string {
       : "http";
   }
 
-  let port = normalizePort(req.headers["x-forwarded-port"]);
+  let port = trustedPeer ? normalizePort(req.headers["x-forwarded-port"]) : "";
+  const forwardedHost = trustedPeer
+    ? req.headers["x-forwarded-host"]
+    : undefined;
   const { host, port: hostPort } = splitHostHeader(
-    req.headers["x-forwarded-host"] || req.headers.host,
+    forwardedHost || req.headers.host,
   );
   port ||= hostPort;
 

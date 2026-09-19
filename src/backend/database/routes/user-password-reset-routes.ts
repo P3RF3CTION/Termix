@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
 import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
+import { getClientIp } from "../../utils/request-origin.js";
 
 /**
  * Reset codes and temporary tokens are single-use credentials that live in the
@@ -184,13 +185,35 @@ export function registerUserPasswordResetRoutes(
       return res.status(400).json({ error: "Username is required" });
     }
 
+    // Rate-limit both the client IP and the target username. Without this, a
+    // burst against /initiate-reset would overwrite an in-progress reset for
+    // any existing user on every call and spam the docker log with fresh reset
+    // codes for enumerated usernames.
+    const clientIp = getClientIp(req);
+    const ipLock = loginRateLimiter.isLocked(clientIp);
+    if (ipLock.locked) {
+      return res.status(429).json({
+        error: `Too many password reset requests. Please wait ${ipLock.remainingTime} seconds before trying again.`,
+        remainingTime: ipLock.remainingTime,
+      });
+    }
+    const perUserLock = loginRateLimiter.isResetCodeLocked(username);
+    if (perUserLock.locked) {
+      return res.status(429).json({
+        error: `Too many password reset requests for this account. Please wait ${perUserLock.remainingTime} seconds before trying again.`,
+        remainingTime: perUserLock.remainingTime,
+      });
+    }
+    loginRateLimiter.recordResetCodeAttempt(username);
+    loginRateLimiter.recordFailedAttempt(clientIp);
+
     try {
       const user = await createCurrentUserRepository().findByUsername(username);
 
       if (!user) {
-        authLogger.warn(
-          `Password reset attempted for non-existent user: ${username}`,
-        );
+        authLogger.warn("Password reset attempted for non-existent user", {
+          operation: "password_reset_unknown_user",
+        });
         return res.json({
           message:
             "If the user exists, a password reset code has been generated. Check docker logs for the code.",

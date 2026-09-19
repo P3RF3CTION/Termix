@@ -3,6 +3,7 @@ import { getTrustProxySetting } from "../utils/trusted-proxies.js";
 import cookieParser from "cookie-parser";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import { createCompressionMiddleware } from "../utils/compression-config.js";
+import { createSecurityHeadersMiddleware } from "../utils/security-headers.js";
 import { dashboardLogger } from "../utils/logger.js";
 import { AuthManager } from "../utils/auth-manager.js";
 import type { AuthenticatedRequest } from "../../types/index.js";
@@ -33,6 +34,7 @@ function isUserDataUnlocked(userId: string): boolean {
 
 app.use(createCompressionMiddleware());
 app.use(createCorsMiddleware());
+app.use(createSecurityHeadersMiddleware());
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
 app.use((_req, res, next) => {

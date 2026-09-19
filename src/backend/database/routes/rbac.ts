@@ -862,6 +862,12 @@ router.get(
   authenticateJWT,
   async (req: AuthenticatedRequest, res: Response) => {
     try {
+      const currentUserId = req.userId;
+      // Regular users only need role names for display; the permission catalog
+      // itself is admin-configuration and stays hidden from them.
+      const isAdmin =
+        currentUserId && (await permissionManager.isAdmin(currentUserId));
+
       const rolesList = (await createCurrentRoleRepository().listRoles()).map(
         ({
           id,
@@ -888,7 +894,7 @@ router.get(
             displayName,
             description,
             isSystem,
-            permissions: parsedPermissions,
+            permissions: isAdmin ? parsedPermissions : [],
             createdAt,
             updatedAt,
           };
