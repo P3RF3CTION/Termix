@@ -11,6 +11,10 @@ import type {
 import type { GuacdOptions } from "./guacd-config.js";
 import type { RemoteSessions } from "./sessions.js";
 import { errorMessage, type RemoteDesktopLogger } from "./log.js";
+import {
+  attachGuacKeepalive,
+  type KeepaliveClientConnection,
+} from "./keepalive.js";
 
 /** The recordings.writer service, when the session-recording plugin provides it. */
 export interface RecordingsWriter {
@@ -37,7 +41,7 @@ export function recordingsDir(env: NodeJS.ProcessEnv = process.env): string {
   );
 }
 
-type ClientConnection = {
+type ClientConnection = KeepaliveClientConnection & {
   guacamoleConnectionId?: string;
   connectionSettings?: {
     connection?: { type?: string; join?: string; readOnly?: boolean };
@@ -217,6 +221,7 @@ export function createGuacamoleServer(
     }
 
     guacamole.on("open", (connection: ClientConnection) => {
+      attachGuacKeepalive(connection, log);
       const meta = connection.connectionSettings?.termixMeta;
       const guacamoleConnectionId = connection.guacamoleConnectionId;
       const isJoin = !!connection.connectionSettings?.connection?.join;

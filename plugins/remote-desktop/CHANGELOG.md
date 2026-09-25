@@ -15,3 +15,6 @@ Bundled with Termix 2.9.0.
   of after an hour.
 - Opening the Windows Remote Desktop client goes through the desktop app's
   backend.
+- Idle RDP, VNC and Telnet sessions in a background browser tab are no longer
+  closed for inactivity: the backend keeps the tunnel alive with WebSocket
+  ping/pong and guacd `nop`s instead of relying on throttled browser timers.
