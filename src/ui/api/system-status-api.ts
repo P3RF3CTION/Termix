@@ -36,12 +36,10 @@ export async function enableTOTP(
 }
 
 export async function disableTOTP(
-  password?: string,
-  totp_code?: string,
+  totp_code: string,
 ): Promise<{ message: string }> {
   try {
     const response = await authApi.post("/users/totp/disable", {
-      password,
       totp_code,
     });
     return response.data;

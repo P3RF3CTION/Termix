@@ -14,6 +14,7 @@ import {
   createCurrentRoleRepository,
 } from "../database/repositories/factory.js";
 import { DataCrypto } from "../utils/data-crypto.js";
+import { applyServerTimeouts } from "../utils/http-server-timeouts.js";
 
 const app = express();
 // Same trust boundary as the main app: these services sit behind the same
@@ -322,7 +323,7 @@ app.delete("/activity/reset", async (req, res) => {
 app.use("/service-links", dashboardServiceLinksRouter);
 
 const PORT = 30006;
-app.listen(PORT, async () => {
+const dashboardServer = app.listen(PORT, async () => {
   try {
     await authManager.initialize();
   } catch (err) {
@@ -331,3 +332,4 @@ app.listen(PORT, async () => {
     });
   }
 });
+applyServerTimeouts(dashboardServer);

@@ -8,6 +8,7 @@
 import crypto from "crypto";
 import ssh2Pkg from "ssh2";
 import { sshLogger } from "../utils/logger.js";
+import { safeOutboundFetch } from "../utils/safe-outbound-fetch.js";
 
 const { utils: ssh2Utils } = ssh2Pkg;
 
@@ -55,7 +56,13 @@ async function vaultRequest(
 ): Promise<any> {
   let response: Response;
   try {
-    response = await fetch(url, {
+    // `vaultAddr` is a user-supplied field on the Vault profile row, so the
+    // outbound URL here is fully attacker-controlled. Route through
+    // safeOutboundFetch so link-local/private addresses (169.254.169.254,
+    // 10.0.0.0/8, etc.) can't be probed through a Vault profile, and so a
+    // Location header on the response can't rebind onto one either
+    // (safeOutboundFetch pins redirects to "error").
+    response = await safeOutboundFetch(url, {
       method,
       headers: {
         ...(body ? { "Content-Type": "application/json" } : {}),
@@ -64,11 +71,18 @@ async function vaultRequest(
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
-    throw new Error(
-      `Failed to reach Vault at ${url}: ${
-        e instanceof Error ? e.message : String(e)
-      }`,
-    );
+    // Don't echo the raw fetch failure -- with a private destination
+    // safeOutboundFetch throws a message that names it, and that message is
+    // what would reach the caller as part of a thrown error below. Keep the
+    // top-level phrasing generic; the operator can still see detail in the
+    // server log.
+    const detail = e instanceof Error ? e.message : String(e);
+    sshLogger.warn("Vault outbound request failed", {
+      operation: "vault_request_failed",
+      url,
+      detail,
+    });
+    throw new Error("Failed to reach Vault");
   }
 
   const text = await response.text();
@@ -82,10 +96,15 @@ async function vaultRequest(
   }
 
   if (!response.ok) {
+    // Deliberately do NOT echo `text` here for non-JSON bodies: with an
+    // attacker-controlled vaultAddr, the response body may be the raw HTTP
+    // reply of an internal metadata endpoint (169.254.169.254 etc). Return
+    // the Vault-shaped `errors` array when present, and only a status code
+    // otherwise.
     const errs =
       json && Array.isArray(json.errors) && json.errors.length
         ? json.errors.join("; ")
-        : text || `HTTP ${response.status}`;
+        : `HTTP ${response.status}`;
     throw new Error(`Vault request failed (${response.status}): ${errs}`);
   }
   return json;

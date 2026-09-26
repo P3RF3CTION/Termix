@@ -11,6 +11,7 @@ import { homepageFaviconRouter } from "../database/routes/homepage-favicon-route
 import { homepageRssRouter } from "../database/routes/homepage-rss-routes.js";
 import { homepagePingRouter } from "../database/routes/homepage-ping-routes.js";
 import { homepageProxyRouter } from "../database/routes/homepage-proxy-routes.js";
+import { applyServerTimeouts } from "../utils/http-server-timeouts.js";
 
 const app = express();
 // Same trust boundary as the main app: these services sit behind the same
@@ -39,6 +40,7 @@ app.use("/homepage/rss", homepageRssRouter);
 app.use("/homepage/ping", homepagePingRouter);
 app.use("/homepage/proxy", homepageProxyRouter);
 
-app.listen(PORT, "127.0.0.1", () => {});
+const server = app.listen(PORT, "127.0.0.1", () => {});
+applyServerTimeouts(server);
 
 export default app;

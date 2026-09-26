@@ -4,6 +4,17 @@ import { mkdtempSync, readFileSync, rmSync } from "fs";
 import os from "os";
 import path from "path";
 import ssh2Pkg from "ssh2";
+
+// vault-signer-core now routes outbound Vault requests through
+// safeOutboundFetch (SSRF hardening); stub it in this file's module scope so
+// the mocked-fetch tests below intercept it, rather than the raw global
+// fetch that used to run inside vaultRequest.
+const safeFetchMock = vi.fn();
+vi.mock("../../utils/safe-outbound-fetch.js", () => ({
+  safeOutboundFetch: (...args: unknown[]) => safeFetchMock(...args),
+  isBlockedAddress: () => false,
+}));
+
 import {
   generateEphemeralKeyPair,
   parseCertValidBefore,
@@ -119,6 +130,7 @@ describe("Vault HTTP flow (mocked fetch)", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    safeFetchMock.mockReset();
   });
 
   function mockFetch(
@@ -128,18 +140,15 @@ describe("Vault HTTP flow (mocked fetch)", () => {
     ) => { status?: number; body: unknown },
   ) {
     const calls: Array<{ url: string; init: RequestInit }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init: RequestInit) => {
-        calls.push({ url, init });
-        const { status = 200, body } = impl(url, init);
-        return {
-          ok: status >= 200 && status < 300,
-          status,
-          text: async () => JSON.stringify(body),
-        } as Response;
-      }),
-    );
+    safeFetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      const { status = 200, body } = impl(url, init);
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => JSON.stringify(body),
+      } as Response;
+    });
     return calls;
   }
 

@@ -9,9 +9,13 @@ import {
 } from "../../utils/request-origin.js";
 
 function request(headers: Record<string, string | string[] | undefined>) {
+  // Default to a loopback peer: `getRequestOrigin` only honours
+  // X-Forwarded-* when the immediate hop is on the trusted-proxy list, and
+  // the default list is `loopback`. Tests exercising forwarded-header
+  // handling therefore need the socket to look like it came from a proxy.
   return {
     headers,
-    socket: {},
+    socket: { remoteAddress: "127.0.0.1" },
   } as Parameters<typeof getRequestBasePath>[0];
 }
 

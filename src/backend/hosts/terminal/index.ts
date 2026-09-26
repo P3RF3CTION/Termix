@@ -316,10 +316,11 @@ wss.on("connection", async (ws: WebSocket, req) => {
       }
     }
 
-    if (!token) {
-      const qp = urlObj.searchParams.get("token");
-      if (qp) token = qp;
-    }
+    // Deliberately no `?token=` query-string fallback: query strings land in
+    // nginx access logs, the browser's history, HAR files, and any downstream
+    // proxy log with the raw JWT intact. Every client that reaches this WSS
+    // already sends its JWT via cookie or Authorization header; there is no
+    // legitimate caller that needs the query form.
 
     if (!token) {
       ws.close(1008, "Authentication required");

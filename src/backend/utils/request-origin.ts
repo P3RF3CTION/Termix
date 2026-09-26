@@ -1,6 +1,6 @@
 import type { Request } from "express";
 import type { IncomingMessage } from "http";
-import { resolveRequestClientIp } from "./trusted-proxies.js";
+import { isTrustedProxy, resolveRequestClientIp } from "./trusted-proxies.js";
 
 function firstHeaderValue(value: string | string[] | undefined): string {
   if (!value) return "";
@@ -85,9 +85,25 @@ export function getClientIp(req: Request | IncomingMessage): string {
   return resolveRequestClientIp(req as IncomingMessage);
 }
 
+/**
+ * Whether the immediate peer that opened this connection is on the operator's
+ * trusted-proxy list. When it isn't, X-Forwarded-* headers were written by
+ * an untrusted client and must not steer origin, port, or protocol -- they
+ * become inputs to the OIDC callback URL and the CORS same-origin fallback,
+ * so trusting client-supplied values there is a redirect-hijack primitive.
+ */
+function peerIsTrustedProxy(req: Request | IncomingMessage): boolean {
+  const socket = (req as { socket?: { remoteAddress?: string } }).socket;
+  return isTrustedProxy(socket?.remoteAddress);
+}
+
 export function getRequestOrigin(req: Request | IncomingMessage): string {
+  const trustForwarded = peerIsTrustedProxy(req);
+
   let protocol: string;
-  const protoHeader = req.headers["x-forwarded-proto"];
+  const protoHeader = trustForwarded
+    ? req.headers["x-forwarded-proto"]
+    : undefined;
 
   if (protoHeader) {
     const raw =
@@ -104,9 +120,11 @@ export function getRequestOrigin(req: Request | IncomingMessage): string {
       : "http";
   }
 
-  let port = normalizePort(req.headers["x-forwarded-port"]);
+  let port = trustForwarded
+    ? normalizePort(req.headers["x-forwarded-port"])
+    : "";
   const { host, port: hostPort } = splitHostHeader(
-    req.headers["x-forwarded-host"] || req.headers.host,
+    (trustForwarded && req.headers["x-forwarded-host"]) || req.headers.host,
   );
   port ||= hostPort;
 
@@ -138,6 +156,12 @@ export function getRequestBasePath(req: Request | IncomingMessage): string {
     process.env.BASE_PATH || process.env.VITE_BASE_PATH,
   );
   if (envBasePath) return envBasePath;
+
+  // Same rule as X-Forwarded-Host: don't let a peer that isn't a configured
+  // reverse proxy dictate the effective base path -- it lands in redirect
+  // targets and OIDC callback URLs, so a client-supplied prefix here is a
+  // rewrite of where the browser is sent next.
+  if (!peerIsTrustedProxy(req)) return "";
 
   return (
     normalizeBasePath(firstHeaderValue(req.headers["x-forwarded-prefix"])) ||

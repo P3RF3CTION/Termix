@@ -1,7 +1,9 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { RequestHandler, Router } from "express";
+import bcrypt from "bcryptjs";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
+import { createCurrentUserRepository } from "../repositories/factory.js";
 
 interface UserDataAccessRoutesDeps {
   authenticateJWT: RequestHandler;
@@ -53,6 +55,29 @@ export function registerUserDataAccessRoutes(
     }
 
     try {
+      // authManager.authenticateUser is a no-op for users already migrated to
+      // the v3 wrap: it returns true whenever the DEK can be loaded, without
+      // re-checking the password. That is fine for the login flow (which
+      // verifies the password against bcrypt above the call) but here it means
+      // any string sent by an already-authenticated client would "unlock"
+      // data. Re-check the password here so this route lives up to its name.
+      const userRepository = createCurrentUserRepository();
+      const userRecord = await userRepository.findById(userId);
+      if (!userRecord || !userRecord.passwordHash) {
+        return res.status(401).json({ error: "Invalid password" });
+      }
+      const passwordMatches = await bcrypt.compare(
+        password,
+        userRecord.passwordHash,
+      );
+      if (!passwordMatches) {
+        authLogger.warn("Failed to unlock user data - invalid password", {
+          operation: "user_data_unlock_failed",
+          userId,
+        });
+        return res.status(401).json({ error: "Invalid password" });
+      }
+
       const unlocked = await authManager.authenticateUser(userId, password);
       if (unlocked) {
         const refreshedSession =

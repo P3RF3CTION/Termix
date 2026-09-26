@@ -111,6 +111,16 @@ export class SessionRepository {
     return rowsAffected(result);
   }
 
+  /**
+   * Wipe every session row -- used by the admin JWT rotation flow, since a
+   * rotated secret must invalidate all in-flight tokens the same request.
+   */
+  async deleteAll(): Promise<number> {
+    const result = await this.context.drizzle.delete(sessions);
+    await this.afterWrite();
+    return rowsAffected(result);
+  }
+
   private async afterWrite(): Promise<void> {
     await this.onWrite?.();
   }

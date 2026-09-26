@@ -6,6 +6,7 @@ import { Client, type ConnectConfig } from "ssh2";
 import { createCorsMiddleware } from "../../utils/cors-config.js";
 import { createSecurityHeadersMiddleware } from "../../utils/security-headers.js";
 import { createCompressionMiddleware } from "../../utils/compression-config.js";
+import { applyServerTimeouts } from "../../utils/http-server-timeouts.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
 import {
@@ -929,4 +930,5 @@ app.put("/tmux_monitor/:hostId/tags", async (req, res) => {
 });
 
 const PORT = 30010;
-app.listen(PORT, () => {});
+const tmuxServer = app.listen(PORT, () => {});
+applyServerTimeouts(tmuxServer);
