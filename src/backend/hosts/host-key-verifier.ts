@@ -116,17 +116,19 @@ export class SSHHostKeyVerifier {
             }
 
             if (!ws) {
-              sshLogger.warn(
-                "No WebSocket available for host key verification prompt",
+              sshLogger.error(
+                "Refusing SSH connection: no stored host key and no interactive channel to confirm first-use. Connect via Terminal first to trust the fingerprint.",
                 {
-                  operation: "host_key_no_ws",
+                  operation: "host_key_no_ws_reject",
                   hostId,
                   ip,
                   port,
+                  fingerprint,
+                  keyType,
                   userId,
                 },
               );
-              verify(true);
+              verify(false);
               return;
             }
 
@@ -205,28 +207,6 @@ export class SSHHostKeyVerifier {
             changeCount: host.hostKeyChangedCount || 0,
           });
 
-          if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
-            );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
-            return;
-          }
-
           if (!ws) {
             sshLogger.error(
               "Host key changed - please connect via Terminal to verify the new key",
@@ -236,6 +216,7 @@ export class SSHHostKeyVerifier {
                 ip,
                 port,
                 userId,
+                isJumpHost,
                 message:
                   "SSH host key has changed. For security, please open a Terminal connection to this host first to verify and accept the new key fingerprint.",
               },

@@ -424,6 +424,7 @@ export function registerUserTotpRoutes(
   router.post("/totp/disable", authenticateJWT, async (req, res) => {
     const userId = (req as AuthenticatedRequest).userId;
     const { password, totp_code } = req.body;
+    const clientIp = req.ip || req.socket?.remoteAddress || "unknown";
     try {
       const userRecord = await createCurrentUserRepository().findById(userId);
       if (!userRecord) {
@@ -446,6 +447,24 @@ export function registerUserTotpRoutes(
         return res.status(400).json({ error: "TOTP is not enabled" });
       }
 
+      // Rate-limit per user: a stolen JWT must not be able to brute-force
+      // the 6-digit TOTP (or the account password) to disable 2FA.
+      const totpLockStatus = loginRateLimiter.isTOTPLocked(userRecord.id);
+      if (totpLockStatus.locked) {
+        return res.status(429).json({
+          error: "Too many attempts. Please wait before trying again.",
+          remainingTime: totpLockStatus.remainingTime,
+        });
+      }
+      const passwordLockKey = `totp-disable:${userRecord.username ?? userRecord.id}`;
+      const pwLockStatus = loginRateLimiter.isLocked(clientIp, passwordLockKey);
+      if (pwLockStatus.locked) {
+        return res.status(429).json({
+          error: "Too many attempts. Please wait before trying again.",
+          remainingTime: pwLockStatus.remainingTime,
+        });
+      }
+
       const userDataKey = authManager.getUserDataKey(userId);
       // TOTP code or backup code first; verifyTotpReauth deliberately refuses
       // the account password, so that stays a separate comparison here.
@@ -460,10 +479,14 @@ export function registerUserTotpRoutes(
       }
 
       if (!verified) {
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
+        loginRateLimiter.recordFailedAttempt(clientIp, passwordLockKey);
         return res
           .status(401)
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
+      loginRateLimiter.resetTOTPAttempts(userRecord.id);
+      loginRateLimiter.resetAttempts(clientIp, passwordLockKey);
 
       await createCurrentUserRepository().update(userId, {
         totpEnabled: false,

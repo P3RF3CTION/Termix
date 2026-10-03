@@ -27,7 +27,18 @@ const behindProxy = proxiedRequest({
 });
 
 describe("isAllowedOrigin", () => {
-  it("allows the origin the request was actually made to", () => {
+  it("requires an explicit allowlist entry (no Host-based fallback)", () => {
+    // Without CORS_ALLOWED_ORIGINS, a public origin is refused even when its
+    // value matches the request's Host header. The Host header is attacker-
+    // controlled through any proxy that does not strictly pin the host, so
+    // reflecting it enabled a cross-origin credentialed-fetch attack.
+    expect(isAllowedOrigin("https://termix.example.com", behindProxy)).toBe(
+      false,
+    );
+  });
+
+  it("allows the origin once it is explicitly on the configured allowlist", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://termix.example.com";
     expect(isAllowedOrigin("https://termix.example.com", behindProxy)).toBe(
       true,
     );
@@ -40,6 +51,7 @@ describe("isAllowedOrigin", () => {
   });
 
   it("rejects an origin that merely looks like the real host", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://termix.example.com";
     expect(
       isAllowedOrigin("https://termix.example.com.evil.example", behindProxy),
     ).toBe(false);

@@ -679,6 +679,25 @@ router.get("/oidc/authorize", async (req, res) => {
       providerId: providerIdStr,
     } = req.query;
     const origin = getRequestOriginWithForceHTTPS(req);
+    // The Host/X-Forwarded-Host header is attacker-controlled through any
+    // reverse proxy that does not strictly pin the host. Confirm the derived
+    // origin is in our CORS allowlist (or a legitimate loopback/file: origin
+    // used by the desktop app) before shipping it as the IdP redirect_uri.
+    // Without this, an attacker with a crafted Host header could receive the
+    // IdP auth code at their own callback URL.
+    if (!isAllowedOrigin(origin, req)) {
+      authLogger.warn(
+        "OIDC authorize refused: derived origin is not in CORS allowlist",
+        {
+          operation: "oidc_authorize_origin_rejected",
+          origin,
+        },
+      );
+      return res.status(400).json({
+        error:
+          "Server origin is not configured. Add it to CORS_ALLOWED_ORIGINS to use OIDC.",
+      });
+    }
     const basePath = (process.env.BASE_PATH || "").replace(/\/+$/, "");
     const backendCallbackUri = `${origin}${basePath}/users/oidc/callback`;
 
@@ -2200,12 +2219,27 @@ router.post(
  *         description: Not authenticated.
  */
 router.get("/me/token", authenticateJWT, (req: Request, res: Response) => {
-  // authenticateJWT accepts either the jwt cookie or an Authorization:
-  // Bearer header (see auth-manager.ts's createAuthMiddleware) -- this must
-  // check both too, or a request that only carried the header (e.g. the
-  // Electron renderer's own axios interceptor, which always attaches a
-  // stored localStorage JWT as a Bearer header) would pass authentication
-  // here but still get back a null token.
+  // Only return the raw JWT to callers that already supplied it via an
+  // Authorization: Bearer header or a dedicated native-client header
+  // (Electron, mobile WebView). If the request authenticated solely via the
+  // HttpOnly `jwt` cookie, returning the token would hand any XSS payload
+  // on the Termix frontend a long-lived credential - defeating the entire
+  // reason the cookie is HttpOnly in the first place.
+  const authHeader = req.headers.authorization;
+  const hasBearer =
+    typeof authHeader === "string" &&
+    authHeader.toLowerCase().startsWith("bearer ");
+  const isNativeClient =
+    req.headers["x-electron-app"] === "true" ||
+    req.headers["x-termix-native"] === "true";
+
+  if (!hasBearer && !isNativeClient) {
+    return res.status(403).json({
+      error:
+        "This endpoint is only available to native clients. Browser sessions use the HttpOnly jwt cookie.",
+    });
+  }
+
   res.json({ token: extractBearerOrCookieToken(req) ?? null });
 });
 
@@ -2765,6 +2799,7 @@ router.patch("/password-reset-allowed", authenticateJWT, async (req, res) => {
 router.delete("/delete-account", authenticateJWT, async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
   const { password } = req.body;
+  const clientIp = req.ip || req.socket?.remoteAddress || "unknown";
 
   if (!isNonEmptyString(password)) {
     return res
@@ -2785,13 +2820,28 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
       });
     }
 
+    // Rate-limit by (ip, username) exactly like /users/login so a stolen
+    // JWT can't be used to brute-force the account password through this
+    // endpoint. bcrypt.compare at ~100ms/attempt is still fast enough for
+    // thousands of guesses in parallel without a limiter.
+    const rateLimitKey = `delete:${userRecord.username}`;
+    const lockStatus = loginRateLimiter.isLocked(clientIp, rateLimitKey);
+    if (lockStatus.locked) {
+      return res.status(429).json({
+        error: "Too many attempts. Please wait before trying again.",
+        remainingTime: lockStatus.remainingTime,
+      });
+    }
+
     const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
     if (!isMatch) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateLimitKey);
       authLogger.warn(
         `Incorrect password provided for account deletion: ${userRecord.username}`,
       );
       return res.status(401).json({ error: "Incorrect password" });
     }
+    loginRateLimiter.resetAttempts(clientIp, rateLimitKey);
 
     if (userRecord.isAdmin) {
       const adminCount = await createCurrentUserRepository().countAdmins();
@@ -2846,6 +2896,7 @@ registerUserPasswordResetRoutes(router, { authManager });
 router.post("/change-password", authenticateJWT, async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
   const { oldPassword, newPassword } = req.body;
+  const clientIp = req.ip || req.socket?.remoteAddress || "unknown";
   authLogger.info("Password change request", {
     operation: "password_change_request",
     userId,
@@ -2866,8 +2917,19 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     return res.status(404).json({ error: "User not found" });
   }
 
+  // Prevent a stolen session from brute-forcing the current password here.
+  const rateLimitKey = `change-password:${user.username ?? userId}`;
+  const lockStatus = loginRateLimiter.isLocked(clientIp, rateLimitKey);
+  if (lockStatus.locked) {
+    return res.status(429).json({
+      error: "Too many attempts. Please wait before trying again.",
+      remainingTime: lockStatus.remainingTime,
+    });
+  }
+
   const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
   if (!isMatch) {
+    loginRateLimiter.recordFailedAttempt(clientIp, rateLimitKey);
     authLogger.warn("Password change failed - old password incorrect", {
       operation: "password_change_failed",
       userId,
@@ -2875,6 +2937,7 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     });
     return res.status(401).json({ error: "Incorrect current password" });
   }
+  loginRateLimiter.resetAttempts(clientIp, rateLimitKey);
 
   const success = await authManager.changeUserPassword(
     userId,

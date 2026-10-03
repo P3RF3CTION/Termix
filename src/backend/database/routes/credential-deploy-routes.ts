@@ -8,14 +8,25 @@ import ssh2Pkg from "ssh2";
 import { createCurrentHostResolutionRepository } from "../repositories/factory.js";
 import { preparePrivateKeyForSSH2 } from "../../utils/ssh-key-utils.js";
 import { buildSSHAlgorithms } from "../../utils/ssh-algorithms.js";
+import { SSHHostKeyVerifier } from "../../hosts/host-key-verifier.js";
 
 const { Client } = ssh2Pkg;
 
 async function deploySSHKeyToHost(
   hostConfig: Record<string, unknown>,
   credData: CredentialBackend,
+  hostId: number | null,
+  userId: string,
 ): Promise<{ success: boolean; message?: string; error?: string }> {
   const publicKey = credData.publicKey as string;
+  const hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+    hostId,
+    String(hostConfig.ip ?? ""),
+    Number(hostConfig.port ?? 22),
+    null,
+    userId,
+    false,
+  );
   return new Promise((resolve) => {
     const conn = new Client();
 
@@ -287,6 +298,7 @@ async function deploySSHKeyToHost(
         // inline list here offered group1-sha1, 3des-cbc and hmac-md5 at equal
         // standing, so a downgrade-capable peer could pick them.
         algorithms: buildSSHAlgorithms(true),
+        hostVerifier,
       };
 
       if (hostConfig.authType === "password" && hostConfig.password) {
@@ -486,7 +498,12 @@ export function registerCredentialDeployRoutes(
           }
         }
 
-        const deployResult = await deploySSHKeyToHost(hostConfig, credData);
+        const deployResult = await deploySSHKeyToHost(
+          hostConfig,
+          credData,
+          hostData.id ?? null,
+          userId,
+        );
 
         if (deployResult.success) {
           res.json({

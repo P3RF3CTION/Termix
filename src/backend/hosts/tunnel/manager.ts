@@ -46,6 +46,7 @@ import { resolveSshConnectConfigHost } from "../ssh-dns.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
 import { handleSocks5Connect } from "./socks5-relay.js";
 import { notifyAutomationInternalEvent } from "../metrics/automation-bridge.js";
+import { SSHHostKeyVerifier } from "../host-key-verifier.js";
 
 export const activeTunnels = new Map<string, Client>();
 export const retryCounters = new Map<string, number>();
@@ -627,6 +628,14 @@ export async function connectEndpointThroughSource(
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
     algorithms: getManagedTunnelAlgorithms(),
+    hostVerifier: await SSHHostKeyVerifier.createHostVerifier(
+      tunnelConfig.endpointHostId ?? null,
+      tunnelConfig.endpointIP,
+      tunnelConfig.endpointSSHPort,
+      null,
+      tunnelConfig.endpointUserId || tunnelConfig.sourceUserId || "",
+      false,
+    ),
   };
 
   applyAuthOptions(endpointOptions, endpointCredentials);
@@ -1474,6 +1483,15 @@ export async function connectSSHTunnel(
     connOptions.password = resolvedSourceCredentials.password;
   }
 
+  connOptions.hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+    tunnelConfig.sourceHostId ?? null,
+    tunnelConfig.sourceIP,
+    tunnelConfig.sourceSSHPort,
+    null,
+    tunnelConfig.sourceUserId || "",
+    false,
+  );
+
   const finalStatus = connectionStatus.get(tunnelName);
   if (!finalStatus || finalStatus.status !== CONNECTION_STATES.WAITING) {
     broadcastTunnelStatus(tunnelName, {
@@ -1738,6 +1756,15 @@ export async function killRemoteTunnelByMarker(
     if (!connOptions.sock) {
       await resolveSshConnectConfigHost(connOptions);
     }
+
+    connOptions.hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+      tunnelConfig.sourceHostId ?? null,
+      tunnelConfig.sourceIP,
+      tunnelConfig.sourceSSHPort,
+      null,
+      tunnelConfig.sourceUserId || "",
+      false,
+    );
 
     return new Promise<Client>((resolve, reject) => {
       const conn = new Client();

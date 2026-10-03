@@ -331,10 +331,27 @@ class SystemCrypto {
       }
 
       // This file holds JWT_SECRET, DATABASE_KEY, ENCRYPTION_KEY and the
-      // internal auth token. Written with the default umask it lands at 0644,
-      // readable by every other account on the host.
+      // internal auth token. Node's writeFile only honours `mode` when the
+      // file is newly created; overwriting an existing file keeps its
+      // existing mode, so a .env created once at 0644 (older release, manual
+      // edit) stays world-readable even after a Termix upgrade. Remove the
+      // old file first to guarantee the new one is created at 0600, and
+      // surface any chmod failure instead of silently swallowing it.
+      await fs.rm(envPath, { force: true });
       await fs.writeFile(envPath, envContent, { mode: 0o600 });
-      await fs.chmod(envPath, 0o600).catch(() => {});
+      try {
+        await fs.chmod(envPath, 0o600);
+      } catch (chmodError) {
+        databaseLogger.error(
+          `Failed to tighten permissions on ${envPath}`,
+          chmodError,
+          {
+            operation: "env_file_chmod_failed",
+            envPath,
+          },
+        );
+        throw chmodError;
+      }
 
       process.env[key] = value;
     } catch (error) {

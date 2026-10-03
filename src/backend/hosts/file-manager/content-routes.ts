@@ -10,6 +10,7 @@ import {
   type SSHSession,
 } from "./session.js";
 import { detectBinary } from "./utils.js";
+import { shellSingleQuote } from "../metrics/managers/exec-elevated.js";
 
 type FileContentRoutesDeps = {
   sshSessions: Record<string, SSHSession>;
@@ -848,9 +849,12 @@ export function registerFileContentRoutes(
                 .toLowerCase()
                 .includes("permission denied");
               if (isPermDenied && sshConn.sudoPassword) {
+                const innerCommand = `echo '${base64Content}' | base64 -d > ${shellSingleQuote(
+                  filePath,
+                )} && echo SUCCESS`;
                 execWithSudo(
                   sshConn,
-                  `bash -c "echo '${base64Content}' | base64 -d > '${escapedPath}' && echo SUCCESS"`,
+                  `bash -c ${shellSingleQuote(innerCommand)}`,
                   sshConn.sudoPassword,
                 )
                   .then(({ stdout, code: sudoCode }) => {
