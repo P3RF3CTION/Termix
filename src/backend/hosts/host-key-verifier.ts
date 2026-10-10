@@ -84,8 +84,12 @@ export class SSHHostKeyVerifier {
                 );
 
           if (!host) {
-            sshLogger.warn(
-              "Host not found in database during key verification",
+            // Fail closed: a missing host record during a security-critical
+            // check must not auto-accept any server key. The window is small
+            // (DB error or a race with host deletion) but the failure mode is
+            // credential/traffic theft to whatever answers on ip:port.
+            sshLogger.error(
+              "Host not found in database during key verification - rejecting",
               {
                 operation: "host_key_no_host",
                 hostId,
@@ -94,7 +98,7 @@ export class SSHHostKeyVerifier {
                 userId,
               },
             );
-            verify(true);
+            verify(false);
             return;
           }
 
@@ -116,13 +120,22 @@ export class SSHHostKeyVerifier {
             }
 
             if (!ws) {
-              sshLogger.warn(
-                "No WebSocket available for host key verification prompt",
+              // Non-terminal first-contact (fleet autostart, metrics, Docker,
+              // Proxmox discovery, file-manager-only, tmux, etc.). Store the
+              // observed key as TOFU so the NEXT connection on this host will
+              // notice tampering. Without this, every reconnect would hit
+              // "no fingerprint" and auto-accept forever, defeating TOFU for
+              // workflows that never go through a Terminal first.
+              await this.storeHostKey(hostId, fingerprint, keyType, algorithm);
+              sshLogger.info(
+                "Host key auto-accepted and stored (non-interactive first contact)",
                 {
-                  operation: "host_key_no_ws",
+                  operation: "host_key_no_ws_stored",
                   hostId,
                   ip,
                   port,
+                  fingerprint,
+                  keyType,
                   userId,
                 },
               );
@@ -205,28 +218,11 @@ export class SSHHostKeyVerifier {
             changeCount: host.hostKeyChangedCount || 0,
           });
 
-          if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
-            );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
-            return;
-          }
-
+          // A changed jump-host key is MORE dangerous than a changed leaf
+          // host, because every tunnel through the jump is now proxied by the
+          // attacker. Treat it like any other changed key: prompt via WS if
+          // available, otherwise fail closed and ask the user to open a
+          // Terminal to accept the new key.
           if (!ws) {
             sshLogger.error(
               "Host key changed - please connect via Terminal to verify the new key",
@@ -236,6 +232,7 @@ export class SSHHostKeyVerifier {
                 ip,
                 port,
                 userId,
+                isJumpHost,
                 message:
                   "SSH host key has changed. For security, please open a Terminal connection to this host first to verify and accept the new key fingerprint.",
               },

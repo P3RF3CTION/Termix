@@ -8,14 +8,25 @@ import ssh2Pkg from "ssh2";
 import { createCurrentHostResolutionRepository } from "../repositories/factory.js";
 import { preparePrivateKeyForSSH2 } from "../../utils/ssh-key-utils.js";
 import { buildSSHAlgorithms } from "../../utils/ssh-algorithms.js";
+import { SSHHostKeyVerifier } from "../../hosts/host-key-verifier.js";
 
 const { Client } = ssh2Pkg;
 
 async function deploySSHKeyToHost(
   hostConfig: Record<string, unknown>,
   credData: CredentialBackend,
+  targetHostId: number,
+  userId: string,
 ): Promise<{ success: boolean; message?: string; error?: string }> {
   const publicKey = credData.publicKey as string;
+  const hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+    targetHostId,
+    hostConfig.ip as string,
+    (hostConfig.port as number) || 22,
+    null,
+    userId,
+    false,
+  );
   return new Promise((resolve) => {
     const conn = new Client();
 
@@ -282,6 +293,11 @@ async function deploySSHKeyToHost(
         keepaliveCountMax: 3,
         tcpKeepAlive: true,
         tcpKeepAliveInitialDelay: 30000,
+        // Fail closed on host-key mismatches. Deploying a public key means
+        // handing the host password or private key to whatever answers on
+        // ip:port, so accepting any server key would turn a MitM into a
+        // credential-theft primitive.
+        hostVerifier,
         // buildSSHAlgorithms(true) puts modern algorithms first and keeps the
         // legacy ones only as a trailing fallback for old appliances. The
         // inline list here offered group1-sha1, 3des-cbc and hmac-md5 at equal
@@ -486,7 +502,12 @@ export function registerCredentialDeployRoutes(
           }
         }
 
-        const deployResult = await deploySSHKeyToHost(hostConfig, credData);
+        const deployResult = await deploySSHKeyToHost(
+          hostConfig,
+          credData,
+          Number(targetHostId),
+          userId,
+        );
 
         if (deployResult.success) {
           res.json({

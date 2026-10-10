@@ -17,6 +17,11 @@ interface ProxyCacheEntry {
 const proxyCache = new Map<string, ProxyCacheEntry>();
 const CACHE_SIZE = 50;
 const FETCH_TIMEOUT_MS = 8000;
+// Response size cap. The timeout only bounds elapsed time, so a fast endpoint
+// can stream multi-GB into a Buffer.concat kill shot in 8 s if we never
+// enforce a byte limit. JSON widgets fit easily in 2 MiB; larger payloads are
+// out of scope for a homepage dashboard tile.
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 async function resolvePublicUrl(rawUrl: string): Promise<{
   url: URL;
@@ -61,8 +66,21 @@ async function fetchJson(rawUrl: string): Promise<unknown> {
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        let received = 0;
+        let aborted = false;
+        res.on("data", (chunk: Buffer) => {
+          if (aborted) return;
+          received += chunk.length;
+          if (received > MAX_RESPONSE_BYTES) {
+            aborted = true;
+            req.destroy();
+            reject(new Error("Response too large"));
+            return;
+          }
+          chunks.push(chunk);
+        });
         res.on("end", () => {
+          if (aborted) return;
           try {
             const text = Buffer.concat(chunks).toString("utf-8");
             resolve(JSON.parse(text));

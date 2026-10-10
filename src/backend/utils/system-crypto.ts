@@ -39,7 +39,6 @@ class SystemCrypto {
           databaseLogger.success("JWT secret loaded from .env file", {
             operation: "jwt_init_from_file_success",
             secretLength: jwtMatch[1].length,
-            secretPrefix: jwtMatch[1].substring(0, 8) + "...",
           });
           return;
         } else {
