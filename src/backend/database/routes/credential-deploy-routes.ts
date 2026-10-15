@@ -15,7 +15,9 @@ const { Client } = ssh2Pkg;
 async function deploySSHKeyToHost(
   hostConfig: Record<string, unknown>,
   credData: CredentialBackend,
-  hostId: number | null,
+  // Never nullable: a null hostId makes the verifier skip pinning entirely,
+  // and this route hands the host password / private key to the peer.
+  hostId: number,
   userId: string,
 ): Promise<{ success: boolean; message?: string; error?: string }> {
   const publicKey = credData.publicKey as string;
@@ -293,12 +295,16 @@ async function deploySSHKeyToHost(
         keepaliveCountMax: 3,
         tcpKeepAlive: true,
         tcpKeepAliveInitialDelay: 30000,
+        // Fail closed on host-key mismatches. Deploying a public key means
+        // handing the host password or private key to whatever answers on
+        // ip:port, so accepting any server key would turn a MitM into a
+        // credential-theft primitive.
+        hostVerifier,
         // buildSSHAlgorithms(true) puts modern algorithms first and keeps the
         // legacy ones only as a trailing fallback for old appliances. The
         // inline list here offered group1-sha1, 3des-cbc and hmac-md5 at equal
         // standing, so a downgrade-capable peer could pick them.
         algorithms: buildSSHAlgorithms(true),
-        hostVerifier,
       };
 
       if (hostConfig.authType === "password" && hostConfig.password) {
@@ -501,7 +507,7 @@ export function registerCredentialDeployRoutes(
         const deployResult = await deploySSHKeyToHost(
           hostConfig,
           credData,
-          hostData.id ?? null,
+          Number(hostData.id ?? targetHostId),
           userId,
         );
 

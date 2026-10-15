@@ -4,6 +4,7 @@ import express, { type Request, type Response } from "express";
 import { authLogger, databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { buildSSHAlgorithms } from "../../utils/ssh-algorithms.js";
+import { SSHHostKeyVerifier } from "../../hosts/host-key-verifier.js";
 import { extractSnippetReorderUpdates } from "./snippets-reorder.js";
 import {
   createSnippetExecutionResult,

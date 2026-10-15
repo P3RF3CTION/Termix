@@ -1,5 +1,6 @@
 import {
   DEFAULT_STEP_TIMEOUT_MS,
+  MAX_STEP_OUTPUT_BYTES,
   type Step,
 } from "../../../types/automations.js";
 import { execCommand } from "../../hosts/metrics/widgets/common-utils.js";
@@ -185,12 +186,61 @@ async function runHttp(
       timeoutMs: stepTimeout(context, step.timeoutMs, DEFAULT_STEP_TIMEOUT_MS),
     });
 
-    const text = await response.text();
+    const text = await readCappedResponseText(response);
     const summary = `HTTP ${response.status} ${response.statusText}\n${text}`;
     return response.ok ? ok(summary) : fail(`HTTP ${response.status}`, summary);
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
+}
+
+/**
+ * `response.text()` buffers the whole body into memory with no cap, which turns
+ * any slow/large endpoint an automation points at into an OOM lever (the step
+ * timeout bounds elapsed time, not throughput). Cap at a few multiples of the
+ * truncate limit so we still have enough bytes for the "... (truncated)" tail
+ * in the engine, then stop reading.
+ */
+const MAX_HTTP_RESPONSE_BYTES = MAX_STEP_OUTPUT_BYTES * 4;
+
+async function readCappedResponseText(response: Response): Promise<string> {
+  const body = response.body;
+  if (!body) {
+    try {
+      return await response.text();
+    } catch {
+      return "";
+    }
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (received < MAX_HTTP_RESPONSE_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        const remaining = MAX_HTTP_RESPONSE_BYTES - received;
+        if (value.byteLength > remaining) {
+          chunks.push(value.subarray(0, remaining));
+          received += remaining;
+          break;
+        }
+        chunks.push(value);
+        received += value.byteLength;
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* */
+    }
+  }
+
+  const merged = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+  return merged.toString("utf8");
 }
 
 async function runCommand(

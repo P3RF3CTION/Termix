@@ -24,8 +24,16 @@ export async function providerFetch(
   }
 
   if (decision.isPrivate) {
+    // redirect:"error" prevents an allowlisted private endpoint from steering
+    // the request into un-allowlisted private space (e.g. cloud metadata at
+    // 169.254.169.254 or lateral LAN IPs). Without it, the follow-on request
+    // uses the raw proxy/direct dispatcher with no DNS filter, and provider
+    // auth headers (Authorization, x-goog-api-key, etc.) travel to the
+    // redirect target. The caller sets the Host explicitly, so a redirect is
+    // never load-bearing for this path.
     return fetch(url, {
       ...init,
+      redirect: "error",
       dispatcher: getFetchDispatcher(url),
     } as RequestInit);
   }

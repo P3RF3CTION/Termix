@@ -8,6 +8,11 @@ const rssCache = new Map<string, { data: RssItem[]; expires: number }>();
 const CACHE_TTL_MS = 1000 * 60 * 15; // 15 minutes
 const CACHE_SIZE = 50;
 const FETCH_TIMEOUT_MS = 8000;
+// Response size cap. The timeout only bounds elapsed time, not throughput, so
+// a hostile feed can stream multi-MB and then feed the regex engine (which is
+// quadratic in the input length on this parser). 2 MiB is already far more
+// than any legitimate RSS/Atom feed.
+const MAX_FEED_BYTES = 2 * 1024 * 1024;
 
 interface RssItem {
   title: string;
@@ -21,8 +26,47 @@ function fetchXml(url: string): Promise<string> {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   }).then(async (res) => {
     if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
-    return res.text();
+    return readCappedResponseText(res, MAX_FEED_BYTES);
   });
+}
+
+async function readCappedResponseText(
+  response: globalThis.Response,
+  maxBytes: number,
+): Promise<string> {
+  const body = response.body;
+  if (!body) {
+    try {
+      return await response.text();
+    } catch {
+      return "";
+    }
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (received < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const remaining = maxBytes - received;
+      if (value.byteLength > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        received += remaining;
+        break;
+      }
+      chunks.push(value);
+      received += value.byteLength;
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* */
+    }
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
 }
 
 function parseRss(xml: string): RssItem[] {

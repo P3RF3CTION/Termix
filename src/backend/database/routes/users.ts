@@ -1101,6 +1101,25 @@ router.get("/oidc/callback", async (req, res) => {
             error: "Failed to setup user security - user creation cancelled",
           });
         }
+      } else if (config.allowed_users) {
+        // Re-check the allowed_users gate for returning users. Without this,
+        // admin-side revocation of `allowed_users` has no effect on anyone who
+        // already linked a GitHub account, mirroring the generic-OIDC branch
+        // below (operation=oidc_user_not_allowed_existing).
+        const email = ghUserInfo.email as string | undefined;
+        if (!isOIDCUserAllowed(config.allowed_users, ghIdentifier, email)) {
+          authLogger.warn(
+            "GitHub OIDC user not in allowed list (existing user)",
+            {
+              operation: "github_oidc_user_not_allowed_existing",
+              ghIdentifier,
+              userId: ghUserRecord.id,
+            },
+          );
+          const redirectUrl = new URL(frontendOrigin);
+          redirectUrl.searchParams.set("error", "user_not_allowed");
+          return res.redirect(redirectUrl.toString());
+        }
       }
 
       try {
@@ -3089,8 +3108,20 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
   // Revoke every session and clear the cookie in the same response so a
   // client with a leaked cookie stops working immediately, not on the next
   // (potentially long-off) request that happens to notice the missing
-  // session row.
-  await authManager.logoutUser(userId);
+  // session row. A DB failure in logoutUser must block the "please log in
+  // again" response rather than slip past as an un-logged background error.
+  try {
+    await authManager.logoutUser(userId);
+  } catch (err) {
+    authLogger.error("Failed to revoke sessions after password change", err, {
+      operation: "password_change_logout_failed",
+      userId,
+    });
+    return res.status(500).json({
+      error:
+        "Password updated but existing sessions could not be revoked. Please try again.",
+    });
+  }
   loginRateLimiter.resetAttempts(clientIp, rateKey);
   res.clearCookie("jwt", authManager.getClearCookieOptions(req));
 
