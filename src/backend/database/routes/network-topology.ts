@@ -85,7 +85,6 @@ router.get(
       });
       return res.status(500).json({
         error: "Failed to fetch network topology",
-        details: (error as Error).message,
       });
     }
   },
@@ -168,7 +167,6 @@ router.post(
       });
       return res.status(500).json({
         error: "Failed to save network topology",
-        details: (error as Error).message,
       });
     }
   },

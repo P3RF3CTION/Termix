@@ -43,6 +43,7 @@ import {
 } from "./utils.js";
 
 import { resolveSshConnectConfigHost } from "../ssh-dns.js";
+import { SSHHostKeyVerifier } from "../host-key-verifier.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
 import { handleSocks5Connect } from "./socks5-relay.js";
 import { notifyAutomationInternalEvent } from "../metrics/automation-bridge.js";
@@ -1626,6 +1627,10 @@ export async function killRemoteTunnelByMarker(
 
   const poolKey = `tunnel:${tunnelConfig.sourceUserId}:${tunnelConfig.sourceIP}:${tunnelConfig.sourceSSHPort}:${tunnelConfig.sourceUsername}`;
 
+  const preloadedKillHost = tunnelConfig.sourceHostId
+    ? await SSHHostKeyVerifier.preloadHostData(tunnelConfig.sourceHostId)
+    : null;
+
   const factory = async (): Promise<Client> => {
     const connOptions: Record<string, unknown> = {
       host:
@@ -1637,35 +1642,41 @@ export async function killRemoteTunnelByMarker(
       readyTimeout: 60000,
       tcpKeepAlive: true,
       tcpKeepAliveInitialDelay: 30000,
+      hostVerifier: tunnelConfig.sourceHostId
+        ? await SSHHostKeyVerifier.createHostVerifier(
+            tunnelConfig.sourceHostId,
+            tunnelConfig.sourceIP,
+            tunnelConfig.sourceSSHPort,
+            null,
+            tunnelConfig.sourceUserId || "",
+            false,
+            preloadedKillHost,
+          )
+        : undefined,
       algorithms: {
         kex: [
-          "diffie-hellman-group14-sha256",
-          "diffie-hellman-group14-sha1",
-          "diffie-hellman-group1-sha1",
-          "diffie-hellman-group-exchange-sha256",
-          "diffie-hellman-group-exchange-sha1",
+          "curve25519-sha256",
+          "curve25519-sha256@libssh.org",
           "ecdh-sha2-nistp256",
           "ecdh-sha2-nistp384",
           "ecdh-sha2-nistp521",
+          "diffie-hellman-group-exchange-sha256",
+          "diffie-hellman-group16-sha512",
+          "diffie-hellman-group18-sha512",
+          "diffie-hellman-group14-sha256",
         ],
         cipher: [
+          "aes128-gcm@openssh.com",
+          "aes256-gcm@openssh.com",
           "aes128-ctr",
           "aes192-ctr",
           "aes256-ctr",
-          "aes128-gcm@openssh.com",
-          "aes256-gcm@openssh.com",
-          "aes128-cbc",
-          "aes192-cbc",
-          "aes256-cbc",
-          "3des-cbc",
         ],
         hmac: [
           "hmac-sha2-256-etm@openssh.com",
           "hmac-sha2-512-etm@openssh.com",
           "hmac-sha2-256",
           "hmac-sha2-512",
-          "hmac-sha1",
-          "hmac-md5",
         ],
         compress: ["none", "zlib@openssh.com", "zlib"],
       },

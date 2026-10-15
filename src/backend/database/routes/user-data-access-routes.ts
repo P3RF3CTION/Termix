@@ -1,7 +1,9 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { RequestHandler, Router } from "express";
+import bcrypt from "bcryptjs";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
+import { createCurrentUserRepository } from "../repositories/factory.js";
 
 interface UserDataAccessRoutesDeps {
   authenticateJWT: RequestHandler;
@@ -53,6 +55,34 @@ export function registerUserDataAccessRoutes(
     }
 
     try {
+      // authManager.authenticateUser only verifies the password on the legacy
+      // password-wrapped DEK path. For every v3-wrapped user it returns true as
+      // long as the DEK is loaded, so this step-up endpoint has to verify the
+      // password itself before treating the session as re-authenticated.
+      const userRecord = await createCurrentUserRepository().findById(userId);
+      if (!userRecord) {
+        return res.status(401).json({ error: "Authentication required" });
+      }
+      if (
+        userRecord.isOidc &&
+        (!userRecord.passwordHash || userRecord.passwordHash.trim() === "")
+      ) {
+        return res
+          .status(400)
+          .json({ error: "This account has no password to unlock with" });
+      }
+      const passwordOk = await bcrypt.compare(
+        password,
+        userRecord.passwordHash || "",
+      );
+      if (!passwordOk) {
+        authLogger.warn("Failed to unlock user data - invalid password", {
+          operation: "user_data_unlock_failed",
+          userId,
+        });
+        return res.status(401).json({ error: "Invalid password" });
+      }
+
       const unlocked = await authManager.authenticateUser(userId, password);
       if (unlocked) {
         const refreshedSession =

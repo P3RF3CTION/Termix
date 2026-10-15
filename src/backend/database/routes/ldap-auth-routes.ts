@@ -5,7 +5,11 @@ import { authLogger } from "../../utils/logger.js";
 import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { getClientIp } from "../../utils/request-origin.js";
 import { AuthManager } from "../../utils/auth-manager.js";
-import { parseUserAgent } from "../../utils/user-agent-parser.js";
+import {
+  parseUserAgent,
+  generateDeviceFingerprint,
+  getDeviceId,
+} from "../../utils/user-agent-parser.js";
 import { isOIDCUserAllowed, loadProviderConfig } from "./user-oidc-utils.js";
 import ldap from "ldapjs";
 import { readFileSync } from "node:fs";
@@ -436,6 +440,37 @@ export function registerLDAPAuthRoutes(router: Router): void {
       }
 
       loginRateLimiter.resetAttempts(clientIp, rateLimitKey);
+
+      // A user who enabled TOTP must still be challenged when they authenticate
+      // via LDAP - otherwise TOTP protects only the password login path.
+      if (userRecord.totpEnabled) {
+        const deviceFingerprint = generateDeviceFingerprint(
+          deviceInfo,
+          getDeviceId(req),
+        );
+        const isTrusted = deviceFingerprint
+          ? await authManager.isTrustedDevice(userRecord.id, deviceFingerprint)
+          : false;
+
+        if (!isTrusted) {
+          const tempToken = await authManager.generateJWTToken(userRecord.id, {
+            pendingTOTP: true,
+            expiresIn: "10m",
+          });
+          return res.json({
+            success: true,
+            requires_totp: true,
+            temp_token: tempToken,
+            rememberMe: !!rememberMe,
+          });
+        }
+
+        authLogger.info("TOTP bypassed for trusted device (LDAP)", {
+          operation: "totp_bypass",
+          userId: userRecord.id,
+          deviceFingerprint,
+        });
+      }
 
       const token = await authManager.generateJWTToken(userRecord.id, {
         deviceType: deviceInfo.type,
