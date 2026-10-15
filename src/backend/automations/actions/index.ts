@@ -97,6 +97,20 @@ async function runNotify(
     return fail("Selected notification channels no longer exist");
   }
 
+  // Same admin recheck as runHttp above: a channel config with
+  // `allowPrivateNetwork: true` is only honoured when the automation owner
+  // is still admin at run time. Without this, any authenticated user could
+  // save a channel that bypassed the SSRF blocklist, then use it from a
+  // scheduled automation. Look the flag up once and pass through to
+  // sendAutomationNotification below.
+  let ownerIsAdmin = false;
+  try {
+    const owner = await createCurrentUserRepository().findById(context.userId);
+    ownerIsAdmin = owner?.isAdmin === true;
+  } catch {
+    ownerIsAdmin = false;
+  }
+
   let delivered = 0;
   const errors: string[] = [];
   for (const channel of selected) {
@@ -110,6 +124,7 @@ async function runNotify(
           severity: step.severity ?? "warning",
           context: context.template,
         },
+        { ownerIsAdmin },
       );
       delivered++;
     } catch (error) {

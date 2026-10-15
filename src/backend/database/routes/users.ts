@@ -46,7 +46,10 @@ import { registerUserImageStorageRoutes } from "./user-image-storage-routes.js";
 import { registerUserSettingsRoutes } from "./user-settings-routes.js";
 import { registerTouchInputSettingsRoutes } from "./touch-input-settings-routes.js";
 import { registerAcmeSSLRoutes } from "./acme-ssl-routes.js";
-import { registerUserTotpRoutes } from "./user-totp-routes.js";
+import {
+  registerUserTotpRoutes,
+  verifyTotpReauth,
+} from "./user-totp-routes.js";
 import { registerUserWebAuthnRoutes } from "./user-webauthn-routes.js";
 import { registerUserSessionRoutes } from "./user-session-routes.js";
 import { registerUserOidcAccountRoutes } from "./user-oidc-account-routes.js";
@@ -74,6 +77,15 @@ import {
 } from "../../utils/trusted-proxy-auth.js";
 
 const authManager = AuthManager.getInstance();
+
+// Precomputed once so /login can spend the same ~100ms on a missing user as
+// on a real one, without leaking which usernames exist through response time.
+// The plaintext is random per boot and never used; the hash is only compared
+// against in the failure branch.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
+  crypto.randomBytes(32).toString("hex"),
+  10,
+);
 
 const router = express.Router();
 
@@ -1883,6 +1895,15 @@ router.post("/login", async (req, res) => {
     const userRecord =
       await createCurrentUserRepository().findByUsername(username);
 
+    // The failure branches below all take the same shape -- record the failed
+    // attempt, run one bcrypt.compare against a real or dummy hash so the
+    // timing is uniform, and return the same generic 401. That way a
+    // distributed attacker can't tell "unknown user" from "OIDC-only" from
+    // "wrong password" through either the response body or the wall-clock,
+    // and the rate limiter engages on every guess.
+    const hashToCompare = userRecord?.passwordHash || DUMMY_PASSWORD_HASH;
+    const passwordMatches = await bcrypt.compare(password, hashToCompare);
+
     if (!userRecord) {
       loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn(`Login failed: user not found`, {
@@ -1901,18 +1922,16 @@ router.post("/login", async (req, res) => {
       userRecord.isOidc &&
       (!userRecord.passwordHash || userRecord.passwordHash.trim() === "")
     ) {
+      loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn("OIDC-only user attempted traditional login", {
         operation: "user_login",
         username,
         userId: userRecord.id,
       });
-      return res
-        .status(403)
-        .json({ error: "This user uses external authentication" });
+      return res.status(401).json({ error: "Invalid username or password" });
     }
 
-    const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
-    if (!isMatch) {
+    if (!passwordMatches) {
       loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn(`Login failed: incorrect password`, {
         operation: "user_login",
@@ -2838,12 +2857,24 @@ router.patch("/password-reset-allowed", authenticateJWT, async (req, res) => {
  */
 router.delete("/delete-account", authenticateJWT, async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
-  const { password } = req.body;
+  const { password, totp_code } = req.body;
 
   if (!isNonEmptyString(password)) {
     return res
       .status(400)
       .json({ error: "Password is required to delete account" });
+  }
+
+  // Same throttle as /change-password: a stolen session cookie should not be
+  // able to grind through the account password on this endpoint either.
+  const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+  const rateKey = `delacct:${userId}`;
+  const lockStatus = loginRateLimiter.isLocked(clientIp, rateKey);
+  if (lockStatus.locked) {
+    return res.status(429).json({
+      error: "Too many account deletion attempts. Try again later.",
+      remainingTime: lockStatus.remainingTime,
+    });
   }
 
   try {
@@ -2861,10 +2892,32 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
     if (!isMatch) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
       authLogger.warn(
         `Incorrect password provided for account deletion: ${userRecord.username}`,
       );
       return res.status(401).json({ error: "Incorrect password" });
+    }
+
+    // A stolen password shouldn't be enough to nuke the account when 2FA is
+    // on -- same rule as changing the password.
+    if (userRecord.totpEnabled) {
+      if (typeof totp_code !== "string" || !totp_code.trim()) {
+        return res.status(400).json({
+          error: "A TOTP code or backup code is required",
+          code: "TOTP_REQUIRED",
+        });
+      }
+      const userDataKey = authManager.getUserDataKey(userId);
+      const totpOk = await verifyTotpReauth(
+        userRecord,
+        totp_code.trim(),
+        userDataKey,
+      );
+      if (!totpOk) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
+        return res.status(401).json({ error: "Invalid TOTP code" });
+      }
     }
 
     if (userRecord.isAdmin) {
@@ -2877,6 +2930,7 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
     }
 
     await createCurrentUserRepository().delete(userId);
+    loginRateLimiter.resetAttempts(clientIp, rateKey);
 
     authLogger.success(`User account deleted: ${userRecord.username}`);
     res.json({ message: "Account deleted successfully" });
@@ -2919,7 +2973,7 @@ registerUserPasswordResetRoutes(router, { authManager });
  */
 router.post("/change-password", authenticateJWT, async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
-  const { oldPassword, newPassword } = req.body;
+  const { oldPassword, newPassword, totp_code } = req.body;
   authLogger.info("Password change request", {
     operation: "password_change_request",
     userId,
@@ -2935,6 +2989,18 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Old and new passwords are required." });
   }
 
+  // Reuse the login rate limiter so a stolen session cookie cannot brute-force
+  // the current password through this endpoint (only /login was throttled).
+  const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+  const rateKey = `pwchange:${userId}`;
+  const lockStatus = loginRateLimiter.isLocked(clientIp, rateKey);
+  if (lockStatus.locked) {
+    return res.status(429).json({
+      error: "Too many password change attempts. Try again later.",
+      remainingTime: lockStatus.remainingTime,
+    });
+  }
+
   const user = await findCurrentUser(userId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
@@ -2942,12 +3008,32 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
 
   const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
   if (!isMatch) {
+    loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
     authLogger.warn("Password change failed - old password incorrect", {
       operation: "password_change_failed",
       userId,
       reason: "old_password_wrong",
     });
     return res.status(401).json({ error: "Incorrect current password" });
+  }
+
+  // The point of 2FA is that a stolen password alone can't take over the
+  // account. Rotating the password (or deleting it below) is exactly the kind
+  // of takeover step 2FA has to gate on, so refuse the change without the
+  // second factor.
+  if (user.totpEnabled) {
+    if (typeof totp_code !== "string" || !totp_code.trim()) {
+      return res.status(400).json({
+        error: "A TOTP code or backup code is required",
+        code: "TOTP_REQUIRED",
+      });
+    }
+    const userDataKey = authManager.getUserDataKey(userId);
+    const totpOk = await verifyTotpReauth(user, totp_code.trim(), userDataKey);
+    if (!totpOk) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
+      return res.status(401).json({ error: "Invalid TOTP code" });
+    }
   }
 
   const success = await authManager.changeUserPassword(
@@ -2966,7 +3052,14 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     passwordHash: password_hash,
   });
 
-  authManager.logoutUser(userId);
+  // Revoke every session and clear the cookie in the same response so a
+  // client with a leaked cookie stops working immediately, not on the next
+  // (potentially long-off) request that happens to notice the missing
+  // session row.
+  await authManager.logoutUser(userId);
+  loginRateLimiter.resetAttempts(clientIp, rateKey);
+  res.clearCookie("jwt", authManager.getClearCookieOptions(req));
+
   authLogger.success("Password changed successfully", {
     operation: "password_change_complete",
     userId,

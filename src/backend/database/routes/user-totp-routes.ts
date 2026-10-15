@@ -423,23 +423,20 @@ export function registerUserTotpRoutes(
    */
   router.post("/totp/disable", authenticateJWT, async (req, res) => {
     const userId = (req as AuthenticatedRequest).userId;
-    const { password, totp_code } = req.body;
+    const { totp_code } = req.body;
     try {
       const userRecord = await createCurrentUserRepository().findById(userId);
       if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
 
-      // One re-authentication value, whichever kind it is. The dialog offers a
-      // single field -- "Enter TOTP code or password" -- so it arrives in
-      // whichever of the two body fields the caller happened to use.
-      const credential = totp_code || password;
-      if (!credential) {
-        return res.status(400).json({
-          error: userRecord.isOidc
-            ? "A TOTP code is required"
-            : "A TOTP code or password is required",
-        });
+      // The second factor is the only credential that can turn TOTP off:
+      // otherwise a stolen password (which is what 2FA exists to defend
+      // against) would be enough to remove 2FA in a single request.
+      if (typeof totp_code !== "string" || !totp_code.trim()) {
+        return res
+          .status(400)
+          .json({ error: "A TOTP code or backup code is required" });
       }
 
       if (!userRecord.totpEnabled) {
@@ -447,22 +444,14 @@ export function registerUserTotpRoutes(
       }
 
       const userDataKey = authManager.getUserDataKey(userId);
-      // TOTP code or backup code first; verifyTotpReauth deliberately refuses
-      // the account password, so that stays a separate comparison here.
-      let verified = await verifyTotpReauth(
+      const verified = await verifyTotpReauth(
         userRecord,
-        credential,
+        totp_code.trim(),
         userDataKey,
       );
 
-      if (!verified && !userRecord.isOidc && userRecord.passwordHash) {
-        verified = await bcrypt.compare(credential, userRecord.passwordHash);
-      }
-
       if (!verified) {
-        return res
-          .status(401)
-          .json({ error: "Incorrect password or invalid TOTP code" });
+        return res.status(401).json({ error: "Invalid TOTP code" });
       }
 
       await createCurrentUserRepository().update(userId, {
@@ -676,7 +665,11 @@ export function registerUserTotpRoutes(
         userRecord.totpSecret,
         userDataKey,
         userRecord.id,
-        "totp_secret",
+        // The rest of this file uses "totpSecret" (camelCase) as the HKDF
+        // context; keep the two in sync so we're not silently relying on the
+        // legacy field-name fallback map to bridge a snake/camel mismatch on
+        // a hot path like TOTP login.
+        "totpSecret",
       );
 
       if (!totpSecret) {

@@ -17,6 +17,10 @@ interface ProxyCacheEntry {
 const proxyCache = new Map<string, ProxyCacheEntry>();
 const CACHE_SIZE = 50;
 const FETCH_TIMEOUT_MS = 8000;
+// Cap the response size we're willing to buffer. Any legitimate JSON widget
+// payload fits well below this; anything larger is either a mistake or a
+// deliberate attempt to pin our memory.
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 async function resolvePublicUrl(rawUrl: string): Promise<{
   url: URL;
@@ -55,13 +59,47 @@ async function fetchJson(rawUrl: string): Promise<unknown> {
         hostname: address,
         port: url.port || undefined,
         path: `${url.pathname}${url.search}`,
-        headers: { Host: url.host },
+        headers: { Host: url.host, Accept: "application/json" },
         servername: url.protocol === "https:" ? url.hostname : undefined,
         timeout: FETCH_TIMEOUT_MS,
       },
       (res) => {
+        // Refuse anything the origin already tells us is too big, so we don't
+        // even start buffering a 10 GB response into memory.
+        const contentLength = Number(res.headers["content-length"]);
+        if (
+          Number.isFinite(contentLength) &&
+          contentLength > MAX_RESPONSE_BYTES
+        ) {
+          res.resume();
+          reject(new Error("Response too large"));
+          return;
+        }
+
+        const contentType = String(res.headers["content-type"] || "");
+        // Prevents accidentally handing a chunk of arbitrary HTML/binary to
+        // JSON.parse — with the size cap above, that would still be a large
+        // wasted parse.
+        if (
+          contentType &&
+          !/^application\/(json|.*\+json)\b/i.test(contentType)
+        ) {
+          res.resume();
+          reject(new Error("Response is not valid JSON"));
+          return;
+        }
+
         const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        let received = 0;
+        res.on("data", (chunk: Buffer) => {
+          received += chunk.length;
+          if (received > MAX_RESPONSE_BYTES) {
+            res.destroy();
+            reject(new Error("Response too large"));
+            return;
+          }
+          chunks.push(chunk);
+        });
         res.on("end", () => {
           try {
             const text = Buffer.concat(chunks).toString("utf-8");
@@ -136,6 +174,9 @@ homepageProxyRouter.get("/", async (req: Request, res: Response) => {
     homepageLogger.warn("Proxy fetch failed", { targetUrl, msg });
     if (msg.includes("not valid JSON")) {
       return res.status(400).json({ error: "Response is not valid JSON" });
+    }
+    if (msg.includes("Response too large")) {
+      return res.status(502).json({ error: "Response too large" });
     }
     res.status(500).json({ error: "Failed to fetch URL" });
   }

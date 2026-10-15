@@ -9,6 +9,7 @@ import {
 import { createCorsMiddleware } from "../../utils/cors-config.js";
 import { createSecurityHeadersMiddleware } from "../../utils/security-headers.js";
 import { createCompressionMiddleware } from "../../utils/compression-config.js";
+import { applyServerTimeouts } from "../../utils/http-server-timeouts.js";
 import cookieParser from "cookie-parser";
 import axios from "axios";
 import ssh2Pkg, { Client as SSHClient } from "ssh2";
@@ -128,9 +129,11 @@ app.use(createSecurityHeadersMiddleware());
 app.use(createCompressionMiddleware());
 app.use(createCorsMiddleware(["GET", "POST", "PUT", "DELETE", "OPTIONS"]));
 app.use(cookieParser());
-app.use(express.json({ limit: "1gb" }));
-app.use(express.urlencoded({ limit: "1gb", extended: true }));
-app.use(express.raw({ limit: "5gb", type: "application/octet-stream" }));
+// The chunked upload path streams the request body directly with req.pipe(),
+// so nothing here needs to buffer a whole file into memory. Keep the parsers
+// bounded to what real JSON control payloads carry.
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
@@ -3144,6 +3147,10 @@ try {
       });
     }
   });
+  // File-manager streams large uploads via req.pipe(), so give the whole
+  // request extra room; the header/keep-alive caps still fend off Slowloris.
+  applyServerTimeouts(server);
+  server.requestTimeout = 0;
 
   server.on("error", (err) => {
     fileLogger.error("File Manager server error", err, {

@@ -17,6 +17,7 @@ import { nanoid } from "nanoid";
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import {
   generateDeviceFingerprint,
   getDeviceId,
@@ -412,11 +413,27 @@ export function registerUserWebAuthnRoutes(
    *         description: Passkey not recognized or authentication failed.
    */
   router.post("/webauthn/authenticate/verify", async (req, res) => {
+    // /login has always been throttled; this endpoint mints a full session
+    // JWT on success, so an attacker probing forged assertions had an
+    // effectively unlimited budget here. Bucket by client IP so a botnet
+    // still gets one bucket per source.
+    const clientIp =
+      req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+    const rateKey = "webauthn:verify";
+    const lockStatus = loginRateLimiter.isLocked(clientIp, rateKey);
+    if (lockStatus.locked) {
+      return res.status(429).json({
+        error: "Too many authentication attempts. Try again later.",
+        remainingTime: lockStatus.remainingTime,
+      });
+    }
+
     const challenge = takeChallenge(
       authenticationChallenges,
       req.body?.challengeId,
     );
     if (!challenge) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
       return res
         .status(400)
         .json({ error: "Authentication challenge expired" });
@@ -425,6 +442,7 @@ export function registerUserWebAuthnRoutes(
     const response = req.body?.response as
       AuthenticationResponseJSON | undefined;
     if (!response?.id) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
       return res.status(400).json({ error: "Invalid passkey response" });
     }
 
@@ -434,10 +452,12 @@ export function registerUserWebAuthnRoutes(
       );
 
     if (!credential) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
       return res.status(401).json({ error: "Passkey not recognized" });
     }
 
     if (challenge.userId && challenge.userId !== credential.userId) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
       return res.status(401).json({ error: "Passkey not recognized" });
     }
 
@@ -455,6 +475,7 @@ export function registerUserWebAuthnRoutes(
       });
 
       if (!verification.verified) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
         return res.status(401).json({ error: "Passkey authentication failed" });
       }
 
@@ -462,6 +483,7 @@ export function registerUserWebAuthnRoutes(
         credential.userId,
       );
       if (!userRecord) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
         return res.status(404).json({ error: "User not found" });
       }
 
@@ -472,11 +494,14 @@ export function registerUserWebAuthnRoutes(
       );
 
       if (!authenticated) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
         return res.status(401).json({
           error:
             "Passkey cannot unlock this account. Log in with password and register the passkey again.",
         });
       }
+
+      loginRateLimiter.resetAttempts(clientIp, rateKey);
 
       await createCurrentWebauthnCredentialRepository().updateAuthState(
         credential.id,

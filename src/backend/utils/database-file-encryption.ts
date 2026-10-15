@@ -290,8 +290,20 @@ class DatabaseFileEncryption {
         throw new Error(`Unsupported encryption version: ${metadata.version}`);
       }
 
+      // Pin the cipher rather than trusting `metadata.algorithm` verbatim:
+      // the meta file lives next to the ciphertext, so an attacker with
+      // filesystem write can swap in an algorithm that skips authentication
+      // (any non-GCM stream cipher) and get tampered plaintext accepted.
+      // `setAuthTag` throws for non-GCM ciphers today, but algorithm-confusion
+      // classes usually become exploitable when the surrounding code changes
+      // -- close it with an explicit allowlist.
+      if (metadata.algorithm !== this.ALGORITHM) {
+        throw new Error(
+          `Unsupported encryption algorithm in metadata: ${metadata.algorithm}`,
+        );
+      }
       const decipher = crypto.createDecipheriv(
-        metadata.algorithm,
+        this.ALGORITHM,
         key,
         Buffer.from(metadata.iv, "hex"),
       ) as crypto.DecipherGCM;

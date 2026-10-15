@@ -2,10 +2,11 @@ import { getErrorMessage } from "../../utils/error-message.js";
 import { getTrustProxySetting } from "../../utils/trusted-proxies.js";
 import express from "express";
 import net from "net";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createCorsMiddleware } from "../../utils/cors-config.js";
 import { createSecurityHeadersMiddleware } from "../../utils/security-headers.js";
 import { createCompressionMiddleware } from "../../utils/compression-config.js";
+import { applyServerTimeouts } from "../../utils/http-server-timeouts.js";
 import cookieParser from "cookie-parser";
 import { Client, type ConnectConfig } from "ssh2";
 import { SSH_ALGORITHMS } from "../../utils/ssh-algorithms.js";
@@ -1552,7 +1553,7 @@ function createSshFactory(host: SSHHostWithCredentials): () => Promise<Client> {
           );
 
           if (totpPromptIndex !== -1) {
-            const sessionId = `totp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const sessionId = `totp-${Date.now()}-${randomUUID()}`;
 
             pendingTOTPSessions[sessionId] = {
               client,
@@ -2427,7 +2428,7 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
           );
 
           if (totpPromptIndex !== -1) {
-            const sessionId = `totp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const sessionId = `totp-${Date.now()}-${randomUUID()}`;
 
             pendingTOTPSessions[sessionId] = {
               client,
@@ -2508,7 +2509,7 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
           };
           scheduleMetricsSessionCleanup(sessionKey);
 
-          const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          const viewerSessionId = `viewer-${Date.now()}-${randomUUID()}`;
           pollingManager.registerViewer(host.id, viewerSessionId, userId);
 
           resolve({ success: true, viewerSessionId });
@@ -2935,7 +2936,7 @@ app.post("/metrics/connect-totp", async (req, res) => {
 
     delete pendingTOTPSessions[sessionId];
 
-    const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const viewerSessionId = `viewer-${Date.now()}-${randomUUID()}`;
     pollingManager.registerViewer(session.hostId, viewerSessionId, userId);
 
     res.json({ success: true, viewerSessionId });
@@ -3091,7 +3092,7 @@ process.on("SIGTERM", () => {
 });
 
 const PORT = 30005;
-app.listen(PORT, async () => {
+const metricsServer = app.listen(PORT, async () => {
   try {
     await authManager.initialize();
   } catch (err) {
@@ -3108,3 +3109,4 @@ app.listen(PORT, async () => {
     10 * 60 * 1000,
   );
 });
+applyServerTimeouts(metricsServer);

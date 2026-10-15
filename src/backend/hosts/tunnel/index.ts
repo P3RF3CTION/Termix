@@ -6,6 +6,7 @@ import { createServer } from "http";
 import { createCorsMiddleware } from "../../utils/cors-config.js";
 import { createSecurityHeadersMiddleware } from "../../utils/security-headers.js";
 import { createCompressionMiddleware } from "../../utils/compression-config.js";
+import { applyServerTimeouts } from "../../utils/http-server-timeouts.js";
 import cookieParser from "cookie-parser";
 import { WebSocketServer } from "ws";
 
@@ -108,6 +109,7 @@ c2sRelayWss.on("connection", (ws, req) => {
   });
 });
 
+applyServerTimeouts(server);
 server.listen(PORT, () => {
   setTimeout(() => {
     initializeAutoStartTunnels();

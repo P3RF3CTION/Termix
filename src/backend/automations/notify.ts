@@ -40,9 +40,24 @@ const DISCORD_COLORS: Record<string, number> = {
   critical: 15158332,
 };
 
+export interface SendAutomationNotificationOptions {
+  /**
+   * Whether the caller has verified the automation owner is currently an
+   * admin. `config.allowPrivateNetwork` is only honoured when this is true;
+   * otherwise LAN/link-local targets get the same block that safeOutboundFetch
+   * applies to every other outbound call. The HTTP step in
+   * automations/actions/index.ts already runs this check at execute time;
+   * `runNotify` now passes the same value through here, so a notification
+   * channel with `allowPrivateNetwork: true` saved by an admin can no longer
+   * be triggered by a non-admin user's automation.
+   */
+  ownerIsAdmin?: boolean;
+}
+
 export async function sendAutomationNotification(
   channel: AutomationChannel,
   notification: AutomationNotification,
+  options: SendAutomationNotificationOptions = {},
 ): Promise<void> {
   let config: Record<string, unknown>;
   try {
@@ -51,7 +66,8 @@ export async function sendAutomationNotification(
     throw new Error("Channel configuration is not valid JSON");
   }
 
-  const allowPrivateNetwork = config.allowPrivateNetwork === true;
+  const allowPrivateNetwork =
+    options.ownerIsAdmin === true && config.allowPrivateNetwork === true;
 
   switch (channel.type) {
     case "webhook":
@@ -170,10 +186,11 @@ async function sendDiscord(
   });
 
   if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(
-      `HTTP ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
-    );
+    // Do NOT echo the response body: with a mis-typed channel type or a
+    // saved-then-mutated Discord URL, the "detail" here would be the raw
+    // HTTP reply of an internal target. The run log surfaces this string
+    // straight to the automation owner, which was a full read primitive.
+    throw new Error(`HTTP ${response.status} ${response.statusText}`);
   }
 }
 

@@ -49,15 +49,18 @@ import { resolveWithinDir } from "../utils/safe-data-path.js";
 import { DatabaseMigration } from "../utils/database-migration.js";
 import { UserDataExport } from "../utils/user-data-export.js";
 import { AutoSSLSetup } from "../utils/auto-ssl-setup.js";
+import { applyServerTimeouts } from "../utils/http-server-timeouts.js";
 import {
   createCurrentCredentialRepository,
   createCurrentDismissedAlertRepository,
   createCurrentFileManagerBookmarkRepository,
   createCurrentHostRepository,
+  createCurrentSessionRepository,
   createCurrentSettingsRepository,
   createCurrentSshCredentialUsageRepository,
   createCurrentUserRepository,
 } from "./repositories/factory.js";
+import { SystemCrypto } from "../utils/system-crypto.js";
 import { withCurrentSqliteForeignKeysDisabled } from "./repositories/sqlite-foreign-keys.js";
 import { parseUserAgent } from "../utils/user-agent-parser.js";
 import { getProxyAgent } from "../utils/proxy-agent.js";
@@ -270,9 +273,12 @@ async function fetchGitHubAPI<T>(
   }
 }
 
-app.use(bodyParser.json({ limit: "1gb" }));
-app.use(bodyParser.urlencoded({ limit: "1gb", extended: true }));
-app.use(bodyParser.raw({ limit: "5gb", type: "application/octet-stream" }));
+// Keep body parsers bounded so a request that reaches them cannot pin memory
+// on its own. Anything larger than these limits (host-list imports, database
+// restores) reaches the server through the multer upload path, which streams
+// to disk with its own per-file size cap.
+app.use(bodyParser.json({ limit: "5mb" }));
+app.use(bodyParser.urlencoded({ limit: "5mb", extended: true }));
 app.use(cookieParser());
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
@@ -597,8 +603,15 @@ app.post("/encryption/initialize", requireAdmin, async (req, res) => {
  */
 app.post("/encryption/regenerate", requireAdmin, async (req, res) => {
   try {
+    // Both the rotation and the session sweep run under one try/catch: the
+    // guarantee the response promises ("all tokens invalid") only holds if
+    // both steps succeed. A partial rotation would sign new JWTs against a
+    // new secret while old sessions still verified against the old one.
+    await SystemCrypto.getInstance().regenerateJWTSecret();
+    const revoked = await createCurrentSessionRepository().deleteAll();
     apiLogger.warn("System JWT secret regenerated via API", {
       operation: "jwt_regenerate_api",
+      revokedSessions: revoked,
     });
 
     res.json({
@@ -607,6 +620,7 @@ app.post("/encryption/regenerate", requireAdmin, async (req, res) => {
       warning:
         "All existing JWT tokens are now invalid - users must re-authenticate",
       note: "User data encryption keys are protected by passwords and cannot be regenerated",
+      revokedSessions: revoked,
     });
   } catch (error) {
     apiLogger.error("Failed to regenerate JWT secret", error, {
@@ -632,8 +646,11 @@ app.post("/encryption/regenerate", requireAdmin, async (req, res) => {
  */
 app.post("/encryption/regenerate-jwt", requireAdmin, async (req, res) => {
   try {
+    await SystemCrypto.getInstance().regenerateJWTSecret();
+    const revoked = await createCurrentSessionRepository().deleteAll();
     apiLogger.warn("JWT secret regenerated via API", {
       operation: "jwt_secret_regenerate_api",
+      revokedSessions: revoked,
     });
 
     res.json({
@@ -641,6 +658,7 @@ app.post("/encryption/regenerate-jwt", requireAdmin, async (req, res) => {
       message: "New JWT secret generated",
       warning:
         "All existing JWT tokens are now invalid - users must re-authenticate",
+      revokedSessions: revoked,
     });
   } catch (error) {
     apiLogger.error("Failed to regenerate JWT secret", error, {
@@ -2063,6 +2081,7 @@ app.get(
 );
 
 const httpServer = http.createServer(app);
+applyServerTimeouts(httpServer);
 
 httpServer.on("error", (err: NodeJS.ErrnoException) => {
   if (err.code === "EADDRINUSE") {
@@ -2111,6 +2130,7 @@ if (
       },
       app,
     );
+    applyServerTimeouts(httpsServer);
 
     httpsServer.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
