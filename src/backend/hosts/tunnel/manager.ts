@@ -628,6 +628,14 @@ export async function connectEndpointThroughSource(
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
     algorithms: getManagedTunnelAlgorithms(),
+    hostVerifier: await SSHHostKeyVerifier.createHostVerifier(
+      tunnelConfig.endpointHostId ?? null,
+      tunnelConfig.endpointIP,
+      tunnelConfig.endpointSSHPort,
+      null,
+      tunnelConfig.endpointUserId || tunnelConfig.sourceUserId || "",
+      false,
+    ),
   };
 
   applyAuthOptions(endpointOptions, endpointCredentials);
@@ -1474,6 +1482,15 @@ export async function connectSSHTunnel(
   } else {
     connOptions.password = resolvedSourceCredentials.password;
   }
+
+  connOptions.hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+    tunnelConfig.sourceHostId ?? null,
+    tunnelConfig.sourceIP,
+    tunnelConfig.sourceSSHPort,
+    null,
+    tunnelConfig.sourceUserId || "",
+    false,
+  );
 
   const finalStatus = connectionStatus.get(tunnelName);
   if (!finalStatus || finalStatus.status !== CONNECTION_STATES.WAITING) {

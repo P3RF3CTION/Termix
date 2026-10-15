@@ -16,12 +16,22 @@ const proxied = {
 };
 
 describe("isAllowedWebSocketOrigin", () => {
-  it("accepts a handshake from the app's own origin", () => {
-    expect(
-      isAllowedWebSocketOrigin(
-        handshake({ ...proxied, origin: "https://termix.example.com" }),
-      ),
-    ).toBe(true);
+  it("accepts a handshake from the app's own origin when it is on the configured allowlist", () => {
+    const originalAllowed = process.env.CORS_ALLOWED_ORIGINS;
+    process.env.CORS_ALLOWED_ORIGINS = "https://termix.example.com";
+    try {
+      expect(
+        isAllowedWebSocketOrigin(
+          handshake({ ...proxied, origin: "https://termix.example.com" }),
+        ),
+      ).toBe(true);
+    } finally {
+      if (originalAllowed === undefined) {
+        delete process.env.CORS_ALLOWED_ORIGINS;
+      } else {
+        process.env.CORS_ALLOWED_ORIGINS = originalAllowed;
+      }
+    }
   });
 
   it("rejects a handshake a foreign page started", () => {

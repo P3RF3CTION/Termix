@@ -495,8 +495,10 @@ function createApiInstance(
       }
       if (config.headers.set) {
         config.headers.set("User-Agent", `Termix-Mobile/${platform}`);
+        config.headers.set("X-Termix-Native", "true");
       } else {
         config.headers["User-Agent"] = `Termix-Mobile/${platform}`;
+        config.headers["X-Termix-Native"] = "true";
       }
     }
 

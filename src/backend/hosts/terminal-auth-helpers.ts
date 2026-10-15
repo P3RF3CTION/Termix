@@ -79,6 +79,64 @@ export class MemoryAgent extends BaseAgent {
   }
 }
 
+/**
+ * Decide whether a user-supplied agentSocketPath is safe to open as an SSH
+ * agent.
+ *
+ * ssh2 speaks the SSH-agent wire protocol over any UNIX socket we hand it,
+ * so letting an authenticated Termix user name `/var/run/docker.sock`,
+ * `/run/user/0/bus`, or any other unix socket on the backend host would let
+ * them probe and send request bytes to those sockets as whichever user
+ * Termix runs as. On Windows the equivalent concern is arbitrary named
+ * pipes.
+ *
+ * The allowlist mirrors what a user can legitimately point to: a socket in
+ * their home SSH directory, the standard per-user runtime socket, a
+ * Windows SSH-agent named pipe, or an environment-provided path. Anything
+ * else is refused regardless of whether it looks like a valid file.
+ */
+function isAllowedAgentSocket(resolved: string): boolean {
+  if (process.platform === "win32") {
+    // Only the standard Windows OpenSSH agent pipe or an operator-provided one.
+    const envPipe = process.env.SSH_AUTH_SOCK;
+    const normalized = resolved.replace(/\//g, "\\");
+    if (envPipe && normalized === envPipe) return true;
+    return (
+      /^\\\\\.\\pipe\\openssh-ssh-agent$/i.test(normalized) ||
+      /^\\\\\.\\pipe\\ssh-agent(?:-\d+)?$/i.test(normalized)
+    );
+  }
+
+  const envSock = process.env.SSH_AUTH_SOCK;
+  if (envSock && resolved === envSock) return true;
+
+  // Must be an absolute path with no traversal.
+  if (!resolved.startsWith("/")) return false;
+  if (resolved.includes("\0")) return false;
+  if (resolved.split("/").some((segment) => segment === "..")) {
+    return false;
+  }
+
+  const prefixes = [
+    "/tmp/ssh-",
+    "/private/tmp/ssh-",
+    "/run/user/",
+    "/var/run/ssh-",
+  ];
+  if (prefixes.some((p) => resolved.startsWith(p))) return true;
+
+  // Any ssh-agent socket inside a user's ~/.ssh directory. Only HOME is
+  // trusted here; letting the caller name an arbitrary /home/<user>/.ssh
+  // path would open any other local account's agent.
+  const home = process.env.HOME;
+  if (home) {
+    const dotSsh = `${home.replace(/\/+$/, "")}/.ssh/`;
+    if (resolved.startsWith(dotSsh)) return true;
+  }
+
+  return false;
+}
+
 export async function resolveAgentSocket(
   terminalConfig: Record<string, unknown> | undefined,
 ): Promise<{ socketPath: string } | { error: string }> {
@@ -90,6 +148,13 @@ export async function resolveAgentSocket(
   if (!resolved) {
     return {
       error: "SSH_AUTH_SOCK is not set and no socket path was provided.",
+    };
+  }
+
+  if (explicit && !isAllowedAgentSocket(explicit)) {
+    return {
+      error:
+        "Agent socket path is not allowed. Use the server's SSH_AUTH_SOCK, a socket under /run/user/<uid>/, /tmp/ssh-*/, or inside the Termix user's ~/.ssh/.",
     };
   }
 

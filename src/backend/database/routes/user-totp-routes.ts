@@ -443,6 +443,17 @@ export function registerUserTotpRoutes(
         return res.status(400).json({ error: "TOTP is not enabled" });
       }
 
+      // Rate-limit per user: a stolen JWT must not be able to brute-force
+      // the 6-digit TOTP / backup code to disable 2FA. Shares the bucket
+      // with /totp/verify-login so attempts cannot be split across routes.
+      const totpLockStatus = loginRateLimiter.isTOTPLocked(userRecord.id);
+      if (totpLockStatus.locked) {
+        return res.status(429).json({
+          error: "Too many attempts. Please wait before trying again.",
+          remainingTime: totpLockStatus.remainingTime,
+        });
+      }
+
       const userDataKey = authManager.getUserDataKey(userId);
       const verified = await verifyTotpReauth(
         userRecord,
@@ -451,8 +462,10 @@ export function registerUserTotpRoutes(
       );
 
       if (!verified) {
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
         return res.status(401).json({ error: "Invalid TOTP code" });
       }
+      loginRateLimiter.resetTOTPAttempts(userRecord.id);
 
       await createCurrentUserRepository().update(userId, {
         totpEnabled: false,

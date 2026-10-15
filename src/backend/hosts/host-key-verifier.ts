@@ -123,10 +123,12 @@ export class SSHHostKeyVerifier {
               sshLogger.error(
                 "No WebSocket available for host key verification prompt - rejecting new key",
                 {
-                  operation: "host_key_no_ws",
+                  operation: "host_key_no_ws_reject",
                   hostId,
                   ip,
                   port,
+                  fingerprint,
+                  keyType,
                   userId,
                   message:
                     "First-use trust for a new host key requires an interactive session. Open the host in Terminal to pin its fingerprint before any background caller can use it.",

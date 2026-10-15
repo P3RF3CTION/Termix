@@ -366,6 +366,8 @@ class SystemCrypto {
       // failure here is not merely cosmetic -- the file may still be
       // world-readable -- so treat it as a hard error rather than swallowing
       // it, and let the caller decide whether to keep serving.
+      // Deliberately no delete-then-write: a crash between the two would lose
+      // DATABASE_KEY (and with it the encrypted database) for good.
       await fs.writeFile(envPath, envContent, { mode: 0o600 });
       try {
         await fs.chmod(envPath, 0o600);

@@ -579,6 +579,8 @@ router.post(
       }
 
       const { Client } = await import("ssh2");
+      const { SSHHostKeyVerifier } =
+        await import("../../hosts/host-key-verifier.js");
       const repository = createCurrentHostResolutionRepository();
       const host = await repository.findHostById(parseInt(hostId), userId);
 
@@ -619,6 +621,15 @@ router.post(
           name: host.name,
         },
         inputValues && typeof inputValues === "object" ? inputValues : {},
+      );
+
+      const hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+        host.id,
+        host.ip,
+        host.port,
+        null,
+        userId,
+        false,
       );
 
       const executePromise = new Promise<{
@@ -680,6 +691,7 @@ router.post(
           tcpKeepAlive: true,
           tcpKeepAliveInitialDelay: 30000,
           timeout: 30000,
+          hostVerifier,
           env: {
             TERM: "xterm-256color",
             LANG: "en_US.UTF-8",

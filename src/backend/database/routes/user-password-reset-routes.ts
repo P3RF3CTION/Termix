@@ -443,11 +443,25 @@ export function registerUserPasswordResetRoutes(
       });
     }
 
+    // Share the reset-code limiter: same identity space, same abuse concern
+    // (unauthenticated guessing against a server-side secret). The temp
+    // token is a nanoid today, but a limiter here keeps that assumption
+    // from silently becoming load-bearing and prevents DoS/timing-channel
+    // probing.
+    const codeLock = loginRateLimiter.isResetCodeLocked(username);
+    if (codeLock.locked) {
+      return res.status(429).json({
+        error: "Too many attempts. Please wait before trying again.",
+        remainingTime: codeLock.remainingTime,
+      });
+    }
+
     try {
       const tempTokenValue = await createCurrentSettingsRepository().get(
         `temp_reset_token_${username}`,
       );
       if (!tempTokenValue) {
+        loginRateLimiter.recordResetCodeAttempt(username);
         return res.status(400).json({ error: "No temporary token found" });
       }
 
@@ -463,6 +477,7 @@ export function registerUserPasswordResetRoutes(
       }
 
       if (!secretMatches(tempToken, tempTokenData.tokenHash)) {
+        loginRateLimiter.recordResetCodeAttempt(username);
         return res.status(400).json({ error: "Invalid temporary token" });
       }
 

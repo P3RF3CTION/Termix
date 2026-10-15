@@ -6,6 +6,16 @@ import {
   rewriteOPKSSHHtml,
 } from "./opkssh-html.js";
 
+function getErrorMessageLocal(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return "unknown error";
+  }
+}
+
 export function registerHostOpksshRoutes(router: Router): void {
   /**
    * @openapi
@@ -496,24 +506,46 @@ export function registerHostOpksshRoutes(router: Router): void {
           }
         });
 
-        // Set a cookie to correlate this browser with the requestId.
-        // OAuth state capture from Location headers only works for 3xx redirects;
-        // if OPKSSH redirects via JavaScript, the state is never registered.
-        // This cookie survives the OIDC round-trip and identifies the session on callback.
-        res.cookie("opkssh_request_id", requestId, {
-          path: "/host/",
-          httpOnly: true,
-          sameSite: "lax",
-          maxAge: 5 * 60 * 1000,
-        });
-
         const contentType = String(response.headers["content-type"] || "");
         if (contentType.includes("text/html")) {
-          const html = rewriteOPKSSHHtml(
-            response.data.toString("utf-8"),
-            requestId,
-            "opkssh-chooser",
-          );
+          const bodyText = response.data.toString("utf-8");
+
+          // Walk the chooser HTML/JS for OAuth-provider URLs that carry a
+          // `state=` query parameter and register each one with this
+          // requestId server-side. This replaces the previous
+          // `opkssh_request_id` cookie fallback used by /opkssh-callback,
+          // which was attacker-settable through a SameSite=lax GET on
+          // /host/opkssh-chooser/<id>: once that cookie lived in a victim's
+          // browser, a legitimate OAuth round-trip in the same browser was
+          // bound to the attacker's requestId, letting them steal the
+          // victim's SSH certificate. Capturing state from the HTML lets us
+          // bind the callback purely to OAuth state, which the IdP binds
+          // to the authenticated identity.
+          try {
+            const stateRe = /[?&#]state=([A-Za-z0-9._~\-+/=%]+)/g;
+            const seen = new Set<string>();
+            let m: RegExpExecArray | null;
+            while ((m = stateRe.exec(bodyText)) !== null) {
+              const raw = m[1];
+              if (!raw || seen.has(raw)) continue;
+              seen.add(raw);
+              let decoded = raw;
+              try {
+                decoded = decodeURIComponent(raw);
+              } catch {
+                // keep raw
+              }
+              registerOAuthState(decoded, requestId);
+            }
+          } catch (stateErr) {
+            sshLogger.warn("Failed to pre-register OAuth state from HTML", {
+              operation: "opkssh_state_prewalk_failed",
+              requestId,
+              error: getErrorMessageLocal(stateErr),
+            });
+          }
+
+          const html = rewriteOPKSSHHtml(bodyText, requestId, "opkssh-chooser");
           res.status(response.status).send(html);
         } else {
           res.status(response.status).send(response.data);
@@ -601,33 +633,25 @@ export function registerHostOpksshRoutes(router: Router): void {
           }
         }
 
-        // Fallback: use the opkssh_request_id cookie set by the chooser proxy.
-        // State capture only works for 3xx redirects; if OPKSSH redirects via
-        // JavaScript in the HTML, the state is never registered in the map.
-        if (userSessions.length === 0) {
-          const cookieRequestId = req.cookies?.opkssh_request_id;
-          if (cookieRequestId) {
-            const cookieSession = getActiveAuthSession(cookieRequestId);
-            if (cookieSession) {
-              userSessions = [cookieSession];
-              res.clearCookie("opkssh_request_id", { path: "/host/" });
-              sshLogger.info("Resolved session via opkssh_request_id cookie", {
-                operation: "opkssh_callback_cookie_lookup",
-                requestId: cookieRequestId,
-              });
-            }
-          }
-        }
+        // The cookie-based fallback that used `opkssh_request_id` was
+        // removed: that cookie was set on any GET to
+        // /host/opkssh-chooser/<id> with SameSite=lax, which let an
+        // attacker's requestId land in a victim's browser via a top-level
+        // navigation. A later legitimate OAuth round-trip in the same
+        // browser would then be bound to the attacker's requestId and the
+        // attacker would receive the victim's signed SSH certificate.
+        // Chooser-side pre-registration of every OAuth `state` value seen
+        // in the proxied HTML now covers the "state missing from the
+        // Location header" case the cookie was added for.
+
+        // Clear any lingering cookie from older sessions.
+        res.clearCookie("opkssh_request_id", { path: "/host/" });
 
         if (userSessions.length === 0) {
-          sshLogger.warn(
-            "OAuth callback with no JWT, no matching state, and no session cookie",
-            {
-              operation: "opkssh_callback_no_session_match",
-              hasState: !!oauthState,
-              hasCookie: !!req.cookies?.opkssh_request_id,
-            },
-          );
+          sshLogger.warn("OAuth callback with no JWT and no matching state", {
+            operation: "opkssh_callback_no_session_match",
+            hasState: !!oauthState,
+          });
           res
             .status(401)
             .send("Authentication callback failed: unable to identify session");

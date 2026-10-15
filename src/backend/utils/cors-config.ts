@@ -1,6 +1,5 @@
 import cors from "cors";
 import type { Request, Response, NextFunction } from "express";
-import { getRequestOrigin } from "./request-origin.js";
 import { apiLogger as logger } from "./logger.js";
 
 const DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
@@ -27,8 +26,16 @@ function getAllowedOrigins(): string[] {
  * request, including one a random website triggered in a victim's browser.
  * Deciding on the peer address therefore reflected any Origin at all with
  * `credentials: true`, which disabled the allowlist below entirely.
+ *
+ * Previously this helper fell back to `origin === getRequestOrigin(req)`,
+ * which derives from the Host/X-Forwarded-Host header. That header is
+ * attacker-controlled through a non-strict reverse proxy, so the fallback
+ * silently reflected any cross-origin page whose JS first set a matching
+ * Host — defeating CORS entirely. The explicit allowlist (env or local
+ * loopback/file) is now the sole authority.
  */
-export function isAllowedOrigin(origin: string, req: Request): boolean {
+// Unused req parameter is kept so existing callers do not break.
+export function isAllowedOrigin(origin: string, _req?: Request): boolean {
   if (DEV_ORIGINS.includes(origin)) return true;
   if (origin.startsWith(ELECTRON_FILE_ORIGIN)) return true;
   if (LOOPBACK_ORIGIN.test(origin)) return true;
@@ -48,7 +55,7 @@ export function isAllowedOrigin(origin: string, req: Request): boolean {
   }
   if (configured.includes(origin)) return true;
 
-  return origin === getRequestOrigin(req);
+  return false;
 }
 
 export function createCorsMiddleware(
