@@ -32,13 +32,11 @@ const secret = speakeasy.generateSecret({ name: "test" }).base32;
 const PASSWORD = "correct-horse";
 
 /**
- * The disable dialog has one field, labelled "Enter TOTP code or password",
- * and its caller passes that single value as `disableTOTP(input)` — which
- * lands in the `password` argument, leaving `totp_code` undefined.
- *
- * 2.5.1 changed the route to require both, so from then on the first check
- * rejected every attempt regardless of what was typed. Nobody could turn 2FA
- * off, and the client reported it as the generic "Failed to disable 2FA".
+ * The disable dialog now only accepts a TOTP code or a backup code -- the
+ * "or password" branch was pulled out because a stolen password on its own
+ * would otherwise be enough to remove the second factor 2FA is meant to
+ * defend against. The client is expected to send the value in `totp_code`;
+ * the `password` field is no longer honoured.
  */
 describe("POST /totp/disable", () => {
   let handler: (req: unknown, res: unknown) => Promise<void>;
@@ -105,13 +103,13 @@ describe("POST /totp/disable", () => {
     );
   });
 
-  it("accepts the account password on its own", async () => {
-    // The single field is labelled "TOTP code or password", and the client
-    // passes it as the password argument — this is the exact failing call.
+  it("refuses the account password on its own", async () => {
+    // The security guarantee of TOTP is that a stolen password alone can't
+    // take over the account; that includes removing the second factor.
     const res = await call({ password: PASSWORD });
 
-    expect(res.statusCode).toBe(200);
-    expect(userUpdate).toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
+    expect(userUpdate).not.toHaveBeenCalled();
   });
 
   it("accepts a backup code", async () => {
@@ -120,8 +118,8 @@ describe("POST /totp/disable", () => {
     expect(res.statusCode).toBe(200);
   });
 
-  it("still refuses a wrong value", async () => {
-    const res = await call({ password: "not-my-password" });
+  it("refuses a wrong TOTP code", async () => {
+    const res = await call({ totp_code: "000000" });
 
     expect(res.statusCode).toBe(401);
     expect(userUpdate).not.toHaveBeenCalled();
@@ -135,7 +133,8 @@ describe("POST /totp/disable", () => {
   });
 
   it("does not let an OIDC user disable it with a password", async () => {
-    // No password to compare against; only a TOTP or backup code will do.
+    // No password compare path exists any more; without a TOTP or backup
+    // code the request is rejected on shape alone.
     findById.mockResolvedValue({
       id: "user-1",
       isOidc: true,
@@ -147,7 +146,7 @@ describe("POST /totp/disable", () => {
 
     const res = await call({ password: "anything" });
 
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(400);
     expect(userUpdate).not.toHaveBeenCalled();
   });
 });

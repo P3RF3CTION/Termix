@@ -5,24 +5,21 @@ import type { Request, Response, NextFunction } from "express";
  * a meta tag, and it is the one that matters most here: a framed Termix means
  * a framed live SSH terminal.
  *
- * It is opt-in rather than on by default, because the desktop app signs in
- * against a remote server by rendering that server inside an <iframe> from a
- * file:// document (see ElectronLoginForm). A default of 'self' would refuse
- * that ancestor and break the remote login. Whether Chromium inside Electron
- * reports the ancestor as `file:` or as an opaque origin could not be
- * established here, so widening the default was not a safe answer either.
+ * The default is `'self'` because a framed live terminal is a clickjackable
+ * surface and the JWT cookie's `SameSite=Lax` still ships on same-tab frame
+ * navigations that follow a top-level click. Operators who deliberately embed
+ * Termix elsewhere (a dashboard tile, the desktop app's remote-login iframe)
+ * widen it through `FRAME_ANCESTORS` -- "'self'" for the common case, or
+ * "'self' https://dash.example.com" for an embed on that host.
  *
- * Set FRAME_ANCESTORS to turn the protection on -- "'self'" for the common
- * case, or "'self' https://dash.example.com" to embed Termix elsewhere.
- *
- * Deliberately no other CSP directive: the responses this middleware covers
- * range from JSON to the server-rendered OPKSSH pages, and a blanket
- * `default-src` would break them without buying anything the same-origin
- * policy does not already provide.
+ * `ELECTRON_EMBEDDED=true` disables the default so the desktop app can render
+ * a remote Termix inside a `file://` iframe without a rebuild.
  */
-function frameAncestors(): string | undefined {
+function frameAncestors(): string {
   const configured = process.env.FRAME_ANCESTORS?.trim();
-  return configured || undefined;
+  if (configured) return configured;
+  if (process.env.ELECTRON_EMBEDDED === "true") return "*";
+  return "'self'";
 }
 
 export function createSecurityHeadersMiddleware() {
@@ -34,8 +31,21 @@ export function createSecurityHeadersMiddleware() {
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
 
     const ancestors = frameAncestors();
-    if (ancestors) {
-      res.setHeader("Content-Security-Policy", `frame-ancestors ${ancestors}`);
+    // Kept separately from frame-ancestors: X-Frame-Options is the fallback
+    // for older UAs that don't parse CSP, and it only understands DENY /
+    // SAMEORIGIN. Skip it when the operator has explicitly widened
+    // frame-ancestors, since the two would contradict.
+    if (ancestors === "'self'") {
+      res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    }
+    if (ancestors !== "*") {
+      // `form-action` cannot be delivered via a meta tag either, and it stops
+      // a form-based XSS from POSTing credentials off-site. `base-uri 'none'`
+      // shuts down base-tag-hijacking DOM-XSS variants.
+      res.setHeader(
+        "Content-Security-Policy",
+        `frame-ancestors ${ancestors}; base-uri 'none'; form-action 'self'`,
+      );
     }
 
     next();

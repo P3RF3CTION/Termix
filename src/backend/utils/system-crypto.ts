@@ -39,7 +39,6 @@ class SystemCrypto {
           databaseLogger.success("JWT secret loaded from .env file", {
             operation: "jwt_init_from_file_success",
             secretLength: jwtMatch[1].length,
-            secretPrefix: jwtMatch[1].substring(0, 8) + "...",
           });
           return;
         } else {
@@ -211,6 +210,21 @@ class SystemCrypto {
     });
   }
 
+  /**
+   * Rotate the process-wide JWT signing secret. Callers are expected to
+   * revoke every session immediately after so no previously-issued JWT keeps
+   * verifying against a stale key -- see `/encryption/regenerate*` in
+   * database.ts, which pairs this with `sessionRepository.deleteAll`.
+   */
+  async regenerateJWTSecret(): Promise<void> {
+    const newSecret = crypto.randomBytes(32).toString("hex");
+    this.jwtSecret = newSecret;
+    await this.updateEnvFile("JWT_SECRET", newSecret);
+    databaseLogger.warn("JWT secret rotated at runtime", {
+      operation: "jwt_secret_rotated",
+    });
+  }
+
   private async generateAndGuideDatabaseKey(): Promise<void> {
     const newKey = crypto.randomBytes(32);
     const newKeyHex = newKey.toString("hex");
@@ -309,7 +323,21 @@ class SystemCrypto {
     const envPath = path.join(dataDir, ".env");
 
     try {
-      await fs.mkdir(dataDir, { recursive: true });
+      // Owner-only from the start: DATA_DIR sits under a shared host in many
+      // deployments, and the default 0755 recursive mkdir would let anyone
+      // list what's inside. `mkdir` ignores the `mode` on existing dirs, so
+      // this only bites on first boot -- follow-up chmod tightens an
+      // already-loose dir.
+      await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
+      try {
+        await fs.chmod(dataDir, 0o700);
+      } catch (chmodErr) {
+        databaseLogger.warn("Could not tighten DATA_DIR permissions to 0700", {
+          operation: "env_file_dir_chmod_failed",
+          dataDir,
+          error: (chmodErr as Error)?.message,
+        });
+      }
 
       let envContent = "";
 
@@ -331,10 +359,29 @@ class SystemCrypto {
       }
 
       // This file holds JWT_SECRET, DATABASE_KEY, ENCRYPTION_KEY and the
-      // internal auth token. Written with the default umask it lands at 0644,
-      // readable by every other account on the host.
+      // internal auth token. `fs.writeFile`'s mode option only applies when
+      // the file is being CREATED; a rewrite keeps whatever mode the file
+      // already had (0644, whatever), so an explicit chmod every time is the
+      // only way to guarantee 0600 after we've written the value. A chmod
+      // failure here is not merely cosmetic -- the file may still be
+      // world-readable -- so treat it as a hard error rather than swallowing
+      // it, and let the caller decide whether to keep serving.
+      // Deliberately no delete-then-write: a crash between the two would lose
+      // DATABASE_KEY (and with it the encrypted database) for good.
       await fs.writeFile(envPath, envContent, { mode: 0o600 });
-      await fs.chmod(envPath, 0o600).catch(() => {});
+      try {
+        await fs.chmod(envPath, 0o600);
+      } catch (chmodErr) {
+        databaseLogger.error(
+          "Failed to set .env to 0600 -- secret material may be world-readable",
+          chmodErr,
+          {
+            operation: "env_file_chmod_failed",
+            envPath,
+          },
+        );
+        throw chmodErr;
+      }
 
       process.env[key] = value;
     } catch (error) {

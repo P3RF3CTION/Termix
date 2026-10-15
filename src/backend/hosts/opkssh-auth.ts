@@ -11,6 +11,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import axios from "axios";
 import { load as loadYaml } from "js-yaml";
+import { isAllowedOrigin } from "../utils/cors-config.js";
 
 const AUTH_TIMEOUT = 60 * 1000;
 
@@ -283,6 +284,31 @@ export async function startOPKSSHAuth(
         requestId: "",
         error: redirectValidation.message,
         instructions: redirectValidation.message,
+      }),
+    );
+    return "";
+  }
+
+  // The requestOrigin derives from Host/X-Forwarded-Host, which is
+  // attacker-controlled through any non-strict reverse proxy. Confirm it
+  // against the CORS allowlist before using it as the IdP redirect_uri,
+  // or an attacker could receive OAuth codes at their own callback.
+  if (!isAllowedOrigin(requestOrigin)) {
+    sshLogger.warn(
+      "OPKSSH auth refused: derived origin is not in CORS allowlist",
+      {
+        operation: "opkssh_start_auth_origin_rejected",
+        userId,
+        hostId,
+        requestOrigin,
+      },
+    );
+    ws.send(
+      JSON.stringify({
+        type: "opkssh_error",
+        requestId: "",
+        error:
+          "Server origin is not configured. Add it to CORS_ALLOWED_ORIGINS to use OPKSSH.",
       }),
     );
     return "";

@@ -59,6 +59,49 @@ router.get("/notification-channels", async (req, res) => {
  *     tags:
  *       - Alerts
  */
+/**
+ * Per-type config validator shared by POST and PUT. Historically the PUT
+ * route had no validation at all, which let a user save a `type: "webhook"`
+ * channel with any URL and then PUT it to `type: "discord"` -- promoting an
+ * arbitrary target into the Discord code path whose failure branch used to
+ * echo the response body back into automation run logs (SSRF read primitive
+ * once the automation notify path is triggered). Enforce the same shape
+ * check whenever type or config is (re)supplied.
+ */
+function validateNotificationChannelConfig(
+  type: string,
+  config: unknown,
+): string | null {
+  if (type !== "webhook" && type !== "ntfy" && type !== "discord") {
+    return "type must be 'webhook', 'ntfy' or 'discord'";
+  }
+  if (!config || typeof config !== "object") {
+    return "config is required";
+  }
+  const c = config as Record<string, unknown>;
+  if (type === "ntfy") {
+    if (!c.url || typeof c.url !== "string") return "ntfy config requires url";
+    if (!c.topic || typeof c.topic !== "string")
+      return "ntfy config requires topic";
+  }
+  if (type === "webhook") {
+    if (!c.url || typeof c.url !== "string")
+      return "webhook config requires url";
+  }
+  if (type === "discord") {
+    if (!c.url || typeof c.url !== "string")
+      return "discord config requires url";
+    if (
+      !/^https:\/\/(?:canary\.|ptb\.)?(?:discord\.com|discordapp\.com)\/api\/webhooks\/.+/i.test(
+        c.url,
+      )
+    ) {
+      return "discord config requires a valid Discord webhook URL (https://discord.com/api/webhooks/...)";
+    }
+  }
+  return null;
+}
+
 router.post("/notification-channels", async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
   const { name, type, config, enabled } = req.body as {
@@ -71,40 +114,9 @@ router.post("/notification-channels", async (req, res) => {
   if (!name || typeof name !== "string" || !name.trim()) {
     return res.status(400).json({ error: "name is required" });
   }
-  if (type !== "webhook" && type !== "ntfy" && type !== "discord") {
-    return res
-      .status(400)
-      .json({ error: "type must be 'webhook', 'ntfy' or 'discord'" });
-  }
-  if (!config || typeof config !== "object") {
-    return res.status(400).json({ error: "config is required" });
-  }
-  if (type === "ntfy") {
-    const c = config as Record<string, unknown>;
-    if (!c.url || typeof c.url !== "string")
-      return res.status(400).json({ error: "ntfy config requires url" });
-    if (!c.topic || typeof c.topic !== "string")
-      return res.status(400).json({ error: "ntfy config requires topic" });
-  }
-  if (type === "webhook") {
-    const c = config as Record<string, unknown>;
-    if (!c.url || typeof c.url !== "string")
-      return res.status(400).json({ error: "webhook config requires url" });
-  }
-  if (type === "discord") {
-    const c = config as Record<string, unknown>;
-    if (!c.url || typeof c.url !== "string")
-      return res.status(400).json({ error: "discord config requires url" });
-    if (
-      !/^https:\/\/(?:canary\.|ptb\.)?(?:discord\.com|discordapp\.com)\/api\/webhooks\/.+/i.test(
-        c.url,
-      )
-    ) {
-      return res.status(400).json({
-        error:
-          "discord config requires a valid Discord webhook URL (https://discord.com/api/webhooks/...)",
-      });
-    }
+  const configError = validateNotificationChannelConfig(type, config);
+  if (configError) {
+    return res.status(400).json({ error: configError });
   }
 
   try {
@@ -152,11 +164,6 @@ router.put(
     );
     if (!existing) return res.status(404).json({ error: "Channel not found" });
 
-    if (type && type !== "webhook" && type !== "ntfy" && type !== "discord") {
-      return res
-        .status(400)
-        .json({ error: "type must be 'webhook', 'ntfy' or 'discord'" });
-    }
     if (
       name === undefined &&
       type === undefined &&
@@ -164,6 +171,29 @@ router.put(
       enabled === undefined
     ) {
       return res.json({ success: true });
+    }
+
+    // Any change that touches the type or the config has to satisfy the
+    // per-type shape check -- otherwise a `webhook` channel could be flipped
+    // to `discord` (or vice versa) while carrying an unrelated URL, which
+    // was the audit's exact bypass path.
+    if (type !== undefined || config !== undefined) {
+      const effectiveType = type ?? existing.type;
+      let effectiveConfig: unknown = config;
+      if (effectiveConfig === undefined) {
+        try {
+          effectiveConfig = JSON.parse(existing.config);
+        } catch {
+          effectiveConfig = {};
+        }
+      }
+      const configError = validateNotificationChannelConfig(
+        effectiveType,
+        effectiveConfig,
+      );
+      if (configError) {
+        return res.status(400).json({ error: configError });
+      }
     }
 
     try {

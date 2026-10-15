@@ -534,6 +534,7 @@ export interface TunnelConfig {
   endpointKeyType?: string;
   endpointCredentialId?: number;
   endpointUserId?: string;
+  endpointHostId?: number;
   sourcePort: number;
   endpointPort: number;
   maxRetries: number;

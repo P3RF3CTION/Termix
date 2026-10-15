@@ -271,27 +271,30 @@ class DatabaseFileEncryption {
       let key: Buffer;
       if (metadata.version === "v2") {
         key = await this.systemCrypto.getDatabaseKey();
-      } else if (metadata.version === "v1") {
-        databaseLogger.warn(
-          "Decrypting legacy v1 encrypted database - consider upgrading",
-          {
-            operation: "decrypt_legacy_v1",
-            path: encryptedPath,
-          },
-        );
-        if (!metadata.salt) {
-          throw new Error("v1 encrypted file missing required salt field");
-        }
-        const salt = Buffer.from(metadata.salt, "hex");
-        const fixedSeed =
-          process.env.DB_FILE_KEY || "termix-database-file-encryption-seed-v1";
-        key = crypto.pbkdf2Sync(fixedSeed, salt, 100000, 32, "sha256");
       } else {
+        // The v1 branch derived the key with PBKDF2 over a public, baked-in
+        // seed, which turns anyone with write access to the on-disk DB file
+        // into a downgrade attacker. Production detection (isEncryptedDatabaseFile)
+        // only matches v2 anyway, so v1 blobs cannot reach this branch in a
+        // supported deployment; drop the path entirely rather than leave a
+        // tripwire for future refactors.
         throw new Error(`Unsupported encryption version: ${metadata.version}`);
       }
 
+      // Pin the cipher rather than trusting `metadata.algorithm` verbatim:
+      // the meta file lives next to the ciphertext, so an attacker with
+      // filesystem write can swap in an algorithm that skips authentication
+      // (any non-GCM stream cipher) and get tampered plaintext accepted.
+      // `setAuthTag` throws for non-GCM ciphers today, but algorithm-confusion
+      // classes usually become exploitable when the surrounding code changes
+      // -- close it with an explicit allowlist.
+      if (metadata.algorithm !== this.ALGORITHM) {
+        throw new Error(
+          `Unsupported encryption algorithm in metadata: ${metadata.algorithm}`,
+        );
+      }
       const decipher = crypto.createDecipheriv(
-        metadata.algorithm,
+        this.ALGORITHM,
         key,
         Buffer.from(metadata.iv, "hex"),
       ) as crypto.DecipherGCM;

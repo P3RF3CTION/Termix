@@ -12,6 +12,10 @@ const faviconCache = new Map<
 >();
 const CACHE_SIZE = 100;
 const CACHE_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
+// A favicon is a few KB; any serious response is a sign that something is
+// wrong (compromised upstream, DNS redirect to a different host). 256 KiB is
+// still more than 1000x a normal icon.
+const MAX_FAVICON_BYTES = 256 * 1024;
 
 function evictIfNeeded() {
   if (faviconCache.size >= CACHE_SIZE) {
@@ -25,8 +29,21 @@ function fetchUrl(url: string): Promise<{ data: Buffer; contentType: string }> {
     const mod = url.startsWith("https") ? https : http;
     const req = mod.get(url, { timeout: 5000 }, (res) => {
       const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      let received = 0;
+      let aborted = false;
+      res.on("data", (chunk: Buffer) => {
+        if (aborted) return;
+        received += chunk.length;
+        if (received > MAX_FAVICON_BYTES) {
+          aborted = true;
+          req.destroy();
+          reject(new Error("Favicon too large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on("end", () => {
+        if (aborted) return;
         resolve({
           data: Buffer.concat(chunks),
           contentType: res.headers["content-type"] || "image/x-icon",

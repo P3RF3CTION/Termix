@@ -1,5 +1,6 @@
 import { getErrorMessage } from "../../utils/error-message.js";
 import type { Express } from "express";
+import { randomUUID } from "node:crypto";
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import { statsLogger } from "../../utils/logger.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
@@ -188,7 +189,7 @@ export function registerHostMetricsViewerRoutes<
         });
       }
 
-      const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const viewerSessionId = `viewer-${Date.now()}-${randomUUID()}`;
       try {
         registerViewer(hostId, viewerSessionId, userId);
       } catch (regErr) {

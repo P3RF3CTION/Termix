@@ -324,6 +324,7 @@ export function registerTunnelRoutes(app: express.Express): void {
                     ? endpointHost.credentialId
                     : undefined;
                 tunnelConfig.endpointUserId = userId;
+                tunnelConfig.endpointHostId = endpointHost.id;
 
                 // Resolve credentials server-side instead of from HTTP response
                 if (endpointHost.id) {

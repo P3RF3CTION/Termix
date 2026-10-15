@@ -3,6 +3,7 @@ import { getTrustProxySetting } from "../utils/trusted-proxies.js";
 import cookieParser from "cookie-parser";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import { createCompressionMiddleware } from "../utils/compression-config.js";
+import { createSecurityHeadersMiddleware } from "../utils/security-headers.js";
 import { dashboardLogger } from "../utils/logger.js";
 import { AuthManager } from "../utils/auth-manager.js";
 import type { AuthenticatedRequest } from "../../types/index.js";
@@ -14,6 +15,7 @@ import {
   createCurrentRoleRepository,
 } from "../database/repositories/factory.js";
 import { DataCrypto } from "../utils/data-crypto.js";
+import { applyServerTimeouts } from "../utils/http-server-timeouts.js";
 
 const app = express();
 // Same trust boundary as the main app: these services sit behind the same
@@ -33,6 +35,7 @@ function isUserDataUnlocked(userId: string): boolean {
 
 app.use(createCompressionMiddleware());
 app.use(createCorsMiddleware());
+app.use(createSecurityHeadersMiddleware());
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
 app.use((_req, res, next) => {
@@ -322,7 +325,7 @@ app.delete("/activity/reset", async (req, res) => {
 app.use("/service-links", dashboardServiceLinksRouter);
 
 const PORT = 30006;
-app.listen(PORT, async () => {
+const dashboardServer = app.listen(PORT, async () => {
   try {
     await authManager.initialize();
   } catch (err) {
@@ -331,3 +334,4 @@ app.listen(PORT, async () => {
     });
   }
 });
+applyServerTimeouts(dashboardServer);

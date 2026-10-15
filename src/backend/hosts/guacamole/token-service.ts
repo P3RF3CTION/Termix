@@ -72,6 +72,23 @@ export class GuacamoleTokenService {
     return GuacamoleTokenService.instance;
   }
 
+  /**
+   * Guacamole tokens carry plaintext RDP/VNC/Telnet passwords, so they need
+   * a persistent key of their own. The pre-hardening default was
+   * `sha256(JWT_SECRET + "_guacamole")`, which coupled two independent
+   * secrets (leaking either one broke both), and the fallback was a
+   * per-process `randomBytes` that invalidated every token on every restart.
+   *
+   * Now: honour `GUACAMOLE_ENCRYPTION_KEY` when set, otherwise HKDF-derive a
+   * key from the persistent system `ENCRYPTION_KEY` with an explicit
+   * "guacamole" context. That key survives restarts, lives in the same
+   * `.env` under 0600, and is unrelated to JWT_SECRET, so rotating JWT
+   * no longer voids in-flight Guacamole sessions.
+   *
+   * `ENCRYPTION_KEY` is populated during SystemCrypto's boot phase in
+   * `starter.ts`, which runs before Guacamole is loaded, so reading it here
+   * is safe.
+   */
   private initializeKey(): Buffer {
     const existingKey = process.env.GUACAMOLE_ENCRYPTION_KEY;
     if (existingKey) {
@@ -81,21 +98,35 @@ export class GuacamoleTokenService {
       if (existingKey.length === KEY_LENGTH) {
         return Buffer.from(existingKey, "utf8");
       }
+      guacLogger.warn(
+        "GUACAMOLE_ENCRYPTION_KEY has an unexpected length; deriving from ENCRYPTION_KEY instead",
+        { operation: "guac_key_env_invalid" },
+      );
     }
 
-    const jwtSecret = process.env.JWT_SECRET;
-    if (jwtSecret) {
-      return crypto
-        .createHash("sha256")
-        .update(jwtSecret + "_guacamole")
-        .digest();
+    const systemKey = process.env.ENCRYPTION_KEY;
+    if (systemKey && systemKey.length >= 64) {
+      return Buffer.from(
+        crypto.hkdfSync(
+          "sha256",
+          Buffer.from(systemKey, "hex"),
+          Buffer.alloc(0),
+          "termix:guacamole-token-key:v1",
+          KEY_LENGTH,
+        ),
+      );
     }
 
-    guacLogger.warn(
-      "No persistent encryption key found, generating random key",
-      {
-        operation: "guac_key_generation",
-      },
+    // If we reach this branch the system key isn't ready yet -- that is a
+    // startup-order bug, not a runtime input error, since starter.ts calls
+    // SystemCrypto.initializeEncryptionKey() before importing this module.
+    // Emit a loud warning and fall back to a per-process random key so we
+    // can at least start; do NOT fall back to JWT_SECRET, which was the
+    // whole class of coupling we're trying to remove.
+    guacLogger.error(
+      "ENCRYPTION_KEY not available while initialising Guacamole key -- Guacamole tokens will not survive restart",
+      undefined,
+      { operation: "guac_key_no_system_key" },
     );
     return crypto.randomBytes(KEY_LENGTH);
   }

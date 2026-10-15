@@ -4,6 +4,7 @@ import express, { type Request, type Response } from "express";
 import { authLogger, databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { buildSSHAlgorithms } from "../../utils/ssh-algorithms.js";
+import { SSHHostKeyVerifier } from "../../hosts/host-key-verifier.js";
 import { extractSnippetReorderUpdates } from "./snippets-reorder.js";
 import {
   createSnippetExecutionResult,
@@ -621,6 +622,15 @@ router.post(
         inputValues && typeof inputValues === "object" ? inputValues : {},
       );
 
+      const hostVerifier = await SSHHostKeyVerifier.createHostVerifier(
+        host.id,
+        host.ip,
+        host.port,
+        null,
+        userId,
+        false,
+      );
+
       const executePromise = new Promise<{
         success: boolean;
         output: string;
@@ -680,6 +690,7 @@ router.post(
           tcpKeepAlive: true,
           tcpKeepAliveInitialDelay: 30000,
           timeout: 30000,
+          hostVerifier,
           env: {
             TERM: "xterm-256color",
             LANG: "en_US.UTF-8",

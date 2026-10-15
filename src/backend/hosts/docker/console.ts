@@ -9,6 +9,7 @@ import { createCurrentHostResolutionRepository } from "../../database/repositori
 import { systemLogger } from "../../utils/logger.js";
 import type { SSHHost } from "../../../types/index.js";
 import { applyAgentAuth } from "../terminal-auth-helpers.js";
+import { SSHHostKeyVerifier } from "../host-key-verifier.js";
 import {
   containerCommand,
   getContainerRuntimeConfig,
@@ -157,6 +158,10 @@ async function createJumpHostChain(
 
     const client = new SSHClient();
 
+    const preloadedJumpHost = await SSHHostKeyVerifier.preloadHostData(
+      jumpHost.id,
+    );
+
     const config: Record<string, unknown> = {
       host: jumpHost.ip?.replace(/^\[|\]$/g, "") || jumpHost.ip,
       port: jumpHost.port || 22,
@@ -167,6 +172,18 @@ async function createJumpHostChain(
       keepaliveCountMax: 120,
       tcpKeepAlive: true,
       tcpKeepAliveInitialDelay: 30000,
+      hostVerifier: await SSHHostKeyVerifier.createHostVerifier(
+        jumpHost.id,
+        jumpHost.ip,
+        jumpHost.port || 22,
+        // Docker console background flow has no interactive WS to prompt on,
+        // so trust-on-first-use plus reject-on-change are the only accepted
+        // outcomes here.
+        null,
+        userId,
+        true,
+        preloadedJumpHost,
+      ),
       algorithms: {
         kex: [
           "curve25519-sha256",
@@ -180,9 +197,6 @@ async function createJumpHostChain(
           "diffie-hellman-group16-sha512",
           "diffie-hellman-group15-sha512",
           "diffie-hellman-group14-sha256",
-          "diffie-hellman-group14-sha1",
-          "diffie-hellman-group-exchange-sha1",
-          "diffie-hellman-group1-sha1",
         ],
         serverHostKey: [
           "ssh-ed25519",
@@ -191,8 +205,6 @@ async function createJumpHostChain(
           "ecdsa-sha2-nistp256",
           "rsa-sha2-512",
           "rsa-sha2-256",
-          "ssh-rsa",
-          "ssh-dss",
         ],
         cipher: SSH_ALGORITHMS.cipher,
         hmac: [
@@ -200,8 +212,6 @@ async function createJumpHostChain(
           "hmac-sha2-256-etm@openssh.com",
           "hmac-sha2-512",
           "hmac-sha2-256",
-          "hmac-sha1",
-          "hmac-md5",
         ],
         compress: ["none", "zlib@openssh.com", "zlib"],
       },
@@ -457,6 +467,10 @@ wss.on("connection", async (ws: WebSocket, req) => {
 
             const client = new SSHClient();
 
+            const preloadedHostKey = await SSHHostKeyVerifier.preloadHostData(
+              resolvedHost.id,
+            );
+
             const config: Record<string, unknown> = {
               host: resolvedHost.ip?.replace(/^\[|\]$/g, "") || resolvedHost.ip,
               port: resolvedHost.port || 22,
@@ -467,6 +481,15 @@ wss.on("connection", async (ws: WebSocket, req) => {
               keepaliveCountMax: 120,
               tcpKeepAlive: true,
               tcpKeepAliveInitialDelay: 30000,
+              hostVerifier: await SSHHostKeyVerifier.createHostVerifier(
+                resolvedHost.id,
+                resolvedHost.ip,
+                resolvedHost.port || 22,
+                ws,
+                userId,
+                false,
+                preloadedHostKey,
+              ),
             };
 
             if (resolvedHost.authType === "password" && resolvedHost.password) {

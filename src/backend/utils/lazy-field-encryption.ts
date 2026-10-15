@@ -118,30 +118,13 @@ export class LazyFieldEncryption {
           }
         }
 
-        const sensitiveFields = [
-          "totpSecret",
-          "totpBackupCodes",
-          "password",
-          "key",
-          "keyPassword",
-          "sudoPassword",
-          "autostartPassword",
-          "autostartKey",
-          "autostartKeyPassword",
-          "socks5Password",
-          "rdpPassword",
-          "vncPassword",
-          "telnetPassword",
-          "privateKey",
-          "publicKey",
-          "clientSecret",
-          "oidcIdentifier",
-        ];
-
-        if (sensitiveFields.includes(fieldName)) {
-          return "";
-        }
-
+        // Every branch above intentionally throws through if it can't decrypt
+        // -- returning "" for a "sensitive field" was papering over the real
+        // failure and, worse, feeding an empty string back into edit-and-save
+        // flows that treat "" as "clear this field". A single bad decrypt was
+        // enough to permanently null out an encrypted secret the next time
+        // the record was saved. Surface the error instead so callers get a
+        // 500 and the stored ciphertext is preserved.
         databaseLogger.error("Failed to decrypt field", error, {
           operation: "lazy_encryption_decrypt_failed",
           recordId,

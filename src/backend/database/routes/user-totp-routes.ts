@@ -423,47 +423,49 @@ export function registerUserTotpRoutes(
    */
   router.post("/totp/disable", authenticateJWT, async (req, res) => {
     const userId = (req as AuthenticatedRequest).userId;
-    const { password, totp_code } = req.body;
+    const { totp_code } = req.body;
     try {
       const userRecord = await createCurrentUserRepository().findById(userId);
       if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
 
-      // One re-authentication value, whichever kind it is. The dialog offers a
-      // single field -- "Enter TOTP code or password" -- so it arrives in
-      // whichever of the two body fields the caller happened to use.
-      const credential = totp_code || password;
-      if (!credential) {
-        return res.status(400).json({
-          error: userRecord.isOidc
-            ? "A TOTP code is required"
-            : "A TOTP code or password is required",
-        });
+      // The second factor is the only credential that can turn TOTP off:
+      // otherwise a stolen password (which is what 2FA exists to defend
+      // against) would be enough to remove 2FA in a single request.
+      if (typeof totp_code !== "string" || !totp_code.trim()) {
+        return res
+          .status(400)
+          .json({ error: "A TOTP code or backup code is required" });
       }
 
       if (!userRecord.totpEnabled) {
         return res.status(400).json({ error: "TOTP is not enabled" });
       }
 
+      // Rate-limit per user: a stolen JWT must not be able to brute-force
+      // the 6-digit TOTP / backup code to disable 2FA. Shares the bucket
+      // with /totp/verify-login so attempts cannot be split across routes.
+      const totpLockStatus = loginRateLimiter.isTOTPLocked(userRecord.id);
+      if (totpLockStatus.locked) {
+        return res.status(429).json({
+          error: "Too many attempts. Please wait before trying again.",
+          remainingTime: totpLockStatus.remainingTime,
+        });
+      }
+
       const userDataKey = authManager.getUserDataKey(userId);
-      // TOTP code or backup code first; verifyTotpReauth deliberately refuses
-      // the account password, so that stays a separate comparison here.
-      let verified = await verifyTotpReauth(
+      const verified = await verifyTotpReauth(
         userRecord,
-        credential,
+        totp_code.trim(),
         userDataKey,
       );
 
-      if (!verified && !userRecord.isOidc && userRecord.passwordHash) {
-        verified = await bcrypt.compare(credential, userRecord.passwordHash);
-      }
-
       if (!verified) {
-        return res
-          .status(401)
-          .json({ error: "Incorrect password or invalid TOTP code" });
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
+        return res.status(401).json({ error: "Invalid TOTP code" });
       }
+      loginRateLimiter.resetTOTPAttempts(userRecord.id);
 
       await createCurrentUserRepository().update(userId, {
         totpEnabled: false,
@@ -522,6 +524,26 @@ export function registerUserTotpRoutes(
         return res.status(404).json({ error: "User not found" });
       }
 
+      // Regenerating backup codes re-verifies password and TOTP. Without the
+      // shared TOTP limiter this endpoint was an unthrottled oracle for both
+      // secrets to anyone holding a session.
+      const lockStatus = loginRateLimiter.isTOTPLocked(userRecord.id);
+      if (lockStatus.locked) {
+        authLogger.warn(
+          "Backup code regeneration blocked due to rate limiting",
+          {
+            operation: "totp_backup_codes_blocked",
+            userId: userRecord.id,
+            remainingTime: lockStatus.remainingTime,
+          },
+        );
+        return res.status(429).json({
+          error: `Rate limited: Too many TOTP verification attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
+          remainingTime: lockStatus.remainingTime,
+          code: "TOTP_RATE_LIMITED",
+        });
+      }
+
       if (!totp_code || (!userRecord.isOidc && !password)) {
         return res.status(400).json({
           error: userRecord.isOidc
@@ -535,6 +557,7 @@ export function registerUserTotpRoutes(
         (!userRecord.passwordHash ||
           !(await bcrypt.compare(password, userRecord.passwordHash)))
       ) {
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
         return res.status(401).json({ error: "Incorrect password" });
       }
 
@@ -549,10 +572,13 @@ export function registerUserTotpRoutes(
         userDataKey,
       );
       if (!verified) {
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
         return res
           .status(401)
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
+
+      loginRateLimiter.resetTOTPAttempts(userRecord.id);
 
       const backupCodes = generateBackupCodes();
       const storedHashedCodes = hashBackupCodes(backupCodes);
@@ -676,7 +702,11 @@ export function registerUserTotpRoutes(
         userRecord.totpSecret,
         userDataKey,
         userRecord.id,
-        "totp_secret",
+        // The rest of this file uses "totpSecret" (camelCase) as the HKDF
+        // context; keep the two in sync so we're not silently relying on the
+        // legacy field-name fallback map to bridge a snake/camel mismatch on
+        // a hot path like TOTP login.
+        "totpSecret",
       );
 
       if (!totpSecret) {

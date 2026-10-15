@@ -46,7 +46,10 @@ import { registerUserImageStorageRoutes } from "./user-image-storage-routes.js";
 import { registerUserSettingsRoutes } from "./user-settings-routes.js";
 import { registerTouchInputSettingsRoutes } from "./touch-input-settings-routes.js";
 import { registerAcmeSSLRoutes } from "./acme-ssl-routes.js";
-import { registerUserTotpRoutes } from "./user-totp-routes.js";
+import {
+  registerUserTotpRoutes,
+  verifyTotpReauth,
+} from "./user-totp-routes.js";
 import { registerUserWebAuthnRoutes } from "./user-webauthn-routes.js";
 import { registerUserSessionRoutes } from "./user-session-routes.js";
 import { registerUserOidcAccountRoutes } from "./user-oidc-account-routes.js";
@@ -74,6 +77,15 @@ import {
 } from "../../utils/trusted-proxy-auth.js";
 
 const authManager = AuthManager.getInstance();
+
+// Precomputed once so /login can spend the same ~100ms on a missing user as
+// on a real one, without leaking which usernames exist through response time.
+// The plaintext is random per boot and never used; the hash is only compared
+// against in the failure branch.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
+  crypto.randomBytes(32).toString("hex"),
+  10,
+);
 
 const router = express.Router();
 
@@ -179,6 +191,21 @@ async function deleteOIDCStateSettings(state: string): Promise<void> {
   await settingsRepository.delete(`oidc_remember_me_${state}`);
   await settingsRepository.delete(`oidc_provider_${state}`);
   await settingsRepository.delete(`oidc_pkce_verifier_${state}`);
+  await settingsRepository.delete(`oidc_state_binding_${state}`);
+}
+
+/**
+ * OIDC `state` alone is not per-browser: an attacker can start their own auth
+ * flow, then feed the callback URL (with THEIR state + code) to a victim. To
+ * bind the flow to the browser that requested it, we drop an HttpOnly cookie
+ * at /oidc/authorize and store its hash next to the state; /oidc/callback
+ * refuses the code unless the cookie the browser sends back hashes to the
+ * same value. This is the OWASP-recommended "double submit / per-flow cookie"
+ * defense against OAuth state-fixation.
+ */
+const OIDC_STATE_COOKIE_PREFIX = "termix_oidc_flow_";
+function hashOidcBinding(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -679,6 +706,25 @@ router.get("/oidc/authorize", async (req, res) => {
       providerId: providerIdStr,
     } = req.query;
     const origin = getRequestOriginWithForceHTTPS(req);
+    // The Host/X-Forwarded-Host header is attacker-controlled through any
+    // reverse proxy that does not strictly pin the host. Confirm the derived
+    // origin is in our CORS allowlist (or a legitimate loopback/file: origin
+    // used by the desktop app) before shipping it as the IdP redirect_uri.
+    // Without this, an attacker with a crafted Host header could receive the
+    // IdP auth code at their own callback URL.
+    if (!isAllowedOrigin(origin, req)) {
+      authLogger.warn(
+        "OIDC authorize refused: derived origin is not in CORS allowlist",
+        {
+          operation: "oidc_authorize_origin_rejected",
+          origin,
+        },
+      );
+      return res.status(400).json({
+        error:
+          "Server origin is not configured. Add it to CORS_ALLOWED_ORIGINS to use OIDC.",
+      });
+    }
     const basePath = (process.env.BASE_PATH || "").replace(/\/+$/, "");
     const backendCallbackUri = `${origin}${basePath}/users/oidc/callback`;
 
@@ -758,6 +804,30 @@ router.get("/oidc/authorize", async (req, res) => {
       );
     }
 
+    // Bind this flow to the browser that started it. Skipped for the desktop
+    // and mobile deep-link paths, which finish outside a browser context.
+    const isDesktopOrMobileFlow =
+      Boolean(desktopCallbackPort) ||
+      (typeof appCallbackUrl === "string" && appCallbackUrl.length > 0);
+    if (!isDesktopOrMobileFlow) {
+      const bindingSecret = crypto.randomBytes(32).toString("base64url");
+      await settingsRepository.set(
+        `oidc_state_binding_${state}`,
+        hashOidcBinding(bindingSecret),
+      );
+      const cookieName = `${OIDC_STATE_COOKIE_PREFIX}${state}`;
+      const isSecure =
+        origin.startsWith("https://") ||
+        process.env.OIDC_FORCE_HTTPS === "true";
+      res.cookie(cookieName, bindingSecret, {
+        httpOnly: true,
+        secure: isSecure,
+        sameSite: "lax",
+        path: "/",
+        maxAge: 15 * 60 * 1000,
+      });
+    }
+
     const authUrl = new URL(config.authorization_url);
     authUrl.searchParams.set("client_id", config.client_id);
     authUrl.searchParams.set("redirect_uri", backendCallbackUri);
@@ -819,6 +889,41 @@ router.get("/oidc/callback", async (req, res) => {
   const backendCallbackUri = storedBackendCallback;
   const frontendOrigin = storedFrontendOrigin;
   const storedRememberMe = storedRememberMeValue === "true";
+
+  // Reject callbacks that don't come from the browser that started the flow.
+  // The desktop / mobile deep-link paths never set this binding (they finish
+  // outside a browser session), so their absence there is expected.
+  const storedBinding = await settingsRepository.get(
+    `oidc_state_binding_${state}`,
+  );
+  if (storedBinding) {
+    const cookieName = `${OIDC_STATE_COOKIE_PREFIX}${state}`;
+    const cookieValue = (req as unknown as { cookies?: Record<string, string> })
+      .cookies?.[cookieName];
+    let bindingOk = false;
+    if (typeof cookieValue === "string" && cookieValue.length > 0) {
+      try {
+        const expected = Buffer.from(storedBinding, "utf8");
+        const actual = Buffer.from(hashOidcBinding(cookieValue), "utf8");
+        bindingOk =
+          expected.length === actual.length &&
+          crypto.timingSafeEqual(expected, actual);
+      } catch {
+        bindingOk = false;
+      }
+    }
+    if (!bindingOk) {
+      authLogger.warn("OIDC callback rejected - state not bound to browser", {
+        operation: "oidc_state_binding_mismatch",
+      });
+      await deleteOIDCStateSettings(state);
+      res.clearCookie(cookieName, { path: "/" });
+      return res
+        .status(400)
+        .json({ error: "OIDC callback does not match this browser session" });
+    }
+    res.clearCookie(cookieName, { path: "/" });
+  }
 
   try {
     const storedNonce = await settingsRepository.get(`oidc_state_${state}`);
@@ -995,6 +1100,25 @@ router.get("/oidc/callback", async (req, res) => {
           return res.status(500).json({
             error: "Failed to setup user security - user creation cancelled",
           });
+        }
+      } else if (config.allowed_users) {
+        // Re-check the allowed_users gate for returning users. Without this,
+        // admin-side revocation of `allowed_users` has no effect on anyone who
+        // already linked a GitHub account, mirroring the generic-OIDC branch
+        // below (operation=oidc_user_not_allowed_existing).
+        const email = ghUserInfo.email as string | undefined;
+        if (!isOIDCUserAllowed(config.allowed_users, ghIdentifier, email)) {
+          authLogger.warn(
+            "GitHub OIDC user not in allowed list (existing user)",
+            {
+              operation: "github_oidc_user_not_allowed_existing",
+              ghIdentifier,
+              userId: ghUserRecord.id,
+            },
+          );
+          const redirectUrl = new URL(frontendOrigin);
+          redirectUrl.searchParams.set("error", "user_not_allowed");
+          return res.redirect(redirectUrl.toString());
         }
       }
 
@@ -1809,6 +1933,15 @@ router.post("/login", async (req, res) => {
     const userRecord =
       await createCurrentUserRepository().findByUsername(username);
 
+    // The failure branches below all take the same shape -- record the failed
+    // attempt, run one bcrypt.compare against a real or dummy hash so the
+    // timing is uniform, and return the same generic 401. That way a
+    // distributed attacker can't tell "unknown user" from "OIDC-only" from
+    // "wrong password" through either the response body or the wall-clock,
+    // and the rate limiter engages on every guess.
+    const hashToCompare = userRecord?.passwordHash || DUMMY_PASSWORD_HASH;
+    const passwordMatches = await bcrypt.compare(password, hashToCompare);
+
     if (!userRecord) {
       loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn(`Login failed: user not found`, {
@@ -1827,18 +1960,16 @@ router.post("/login", async (req, res) => {
       userRecord.isOidc &&
       (!userRecord.passwordHash || userRecord.passwordHash.trim() === "")
     ) {
+      loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn("OIDC-only user attempted traditional login", {
         operation: "user_login",
         username,
         userId: userRecord.id,
       });
-      return res
-        .status(403)
-        .json({ error: "This user uses external authentication" });
+      return res.status(401).json({ error: "Invalid username or password" });
     }
 
-    const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
-    if (!isMatch) {
+    if (!passwordMatches) {
       loginRateLimiter.recordFailedAttempt(clientIp, username);
       authLogger.warn(`Login failed: incorrect password`, {
         operation: "user_login",
@@ -2200,12 +2331,27 @@ router.post(
  *         description: Not authenticated.
  */
 router.get("/me/token", authenticateJWT, (req: Request, res: Response) => {
-  // authenticateJWT accepts either the jwt cookie or an Authorization:
-  // Bearer header (see auth-manager.ts's createAuthMiddleware) -- this must
-  // check both too, or a request that only carried the header (e.g. the
-  // Electron renderer's own axios interceptor, which always attaches a
-  // stored localStorage JWT as a Bearer header) would pass authentication
-  // here but still get back a null token.
+  // Only return the raw JWT to callers that already supplied it via an
+  // Authorization: Bearer header or a dedicated native-client header
+  // (Electron, mobile WebView). If the request authenticated solely via the
+  // HttpOnly `jwt` cookie, returning the token would hand any XSS payload
+  // on the Termix frontend a long-lived credential - defeating the entire
+  // reason the cookie is HttpOnly in the first place.
+  const authHeader = req.headers.authorization;
+  const hasBearer =
+    typeof authHeader === "string" &&
+    authHeader.toLowerCase().startsWith("bearer ");
+  const isNativeClient =
+    req.headers["x-electron-app"] === "true" ||
+    req.headers["x-termix-native"] === "true";
+
+  if (!hasBearer && !isNativeClient) {
+    return res.status(403).json({
+      error:
+        "This endpoint is only available to native clients. Browser sessions use the HttpOnly jwt cookie.",
+    });
+  }
+
   res.json({ token: extractBearerOrCookieToken(req) ?? null });
 });
 
@@ -2764,12 +2910,24 @@ router.patch("/password-reset-allowed", authenticateJWT, async (req, res) => {
  */
 router.delete("/delete-account", authenticateJWT, async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
-  const { password } = req.body;
+  const { password, totp_code } = req.body;
 
   if (!isNonEmptyString(password)) {
     return res
       .status(400)
       .json({ error: "Password is required to delete account" });
+  }
+
+  // Same throttle as /change-password: a stolen session cookie should not be
+  // able to grind through the account password on this endpoint either.
+  const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+  const rateKey = `delacct:${userId}`;
+  const lockStatus = loginRateLimiter.isLocked(clientIp, rateKey);
+  if (lockStatus.locked) {
+    return res.status(429).json({
+      error: "Too many account deletion attempts. Try again later.",
+      remainingTime: lockStatus.remainingTime,
+    });
   }
 
   try {
@@ -2787,10 +2945,32 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
     if (!isMatch) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
       authLogger.warn(
         `Incorrect password provided for account deletion: ${userRecord.username}`,
       );
       return res.status(401).json({ error: "Incorrect password" });
+    }
+
+    // A stolen password shouldn't be enough to nuke the account when 2FA is
+    // on -- same rule as changing the password.
+    if (userRecord.totpEnabled) {
+      if (typeof totp_code !== "string" || !totp_code.trim()) {
+        return res.status(400).json({
+          error: "A TOTP code or backup code is required",
+          code: "TOTP_REQUIRED",
+        });
+      }
+      const userDataKey = authManager.getUserDataKey(userId);
+      const totpOk = await verifyTotpReauth(
+        userRecord,
+        totp_code.trim(),
+        userDataKey,
+      );
+      if (!totpOk) {
+        loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
+        return res.status(401).json({ error: "Invalid TOTP code" });
+      }
     }
 
     if (userRecord.isAdmin) {
@@ -2803,6 +2983,7 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
     }
 
     await createCurrentUserRepository().delete(userId);
+    loginRateLimiter.resetAttempts(clientIp, rateKey);
 
     authLogger.success(`User account deleted: ${userRecord.username}`);
     res.json({ message: "Account deleted successfully" });
@@ -2845,7 +3026,7 @@ registerUserPasswordResetRoutes(router, { authManager });
  */
 router.post("/change-password", authenticateJWT, async (req, res) => {
   const userId = (req as AuthenticatedRequest).userId;
-  const { oldPassword, newPassword } = req.body;
+  const { oldPassword, newPassword, totp_code } = req.body;
   authLogger.info("Password change request", {
     operation: "password_change_request",
     userId,
@@ -2861,6 +3042,18 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Old and new passwords are required." });
   }
 
+  // Reuse the login rate limiter so a stolen session cookie cannot brute-force
+  // the current password through this endpoint (only /login was throttled).
+  const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+  const rateKey = `pwchange:${userId}`;
+  const lockStatus = loginRateLimiter.isLocked(clientIp, rateKey);
+  if (lockStatus.locked) {
+    return res.status(429).json({
+      error: "Too many password change attempts. Try again later.",
+      remainingTime: lockStatus.remainingTime,
+    });
+  }
+
   const user = await findCurrentUser(userId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
@@ -2868,12 +3061,32 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
 
   const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
   if (!isMatch) {
+    loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
     authLogger.warn("Password change failed - old password incorrect", {
       operation: "password_change_failed",
       userId,
       reason: "old_password_wrong",
     });
     return res.status(401).json({ error: "Incorrect current password" });
+  }
+
+  // The point of 2FA is that a stolen password alone can't take over the
+  // account. Rotating the password (or deleting it below) is exactly the kind
+  // of takeover step 2FA has to gate on, so refuse the change without the
+  // second factor.
+  if (user.totpEnabled) {
+    if (typeof totp_code !== "string" || !totp_code.trim()) {
+      return res.status(400).json({
+        error: "A TOTP code or backup code is required",
+        code: "TOTP_REQUIRED",
+      });
+    }
+    const userDataKey = authManager.getUserDataKey(userId);
+    const totpOk = await verifyTotpReauth(user, totp_code.trim(), userDataKey);
+    if (!totpOk) {
+      loginRateLimiter.recordFailedAttempt(clientIp, rateKey);
+      return res.status(401).json({ error: "Invalid TOTP code" });
+    }
   }
 
   const success = await authManager.changeUserPassword(
@@ -2892,7 +3105,26 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     passwordHash: password_hash,
   });
 
-  authManager.logoutUser(userId);
+  // Revoke every session and clear the cookie in the same response so a
+  // client with a leaked cookie stops working immediately, not on the next
+  // (potentially long-off) request that happens to notice the missing
+  // session row. A DB failure in logoutUser must block the "please log in
+  // again" response rather than slip past as an un-logged background error.
+  try {
+    await authManager.logoutUser(userId);
+  } catch (err) {
+    authLogger.error("Failed to revoke sessions after password change", err, {
+      operation: "password_change_logout_failed",
+      userId,
+    });
+    return res.status(500).json({
+      error:
+        "Password updated but existing sessions could not be revoked. Please try again.",
+    });
+  }
+  loginRateLimiter.resetAttempts(clientIp, rateKey);
+  res.clearCookie("jwt", authManager.getClearCookieOptions(req));
+
   authLogger.success("Password changed successfully", {
     operation: "password_change_complete",
     userId,
