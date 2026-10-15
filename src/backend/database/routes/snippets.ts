@@ -580,8 +580,6 @@ router.post(
       }
 
       const { Client } = await import("ssh2");
-      const { SSHHostKeyVerifier } =
-        await import("../../hosts/host-key-verifier.js");
       const repository = createCurrentHostResolutionRepository();
       const host = await repository.findHostById(parseInt(hostId), userId);
 
