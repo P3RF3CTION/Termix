@@ -1810,7 +1810,14 @@ export async function dismissDonationModal(): Promise<void> {
 
 export async function getCurrentToken(): Promise<string | null> {
   try {
-    const response = await authApi.get("/users/me/token");
+    // The backend only hands out the raw JWT to native clients. Every caller
+    // of this helper runs inside a native shell (Electron login iframe or the
+    // mobile WebView), but outside the top-level Electron renderer the request
+    // interceptor does not add X-Electron-App, so the call was refused with
+    // 403 and the login flows could not read the token back from the cookie.
+    const response = await authApi.get("/users/me/token", {
+      headers: { "X-Termix-Native": "true" },
+    });
     return response.data?.token ?? null;
   } catch {
     return null;

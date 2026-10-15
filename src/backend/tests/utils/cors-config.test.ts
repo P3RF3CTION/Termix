@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Request } from "express";
-import { isAllowedOrigin } from "../../utils/cors-config.js";
+import {
+  createCorsMiddleware,
+  isAllowedOrigin,
+} from "../../utils/cors-config.js";
 
 const originalAllowed = process.env.CORS_ALLOWED_ORIGINS;
 
@@ -86,5 +89,72 @@ describe("isAllowedOrigin", () => {
     process.env.CORS_ALLOWED_ORIGINS = "*,https://dash.example.com";
     expect(isAllowedOrigin("https://dash.example.com", behindProxy)).toBe(true);
     expect(isAllowedOrigin("https://evil.example", behindProxy)).toBe(false);
+  });
+});
+
+describe("createCorsMiddleware", () => {
+  function run(origin: string | undefined, method = "GET") {
+    const headers: Record<string, string> = {};
+    if (origin) headers.origin = origin;
+    const req = {
+      headers,
+      method,
+      path: "/users/me",
+      socket: { remoteAddress: "127.0.0.1" },
+    } as unknown as Request;
+    let status: number | undefined;
+    let body: unknown;
+    const resHeaders: Record<string, string> = {};
+    const res = {
+      statusCode: 200,
+      status(code: number) {
+        status = code;
+        this.statusCode = code;
+        return this;
+      },
+      json(payload: unknown) {
+        body = payload;
+        return this;
+      },
+      setHeader(name: string, value: string) {
+        resHeaders[name.toLowerCase()] = String(value);
+      },
+      getHeader(name: string) {
+        return resHeaders[name.toLowerCase()];
+      },
+      end() {},
+    };
+    let nextCalled = false;
+    let nextError: unknown;
+    createCorsMiddleware()(req, res as never, (err?: unknown) => {
+      nextCalled = true;
+      nextError = err;
+    });
+    return { status, body, nextCalled, nextError, resHeaders };
+  }
+
+  it("answers a disallowed origin with 403 instead of an error (HTTP 500)", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://termix.example.com";
+    const r = run("https://evil.example", "POST");
+    expect(r.status).toBe(403);
+    expect(r.body).toEqual({ error: "Origin not allowed" });
+    expect(r.nextCalled).toBe(false);
+  });
+
+  it("passes an allowed origin through with CORS headers", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://termix.example.com";
+    const r = run("https://termix.example.com");
+    expect(r.status).toBeUndefined();
+    expect(r.nextCalled).toBe(true);
+    expect(r.nextError).toBeUndefined();
+    expect(r.resHeaders["access-control-allow-origin"]).toBe(
+      "https://termix.example.com",
+    );
+  });
+
+  it("passes requests without an Origin header (same-origin GET, curl, native app)", () => {
+    const r = run(undefined);
+    expect(r.status).toBeUndefined();
+    expect(r.nextCalled).toBe(true);
   });
 });

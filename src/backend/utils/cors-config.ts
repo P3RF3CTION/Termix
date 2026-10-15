@@ -70,6 +70,7 @@ export function createCorsMiddleware(
     "Authorization",
     "User-Agent",
     "X-Electron-App",
+    "X-Termix-Native",
     "X-Termix-Device-ID",
     "Cache-Control",
     "x-admin-target-user",
@@ -77,6 +78,23 @@ export function createCorsMiddleware(
   ];
 
   return (req: Request, res: Response, next: NextFunction) => {
+    // Refuse a disallowed Origin with an explicit 403 before the request
+    // reaches any route. Passing an Error to the cors() callback ended in
+    // Express's default error handler (HTTP 500), which reads like a server
+    // fault in monitoring and logs; callback(null, false) would instead let
+    // simple cross-origin requests run server-side without CORS headers.
+    const requestOrigin = req.headers.origin;
+    if (requestOrigin && !isAllowedOrigin(requestOrigin, req)) {
+      logger.warn("Request from disallowed origin refused", {
+        operation: "cors_origin_refused",
+        origin: requestOrigin,
+        method: req.method,
+        path: req.path,
+      });
+      res.status(403).json({ error: "Origin not allowed" });
+      return;
+    }
+
     const handler = cors({
       origin: (origin, callback) => {
         // No origin = same-origin or non-browser request (curl, the native

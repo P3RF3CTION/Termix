@@ -524,6 +524,26 @@ export function registerUserTotpRoutes(
         return res.status(404).json({ error: "User not found" });
       }
 
+      // Regenerating backup codes re-verifies password and TOTP. Without the
+      // shared TOTP limiter this endpoint was an unthrottled oracle for both
+      // secrets to anyone holding a session.
+      const lockStatus = loginRateLimiter.isTOTPLocked(userRecord.id);
+      if (lockStatus.locked) {
+        authLogger.warn(
+          "Backup code regeneration blocked due to rate limiting",
+          {
+            operation: "totp_backup_codes_blocked",
+            userId: userRecord.id,
+            remainingTime: lockStatus.remainingTime,
+          },
+        );
+        return res.status(429).json({
+          error: `Rate limited: Too many TOTP verification attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
+          remainingTime: lockStatus.remainingTime,
+          code: "TOTP_RATE_LIMITED",
+        });
+      }
+
       if (!totp_code || (!userRecord.isOidc && !password)) {
         return res.status(400).json({
           error: userRecord.isOidc
@@ -537,6 +557,7 @@ export function registerUserTotpRoutes(
         (!userRecord.passwordHash ||
           !(await bcrypt.compare(password, userRecord.passwordHash)))
       ) {
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
         return res.status(401).json({ error: "Incorrect password" });
       }
 
@@ -551,10 +572,13 @@ export function registerUserTotpRoutes(
         userDataKey,
       );
       if (!verified) {
+        loginRateLimiter.recordFailedTOTPAttempt(userRecord.id);
         return res
           .status(401)
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
+
+      loginRateLimiter.resetTOTPAttempts(userRecord.id);
 
       const backupCodes = generateBackupCodes();
       const storedHashedCodes = hashBackupCodes(backupCodes);
