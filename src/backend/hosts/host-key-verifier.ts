@@ -173,14 +173,24 @@ export class SSHHostKeyVerifier {
               return;
             }
 
+            // Background connections (metrics, tunnels, Docker, fleets,
+            // snippets, credential deploy) have no socket to ask on. Accepting
+            // the key without storing it meant every later background
+            // connection accepted whatever key it was shown, so a host that was
+            // never opened in a terminal was never pinned at all. Pin it on
+            // first contact (trust on first use): from then on a changed key is
+            // refused below until a user confirms it in a terminal.
             if (!ws) {
+              await this.storeHostKey(hostId, fingerprint, keyType, algorithm);
               sshLogger.warn(
-                "No WebSocket available for host key verification prompt",
+                "Host key pinned on first contact without interactive verification",
                 {
-                  operation: "host_key_no_ws",
+                  operation: "host_key_stored_first_contact",
                   hostId,
                   ip,
                   port,
+                  fingerprint,
+                  keyType,
                   userId,
                 },
               );
@@ -263,28 +273,11 @@ export class SSHHostKeyVerifier {
             changeCount: host.hostKeyChangedCount || 0,
           });
 
-          if (isJumpHost) {
-            await this.updateHostKey(
-              hostId,
-              fingerprint,
-              keyType,
-              algorithm,
-              host.hostKeyChangedCount || 0,
-            );
-            sshLogger.warn("Jump host key changed - auto-accepted", {
-              operation: "host_key_updated",
-              hostId,
-              ip,
-              port,
-              fingerprint,
-              keyType,
-              userId,
-              isJumpHost: true,
-            });
-            verify(true);
-            return;
-          }
-
+          // A changed key on a jump host is treated exactly like one on the
+          // target: the credentials for every host behind it travel through
+          // that connection, so silently accepting a new jump-host key handed
+          // them to whoever answered on the jump host's address. Below, the
+          // user confirms it when there is a socket, otherwise it is refused.
           if (!ws) {
             sshLogger.error(
               "Host key changed - please connect via Terminal to verify the new key",
