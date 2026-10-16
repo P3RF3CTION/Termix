@@ -14,6 +14,30 @@ import {
   createCurrentUserRepository,
 } from "../repositories/factory.js";
 import { pluginEvents, TOPICS } from "../../plugins/events.js";
+import { getClientIp } from "../../utils/request-origin.js";
+
+// Reset codes and temporary reset tokens are stored only as SHA-256 digests
+// and compared in constant time: a copy of the settings table must not hand
+// out live reset secrets. A random 6-digit code has ~20 bits; its protection
+// is the attempt limit on /verify-reset-code, not the digest.
+function hashResetSecret(secret: string): string {
+  return crypto.createHash("sha256").update(secret, "utf8").digest("hex");
+}
+
+function safeEqualHex(expected: unknown, actual: string): boolean {
+  if (typeof expected !== "string" || expected.length !== actual.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(
+    Buffer.from(expected, "hex"),
+    Buffer.from(actual, "hex"),
+  );
+}
+
+// Same answer whether or not the account exists (and whether it is external),
+// so the endpoint does not tell an anonymous caller which usernames exist.
+const RESET_INITIATED_MESSAGE =
+  "If the user exists, a password reset code has been generated. Check docker logs for the code.";
 
 interface UserPasswordResetRoutesDeps {
   authManager: AuthManager;
@@ -160,24 +184,35 @@ export function registerUserPasswordResetRoutes(
       return res.status(400).json({ error: "Username is required" });
     }
 
+    // Each call replaces the stored code and writes a new one to the log.
+    // Limit per client IP and per account, on their own keys so a reset
+    // never locks the normal login of the same IP or user.
+    const ipKey = `pwreset-initiate-ip:${getClientIp(req)}`;
+    const userKey = `pwreset-initiate-user:${username}`;
+    const initiateLock = loginRateLimiter.isLocked(ipKey);
+    const userInitiateLock = loginRateLimiter.isLocked(userKey);
+    if (initiateLock.locked || userInitiateLock.locked) {
+      return res.status(429).json({
+        error: "Too many password reset requests. Try again later.",
+        remainingTime:
+          initiateLock.remainingTime ?? userInitiateLock.remainingTime,
+      });
+    }
+    loginRateLimiter.recordFailedAttempt(ipKey);
+    loginRateLimiter.recordFailedAttempt(userKey);
+
     try {
       const user = await createCurrentUserRepository().findByUsername(username);
 
       if (!user) {
-        authLogger.warn(
-          `Password reset attempted for non-existent user: ${username}`,
-        );
-        return res.json({
-          message:
-            "If the user exists, a password reset code has been generated. Check docker logs for the code.",
+        authLogger.warn("Password reset attempted for non-existent user", {
+          operation: "password_reset_unknown_user",
         });
+        return res.json({ message: RESET_INITIATED_MESSAGE });
       }
 
       if (user.isExternal) {
-        return res.json({
-          message:
-            "If the user exists, a password reset code has been generated. Check docker logs for the code.",
-        });
+        return res.json({ message: RESET_INITIATED_MESSAGE });
       }
 
       const resetCode = crypto.randomInt(100000, 1000000).toString();
@@ -186,7 +221,7 @@ export function registerUserPasswordResetRoutes(
       await createCurrentSettingsRepository().set(
         `reset_code_${username}`,
         JSON.stringify({
-          code: resetCode,
+          codeHash: hashResetSecret(resetCode),
           expiresAt: expiresAt.toISOString(),
         }),
       );
@@ -195,10 +230,7 @@ export function registerUserPasswordResetRoutes(
         `Password reset code generated for user ${username}: ${resetCode} (expires at ${expiresAt.toLocaleString()})`,
       );
 
-      res.json({
-        message:
-          "Password reset code has been generated and logged. Check docker logs for the code.",
-      });
+      res.json({ message: RESET_INITIATED_MESSAGE });
     } catch (err) {
       authLogger.error("Failed to initiate password reset", err);
       res.status(500).json({ error: "Failed to initiate password reset" });
@@ -299,7 +331,7 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      if (!safeEqualHex(resetData.codeHash, hashResetSecret(resetCode))) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -318,10 +350,14 @@ export function registerUserPasswordResetRoutes(
       const tempToken = nanoid();
       const tempTokenExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
-      await createCurrentSettingsRepository().set(
+      // The code is single-use: it is exchanged for the temporary token here
+      // and must not be redeemable a second time.
+      const settingsRepository = createCurrentSettingsRepository();
+      await settingsRepository.delete(`reset_code_${username}`);
+      await settingsRepository.set(
         `temp_reset_token_${username}`,
         JSON.stringify({
-          token: tempToken,
+          tokenHash: hashResetSecret(tempToken),
           expiresAt: tempTokenExpiry.toISOString(),
         }),
       );
@@ -377,6 +413,15 @@ export function registerUserPasswordResetRoutes(
       });
     }
 
+    const completeKey = `pwreset-complete:${username}`;
+    const completeLock = loginRateLimiter.isLocked(completeKey);
+    if (completeLock.locked) {
+      return res.status(429).json({
+        error: "Too many attempts. Request a new reset code later.",
+        remainingTime: completeLock.remainingTime,
+      });
+    }
+
     try {
       const tempTokenValue = await createCurrentSettingsRepository().get(
         `temp_reset_token_${username}`,
@@ -396,9 +441,11 @@ export function registerUserPasswordResetRoutes(
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      if (!safeEqualHex(tempTokenData.tokenHash, hashResetSecret(tempToken))) {
+        loginRateLimiter.recordFailedAttempt(completeKey);
         return res.status(400).json({ error: "Invalid temporary token" });
       }
+      loginRateLimiter.resetAttempts(completeKey);
 
       const user = await createCurrentUserRepository().findByUsername(username);
       if (!user) {
