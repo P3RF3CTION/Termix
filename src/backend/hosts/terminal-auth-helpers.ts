@@ -10,6 +10,7 @@ import ssh2Pkg, {
   type SigningRequestOptions,
 } from "ssh2";
 
+import os from "node:os";
 import type { HostSshOptions } from "./ssh-options.js";
 
 type KnownPublicKey = KnownPublicKeys[number];
@@ -72,7 +73,7 @@ export function isAllowedAgentSocketPath(candidate: string): boolean {
     return true;
   }
 
-  const home = process.env.HOME;
+  const home = os.homedir();
   if (home) {
     const dotSsh = `${home.replace(/\/+$/, "")}/.ssh/`;
     if (candidate.startsWith(dotSsh)) return true;

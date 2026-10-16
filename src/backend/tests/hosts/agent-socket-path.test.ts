@@ -12,6 +12,12 @@ vi.mock("fs/promises", () => ({
   realpath: async (p: string) => fsState.links.get(p) ?? p,
 }));
 
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const homedir = () => "/home/termix";
+  return { ...actual, homedir, default: { ...actual, homedir } };
+});
+
 import {
   isAllowedAgentSocketPath,
   resolveAgentSocket,
@@ -22,7 +28,6 @@ const env = { ...process.env };
 beforeEach(() => {
   fsState.existing.clear();
   fsState.links.clear();
-  process.env.HOME = "/home/termix";
   delete process.env.SSH_AUTH_SOCK;
   delete process.env.TERMIX_AGENT_SOCKET_ALLOWLIST;
 });
