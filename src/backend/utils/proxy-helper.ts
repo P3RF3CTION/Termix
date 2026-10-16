@@ -14,8 +14,15 @@ async function validateHost(host: string): Promise<void> {
     return;
   }
 
-  const { address } = await dns.lookup(host);
-  if (isBlockedAddress(address)) {
+  // Check every address the name resolves to, not just the first: a name
+  // with one public and one loopback/private record otherwise passes and the
+  // connection may still go to the blocked one (safe-outbound-fetch already
+  // does this; the proxy test lagged behind).
+  const addresses = await dns.lookup(host, { all: true, verbatim: true });
+  if (addresses.length === 0) {
+    throw new Error("Proxy target could not be resolved");
+  }
+  if (addresses.some(({ address }) => isBlockedAddress(address))) {
     throw new Error("Proxy target address is not allowed");
   }
 }

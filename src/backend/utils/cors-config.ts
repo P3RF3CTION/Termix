@@ -62,6 +62,15 @@ export function createCorsMiddleware(
   ];
 
   return (req: Request, res: Response, next: NextFunction) => {
+    // Refuse a disallowed Origin with an explicit 403 before any route runs.
+    // Passing an Error to the cors() callback ended in Express's default error
+    // handler as HTTP 500, which reads like a server fault in logs and
+    // monitoring.
+    const requestOrigin = req.headers.origin;
+    if (requestOrigin && !isCorsOriginAllowed(req, requestOrigin)) {
+      res.status(403).json({ error: "Origin not allowed" });
+      return;
+    }
     const handler = cors({
       origin: (origin, callback) => {
         if (isCorsOriginAllowed(req, origin)) return callback(null, true);
