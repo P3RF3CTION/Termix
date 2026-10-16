@@ -654,7 +654,7 @@ class DatabaseFileEncryption {
 
   static async restoreFromEncryptedBackup(
     backupPath: string,
-    targetPath: string,
+    targetPath?: string,
   ): Promise<string> {
     if (!this.isEncryptedDatabaseFile(backupPath)) {
       throw new Error("Invalid encrypted backup file");

@@ -1,4 +1,5 @@
 import { getErrorMessage } from "../utils/error-message.js";
+import { resolveWithinDir, safeFileSegment } from "../utils/safe-data-path.js";
 import { sshOptionsForWrite } from "../hosts/ssh-options.js";
 import {
   applyDefaultsAfterHostWrites,
@@ -147,8 +148,13 @@ const storage = multer.diskStorage({
     cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
+    // originalname comes from the client; keep only a plain file-name
+    // segment so it cannot steer the write outside the uploads directory.
     const timestamp = Date.now();
-    cb(null, `${timestamp}-${file.originalname}`);
+    cb(
+      null,
+      `${timestamp}-${safeFileSegment(file.originalname, "upload.sqlite")}`,
+    );
   },
 });
 
@@ -778,7 +784,9 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `termix-export-${user.username}-${timestamp}.sqlite`;
+    // Usernames are not restricted (sign-up, SSO, LDAP), so one like
+    // "../../x" must not become a path outside the export directory.
+    const filename = `termix-export-${safeFileSegment(user.username, "user")}-${timestamp}.sqlite`;
     const tempPath = path.join(tempDir, filename);
 
     apiLogger.info("Creating export database", {
@@ -1590,14 +1598,34 @@ app.post("/database/restore", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "Backup path is required" });
     }
 
-    if (!DatabaseFileEncryption.isEncryptedDatabaseFile(backupPath)) {
+    // Both paths come from the request body and become fs read and write
+    // targets. Backups only ever live under DATA_DIR, so confine them there:
+    // an admin session must not turn into arbitrary file read/write.
+    const dataDir = process.env.DATA_DIR || "./db/data";
+    const safeBackupPath = resolveWithinDir(dataDir, backupPath);
+    if (!safeBackupPath) {
+      return res
+        .status(400)
+        .json({ error: "Backup path must be inside the data directory" });
+    }
+    let safeTargetPath: string | undefined;
+    if (targetPath !== undefined && targetPath !== null && targetPath !== "") {
+      safeTargetPath = resolveWithinDir(dataDir, targetPath) ?? undefined;
+      if (!safeTargetPath) {
+        return res
+          .status(400)
+          .json({ error: "Target path must be inside the data directory" });
+      }
+    }
+
+    if (!DatabaseFileEncryption.isEncryptedDatabaseFile(safeBackupPath)) {
       return res.status(400).json({ error: "Invalid encrypted backup file" });
     }
 
     const restoredPath =
       await DatabaseFileEncryption.restoreFromEncryptedBackup(
-        backupPath,
-        targetPath,
+        safeBackupPath,
+        safeTargetPath,
       );
 
     res.json({
