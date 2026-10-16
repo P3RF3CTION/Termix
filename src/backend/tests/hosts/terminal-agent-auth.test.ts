@@ -6,6 +6,7 @@ const mockAccess = vi.fn();
 
 vi.mock("fs/promises", () => ({
   access: mockAccess,
+  realpath: async (p: string) => p,
 }));
 
 import {

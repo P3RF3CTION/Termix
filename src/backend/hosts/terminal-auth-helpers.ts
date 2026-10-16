@@ -29,6 +29,60 @@ type PortKnockingOptions = {
 
 const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const AGENT_SOCKET_PREFIXES = [
+  "/tmp/ssh-",
+  "/private/tmp/ssh-",
+  "/run/user/",
+  "/var/run/ssh-",
+];
+
+/**
+ * A host owner may name the agent socket for their hosts, but that path is a
+ * UNIX socket on the Termix server, spoken to with the SSH agent protocol.
+ * Without a limit any user could point it at /var/run/docker.sock, D-Bus or
+ * another local service. Allowed: the server's own SSH_AUTH_SOCK, the usual
+ * agent locations, the Termix user's ~/.ssh, and prefixes the operator lists
+ * in TERMIX_AGENT_SOCKET_ALLOWLIST (comma-separated). The path is compared
+ * after resolving symlinks, so a link under /tmp/ssh-* cannot lead elsewhere.
+ */
+export function isAllowedAgentSocketPath(candidate: string): boolean {
+  if (process.platform === "win32") {
+    const envPipe = process.env.SSH_AUTH_SOCK;
+    const normalized = candidate.replace(/\//g, "\\");
+    if (envPipe && normalized === envPipe) return true;
+    return (
+      /^\\\\\.\\pipe\\openssh-ssh-agent$/i.test(normalized) ||
+      /^\\\\\.\\pipe\\ssh-agent(?:-\d+)?$/i.test(normalized)
+    );
+  }
+
+  const envSock = process.env.SSH_AUTH_SOCK;
+  if (envSock && candidate === envSock) return true;
+
+  if (!candidate.startsWith("/") || candidate.includes("\0")) return false;
+  if (candidate.split("/").some((segment) => segment === "..")) return false;
+
+  const extra = (process.env.TERMIX_AGENT_SOCKET_ALLOWLIST ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.startsWith("/"));
+  if (
+    [...AGENT_SOCKET_PREFIXES, ...extra].some((p) => candidate.startsWith(p))
+  ) {
+    return true;
+  }
+
+  const home = process.env.HOME;
+  if (home) {
+    const dotSsh = `${home.replace(/\/+$/, "")}/.ssh/`;
+    if (candidate.startsWith(dotSsh)) return true;
+  }
+  return false;
+}
+
+const AGENT_SOCKET_NOT_ALLOWED =
+  "Agent socket path is not allowed. Use the server's SSH_AUTH_SOCK, a socket under /run/user/<uid>/ or /tmp/ssh-*/, inside the Termix user's ~/.ssh/, or a prefix listed in TERMIX_AGENT_SOCKET_ALLOWLIST.";
+
 export async function resolveAgentSocket(
   sshOptions: HostSshOptions | null | undefined,
 ): Promise<{ socketPath: string } | { error: string }> {
@@ -41,14 +95,27 @@ export async function resolveAgentSocket(
     };
   }
 
+  if (explicit && !isAllowedAgentSocketPath(explicit)) {
+    return { error: AGENT_SOCKET_NOT_ALLOWED };
+  }
+
   if (process.platform !== "win32") {
-    const { access } = await import("fs/promises");
+    const fsp = await import("fs/promises");
     try {
-      await access(resolved);
+      await fsp.access(resolved);
     } catch {
       return {
         error: `SSH agent socket not found at ${resolved}. Make sure your agent is running.`,
       };
+    }
+    if (explicit && explicit !== process.env.SSH_AUTH_SOCK) {
+      // The prefix check above ran on the given string; check where it
+      // really leads, so a symlink under an allowed prefix cannot point at
+      // docker.sock or any other socket.
+      const real = await fsp.realpath(resolved).catch(() => null);
+      if (!real || !isAllowedAgentSocketPath(real)) {
+        return { error: AGENT_SOCKET_NOT_ALLOWED };
+      }
     }
   }
 

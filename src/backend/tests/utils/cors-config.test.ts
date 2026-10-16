@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Request } from "express";
 import {
+  createCorsMiddleware,
   isCorsOriginAllowed,
   isDesktopAppOrigin,
 } from "../../utils/cors-config.js";
@@ -81,5 +82,63 @@ describe("isDesktopAppOrigin", () => {
   it("rejects websites", () => {
     expect(isDesktopAppOrigin("https://evil.example")).toBe(false);
     expect(isDesktopAppOrigin("null")).toBe(false);
+  });
+});
+
+describe("createCorsMiddleware", () => {
+  function run(origin: string | undefined) {
+    const headers: Record<string, string> = { host: "termix.example" };
+    if (origin) headers.origin = origin;
+    const req = { headers, method: "POST", protocol: "https" } as never;
+    let status: number | undefined;
+    let body: unknown;
+    const resHeaders: Record<string, string> = {};
+    const res = {
+      statusCode: 200,
+      status(code: number) {
+        status = code;
+        return this;
+      },
+      json(payload: unknown) {
+        body = payload;
+        return this;
+      },
+      setHeader(name: string, value: string) {
+        resHeaders[name.toLowerCase()] = String(value);
+      },
+      getHeader(name: string) {
+        return resHeaders[name.toLowerCase()];
+      },
+      end() {},
+    };
+    let nextErr: unknown = "not called";
+    createCorsMiddleware()(req, res as never, (err?: unknown) => {
+      nextErr = err;
+    });
+    return { status, body, nextErr, resHeaders };
+  }
+
+  it("answers a disallowed origin with 403 instead of an error (HTTP 500)", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://portal.example";
+    const r = run("https://evil.example");
+    expect(r.status).toBe(403);
+    expect(r.body).toEqual({ error: "Origin not allowed" });
+    expect(r.nextErr).toBe("not called");
+  });
+
+  it("passes an allowed origin through with CORS headers", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://portal.example";
+    const r = run("https://portal.example");
+    expect(r.status).toBeUndefined();
+    expect(r.nextErr).toBeUndefined();
+    expect(r.resHeaders["access-control-allow-origin"]).toBe(
+      "https://portal.example",
+    );
+  });
+
+  it("passes requests without an Origin header", () => {
+    const r = run(undefined);
+    expect(r.status).toBeUndefined();
+    expect(r.nextErr).toBeUndefined();
   });
 });
