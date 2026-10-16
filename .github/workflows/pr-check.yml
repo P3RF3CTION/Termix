@@ -6,7 +6,10 @@ on:
 
 jobs:
   lint-and-build:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Blacksmith runners exist for the upstream repository only. In a fork the
+    # job is never picked up and fails after 24h ("awaiting a runner") - a red
+    # check that never ran. Forks fall back to a GitHub-hosted runner.
+    runs-on: ${{ github.repository_owner == 'Termix-SSH' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
 
     env:
       NODE_OPTIONS: "--max-old-space-size=4096"
@@ -53,7 +56,10 @@ jobs:
 
   database-dialects:
     name: Postgres and MySQL
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Blacksmith runners exist for the upstream repository only. In a fork the
+    # job is never picked up and fails after 24h ("awaiting a runner") - a red
+    # check that never ran. Forks fall back to a GitHub-hosted runner.
+    runs-on: ${{ github.repository_owner == 'Termix-SSH' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
 
     services:
       postgres:

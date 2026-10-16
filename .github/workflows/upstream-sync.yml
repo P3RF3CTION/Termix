@@ -1,0 +1,78 @@
+name: Upstream-Sync (Fork)
+
+# Haelt den Fork P3RF3CTION/Termix auf dem Stand des offiziellen Repos
+# Termix-SSH/Termix. Laeuft taeglich und bei Bedarf von Hand:
+#   1. neuestes offizielles Release ermitteln
+#   2. ist es nicht in main enthalten: main per GitHub "Sync fork" (merge-upstream)
+#      mit Termix-SSH/Termix:main abgleichen
+#   3. scheitert der Abgleich (Konflikt mit eigenen Commits, oder upstream hat
+#      Workflow-Dateien geaendert und das Token darf keine Workflows schreiben),
+#      endet der Lauf rot mit Grund in der Zusammenfassung - GitHub meldet den
+#      fehlgeschlagenen Lauf per Mail. Dann von Hand abgleichen.
+#
+# Token: Secret UPSTREAM_SYNC_TOKEN (fine-grained PAT nur fuer diesen Fork,
+# Contents: write, Workflows: write). Ohne Secret wird github.token benutzt;
+# das reicht, solange upstream keine Dateien unter .github/workflows aendert.
+#
+# Nur im Fork: Upstream selbst braucht diesen Abgleich nicht.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'P3RF3CTION/Termix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Release pruefen und abgleichen
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM: Termix-SSH/Termix
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          echo "Neuestes Release upstream: ${tag}"
+
+          # Enthaelt main das Release? compare main...<upstream>:<tag> -> ahead_by
+          # zaehlt Commits des Releases, die main fehlen.
+          fehlt=$(gh api "repos/${REPO}/compare/main...${UPSTREAM%%/*}:${tag}" --jq .ahead_by)
+          if [ "${fehlt}" = "0" ]; then
+            echo "main enthaelt ${tag} bereits."
+            echo "main enthaelt ${tag} bereits - nichts zu tun." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "main fehlen ${fehlt} Commit(s) von ${tag} - gleiche ab."
+
+          if ausgabe=$(gh api -X POST "repos/${REPO}/merge-upstream" -f branch=main 2>&1); then
+            echo "${ausgabe}"
+            {
+              echo "### Abgleich mit ${UPSTREAM} erfolgreich"
+              echo ""
+              echo "Release ${tag}; Antwort: \`$(echo "${ausgabe}" | tr -d '\n' | cut -c1-300)\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Abgleich mit ${UPSTREAM} gescheitert: ${ausgabe}"
+            {
+              echo "### Abgleich mit ${UPSTREAM} gescheitert"
+              echo ""
+              echo "Release ${tag}, main fehlen ${fehlt} Commit(s)."
+              echo ""
+              echo "\`$(echo "${ausgabe}" | tr -d '\n' | cut -c1-500)\`"
+              echo ""
+              echo "Typische Gruende: Konflikt mit eigenen Commits in main, oder upstream hat"
+              echo ".github/workflows geaendert und das Token hat keine Workflows-Berechtigung"
+              echo "(Secret UPSTREAM_SYNC_TOKEN). Dann von Hand: git merge upstream/main."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
