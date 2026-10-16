@@ -422,6 +422,10 @@ export async function readPendingLogin(
   if (!decoded || !decoded.pendingTOTP) return null;
   prunePending();
   const pending = pendingLogins.get(pendingKey(token)) ?? null;
+  // The JWT alone stays valid for ten minutes. Only a token that is still in
+  // the pending map is live: one that was already redeemed (or minted before
+  // a restart) must not complete a second login with a fresh factor code.
+  if (!pending || pending.userId !== decoded.userId) return null;
   return { userId: decoded.userId, token, pending };
 }
 
@@ -541,6 +545,9 @@ export async function verifySecondFactorAndRespond(
   }
 
   const pending = lookup.pending;
+  // Consume before issuing, so two parallel requests with the same token
+  // cannot both end in a session.
+  consumePendingLogin(lookup.token);
   const session = await issueSession(req, user, {
     methodId: pending?.methodId ?? "password",
     rememberMe,
@@ -551,7 +558,6 @@ export async function verifySecondFactorAndRespond(
     session.body.trustToken = trustToken;
   }
 
-  consumePendingLogin(lookup.token);
   res.clearCookie(
     PENDING_LOGIN_COOKIE,
     AuthManager.getInstance().getClearCookieOptions(req),

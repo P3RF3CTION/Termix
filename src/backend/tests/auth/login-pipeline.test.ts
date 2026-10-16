@@ -312,6 +312,46 @@ describe("second factors", () => {
     expect(h.state.audits.at(-1)).toMatchObject({ action: "login" });
   });
 
+  it("refuses a pending token a second time once it was redeemed", async () => {
+    enrolTotp();
+    const first = await passwordLogin({
+      username: "alice",
+      password: PASSWORD,
+    });
+    const tempToken = (first.body as { temp_token: string }).temp_token;
+    const redeem = async () => {
+      const res = fakeResponse();
+      await verifySecondFactorAndRespond(
+        fakeRequest({
+          body: { temp_token: tempToken, totp_code: TOTP_CODE },
+        }) as never,
+        res as never,
+        "totp",
+      );
+      return res;
+    };
+
+    expect((await redeem()).statusCode).toBe(200);
+    const replay = await redeem();
+    expect(replay.statusCode).toBe(401);
+    expect(replay.cookies.find((c) => c.name === "jwt")).toBeUndefined();
+  });
+
+  it("refuses a pending-TOTP token that this server never registered", async () => {
+    enrolTotp();
+    await passwordLogin({ username: "alice", password: PASSWORD });
+    resetPendingLoginsForTests();
+    const res = fakeResponse();
+    await verifySecondFactorAndRespond(
+      fakeRequest({
+        body: { temp_token: "pending-1", totp_code: TOTP_CODE },
+      }) as never,
+      res as never,
+      "totp",
+    );
+    expect(res.statusCode).toBe(401);
+  });
+
   it("hands the trust token to the desktop app in the body", async () => {
     enrolTotp();
     const first = await passwordLogin({

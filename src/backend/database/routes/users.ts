@@ -8,6 +8,7 @@ import express, {
 import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
 import { authLogger } from "../../utils/logger.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
 import { parseUserAgent } from "../../utils/user-agent-parser.js";
@@ -1267,13 +1268,26 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
       });
     }
 
+    // The password check is an oracle for whoever holds a session (stolen
+    // cookie, unattended browser): limit it per account.
+    const deleteKey = `delete-account:${userId}`;
+    const deleteLock = loginRateLimiter.isLocked(deleteKey);
+    if (deleteLock.locked) {
+      return res.status(429).json({
+        error: "Too many attempts. Try again later.",
+        remainingTime: deleteLock.remainingTime,
+      });
+    }
+
     const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
     if (!isMatch) {
+      loginRateLimiter.recordFailedAttempt(deleteKey);
       authLogger.warn(
         `Incorrect password provided for account deletion: ${userRecord.username}`,
       );
       return res.status(401).json({ error: "Incorrect password" });
     }
+    loginRateLimiter.resetAttempts(deleteKey);
 
     if (userRecord.isAdmin) {
       const adminCount = await createCurrentUserRepository().countAdmins();
@@ -1348,8 +1362,19 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     return res.status(404).json({ error: "User not found" });
   }
 
+  // Same oracle as delete-account: limit wrong current passwords per account.
+  const changeKey = `change-password:${userId}`;
+  const changeLock = loginRateLimiter.isLocked(changeKey);
+  if (changeLock.locked) {
+    return res.status(429).json({
+      error: "Too many attempts. Try again later.",
+      remainingTime: changeLock.remainingTime,
+    });
+  }
+
   const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
   if (!isMatch) {
+    loginRateLimiter.recordFailedAttempt(changeKey);
     authLogger.warn("Password change failed - old password incorrect", {
       operation: "password_change_failed",
       userId,
@@ -1374,7 +1399,12 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     passwordHash: password_hash,
   });
 
-  authManager.logoutUser(userId);
+  loginRateLimiter.resetAttempts(changeKey);
+  // Wait for the revocation of every session before answering, so no old
+  // session is still accepted once the client has been told it is done, and
+  // drop this browser's cookie as well.
+  await authManager.logoutUser(userId);
+  res.clearCookie("jwt", authManager.getClearCookieOptions(req));
   authLogger.success("Password changed successfully", {
     operation: "password_change_complete",
     userId,
