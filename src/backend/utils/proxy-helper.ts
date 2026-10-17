@@ -112,11 +112,7 @@ async function createHttpConnectConnection(
   // Numeric port coercion before any interpolation: a non-numeric value could
   // smuggle `\r\n` into the CONNECT request line / Host header.
   const safePort = Number(targetPort);
-  if (
-    !Number.isInteger(safePort) ||
-    safePort < 1 ||
-    safePort > 65535
-  ) {
+  if (!Number.isInteger(safePort) || safePort < 1 || safePort > 65535) {
     throw new Error(`invalid target port: ${String(targetPort)}`);
   }
   // targetHost already runs through validateHost in callers, but defense in

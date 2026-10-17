@@ -252,15 +252,14 @@ export function createPluginProcess(deps: Deps): PluginProcess {
     // Cap the download so a plugin pointing at a huge or chunked-infinite URL
     // cannot OOM the server. MAX_PREBUILT_BYTES mirrors the on-disk check.
     const declaredLen = Number(response.headers.get("content-length") ?? 0);
-    if (
-      Number.isFinite(declaredLen) &&
-      declaredLen > MAX_PREBUILT_BYTES
-    ) {
-      throw new Error(
-        `Binary ${spec.name} is larger than the allowed limit`,
-      );
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_PREBUILT_BYTES) {
+      throw new Error(`Binary ${spec.name} is larger than the allowed limit`);
     }
-    const data = await readLimitedBuffer(response, MAX_PREBUILT_BYTES, spec.name);
+    const data = await readLimitedBuffer(
+      response,
+      MAX_PREBUILT_BYTES,
+      spec.name,
+    );
     const actual = createHash("sha256").update(data).digest("hex");
     if (actual !== spec.sha256.toLowerCase()) {
       throw new Error(

@@ -38,11 +38,7 @@ export function readArtifactFile(
     // Allow NUL (old-style regular file), '0' (regular file), '5' (dir).
     // Everything else (hard/symlink, PAX x/g, GNU L/K, char/block device,
     // vendor extensions) is treated as "we don't understand this archive".
-    if (
-      header[156] !== 0 &&
-      typeflag !== "0" &&
-      typeflag !== "5"
-    ) {
+    if (header[156] !== 0 && typeflag !== "0" && typeflag !== "5") {
       throw new Error(
         `the archive uses an unsupported tar entry type (${typeflag || "\\0"})`,
       );

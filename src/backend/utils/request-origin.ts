@@ -17,10 +17,9 @@ function firstHeaderValue(value: string | string[] | undefined): string {
 function peerIsTrustedProxy(req: Request | IncomingMessage): boolean {
   const peer = req.socket?.remoteAddress;
   if (!peer) return false;
-  const trustFn = ("app" in req ? (req as Request).app?.get("trust proxy fn") : null) as
-    | ((addr: string, i: number) => boolean)
-    | null
-    | undefined;
+  const trustFn = (
+    "app" in req ? (req as Request).app?.get("trust proxy fn") : null
+  ) as ((addr: string, i: number) => boolean) | null | undefined;
   if (typeof trustFn === "function") {
     try {
       return !!trustFn(peer, 0);
@@ -122,8 +121,7 @@ export function getRequestOrigin(req: Request | IncomingMessage): string {
 
   let port = trusted ? normalizePort(req.headers["x-forwarded-port"]) : "";
   const { host, port: hostPort } = splitHostHeader(
-    (trusted ? req.headers["x-forwarded-host"] : undefined) ||
-      req.headers.host,
+    (trusted ? req.headers["x-forwarded-host"] : undefined) || req.headers.host,
   );
   port ||= hostPort;
 
