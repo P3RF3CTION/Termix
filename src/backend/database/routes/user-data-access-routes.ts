@@ -2,6 +2,7 @@ import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { RequestHandler, Router } from "express";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { authLogger } from "../../utils/logger.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 
 interface UserDataAccessRoutesDeps {
   authenticateJWT: RequestHandler;
@@ -52,9 +53,22 @@ export function registerUserDataAccessRoutes(
       return res.status(400).json({ error: "Password is required" });
     }
 
+    // Same oracle shape as /users/change-password: a session-bound caller
+    // could brute-force the password here, which would unwrap any legacy-v1
+    // DEK material. Lock per-user after repeated failures.
+    const unlockKey = `unlock-data:${userId}`;
+    const unlockLock = loginRateLimiter.isLocked(unlockKey);
+    if (unlockLock.locked) {
+      return res.status(429).json({
+        error: "Too many attempts. Try again later.",
+        remainingTime: unlockLock.remainingTime,
+      });
+    }
+
     try {
       const unlocked = await authManager.authenticateUser(userId, password);
       if (unlocked) {
+        loginRateLimiter.resetAttempts(unlockKey);
         const refreshedSession =
           userId && authReq.sessionId
             ? await authManager.refreshSessionToken(userId, authReq.sessionId)
@@ -73,6 +87,7 @@ export function registerUserDataAccessRoutes(
           message: "Data unlocked successfully",
         });
       } else {
+        loginRateLimiter.recordFailedAttempt(unlockKey);
         authLogger.warn("Failed to unlock user data - invalid password", {
           operation: "user_data_unlock_failed",
           userId,

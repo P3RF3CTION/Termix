@@ -7,6 +7,35 @@ function firstHeaderValue(value: string | string[] | undefined): string {
   return raw.split(",")[0].trim();
 }
 
+/**
+ * Match the Express `trust proxy = loopback` setting configured in
+ * database.ts: only honor X-Forwarded-* when the first-hop peer is a
+ * loopback address (the reverse proxy). From any other peer the headers are
+ * spoofable, so we drop them and build the origin from the raw Host header
+ * (and TLS state), the same way Express computes req.protocol / req.hostname.
+ */
+function peerIsTrustedProxy(req: Request | IncomingMessage): boolean {
+  const peer = req.socket?.remoteAddress;
+  if (!peer) return false;
+  const trustFn = ("app" in req ? (req as Request).app?.get("trust proxy fn") : null) as
+    | ((addr: string, i: number) => boolean)
+    | null
+    | undefined;
+  if (typeof trustFn === "function") {
+    try {
+      return !!trustFn(peer, 0);
+    } catch {
+      /* fall through to default loopback check */
+    }
+  }
+  return (
+    peer === "127.0.0.1" ||
+    peer === "::1" ||
+    peer === "::ffff:127.0.0.1" ||
+    peer.startsWith("127.")
+  );
+}
+
 function normalizePort(value: string | string[] | undefined): string {
   const raw = firstHeaderValue(value);
   if (!/^\d+$/.test(raw)) return "";
@@ -72,8 +101,9 @@ export function getClientIp(req: Request | IncomingMessage): string {
 }
 
 export function getRequestOrigin(req: Request | IncomingMessage): string {
+  const trusted = peerIsTrustedProxy(req);
   let protocol: string;
-  const protoHeader = req.headers["x-forwarded-proto"];
+  const protoHeader = trusted ? req.headers["x-forwarded-proto"] : undefined;
 
   if (protoHeader) {
     const raw =
@@ -90,9 +120,10 @@ export function getRequestOrigin(req: Request | IncomingMessage): string {
       : "http";
   }
 
-  let port = normalizePort(req.headers["x-forwarded-port"]);
+  let port = trusted ? normalizePort(req.headers["x-forwarded-port"]) : "";
   const { host, port: hostPort } = splitHostHeader(
-    req.headers["x-forwarded-host"] || req.headers.host,
+    (trusted ? req.headers["x-forwarded-host"] : undefined) ||
+      req.headers.host,
   );
   port ||= hostPort;
 
@@ -127,6 +158,10 @@ export function getRequestBasePath(req: Request | IncomingMessage): string {
     process.env.BASE_PATH || process.env.VITE_BASE_PATH,
   );
   if (envBasePath) return envBasePath;
+
+  // The base-path headers are set by reverse proxies; outside a trusted peer
+  // they can be forged to redirect generated plugin/callback URLs.
+  if (!peerIsTrustedProxy(req)) return "";
 
   return (
     normalizeBasePath(firstHeaderValue(req.headers["x-forwarded-prefix"])) ||

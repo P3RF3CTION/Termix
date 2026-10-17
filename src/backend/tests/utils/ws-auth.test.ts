@@ -84,6 +84,28 @@ describe("the jwt cookie on a socket", () => {
     ).toBe(true);
   });
 
+  it("rejects a browser extension that is also not a web origin", () => {
+    // A browser extension (chrome-extension://, moz-extension://) is an
+    // unknown non-http(s) scheme that the browser does attach the cookie
+    // to. Only a hand-picked set of native-app schemes may pass.
+    expect(
+      isCookieOriginAllowed(
+        request({
+          host: "termix.example.com",
+          origin: "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isCookieOriginAllowed(
+        request({
+          host: "termix.example.com",
+          origin: "moz-extension://abcdefg",
+        }),
+      ),
+    ).toBe(false);
+  });
+
   it("trusts the browser's same-origin mark behind a proxy that rewrites Host", () => {
     expect(
       extractWebSocketToken(

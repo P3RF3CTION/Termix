@@ -341,6 +341,7 @@ class AuthManager {
 
       const token = jwt.sign(payload, jwtSecret, {
         expiresIn,
+        algorithm: "HS256",
       } as jwt.SignOptions);
 
       const expirationMs = this.parseExpiresIn(expiresIn);
@@ -371,7 +372,10 @@ class AuthManager {
       return token;
     }
 
-    return jwt.sign(payload, jwtSecret, { expiresIn } as jwt.SignOptions);
+    return jwt.sign(payload, jwtSecret, {
+      expiresIn,
+      algorithm: "HS256",
+    } as jwt.SignOptions);
   }
 
   private parseExpiresIn(expiresIn: string): number {
@@ -404,6 +408,7 @@ class AuthManager {
     const payload: JWTPayload = { userId, sessionId, purpose: "ws" };
     return jwt.sign(payload, await this.systemCrypto.getJWTSecret(), {
       expiresIn: 60,
+      algorithm: "HS256",
     } as jwt.SignOptions);
   }
 
@@ -414,7 +419,9 @@ class AuthManager {
     try {
       const jwtSecret = await this.systemCrypto.getJWTSecret();
 
-      const payload = jwt.verify(token, jwtSecret) as JWTPayload;
+      const payload = jwt.verify(token, jwtSecret, {
+        algorithms: ["HS256"],
+      }) as JWTPayload;
       if (
         payload.purpose !== undefined &&
         !(payload.purpose === "ws" && options.allowSocketTicket)
@@ -492,6 +499,7 @@ class AuthManager {
 
     const token = jwt.sign(payload, await this.systemCrypto.getJWTSecret(), {
       expiresIn: Math.ceil(maxAge / 1000),
+      algorithm: "HS256",
     } as jwt.SignOptions);
 
     await createCurrentSessionRepository().updateToken(sessionId, token);

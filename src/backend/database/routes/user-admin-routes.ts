@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { DataCrypto } from "../../utils/data-crypto.js";
+import { safeFileSegment } from "../../utils/safe-data-path.js";
 import {
   createCurrentRoleRepository,
   createCurrentUserAuthRepository,
@@ -861,9 +862,13 @@ export function registerUserAdminRoutes(
       });
 
       res.setHeader("Content-Type", "application/json");
+      // The username comes from external IdPs / LDAP in some deployments and
+      // can carry quotes, CR/LF, or other header-splitting characters. Strip
+      // them down to a filename-safe segment before interpolating.
+      const safeUsername = safeFileSegment(targetUser.username, "user");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="termix-user-${targetUser.username}-export.json"`,
+        `attachment; filename="termix-user-${safeUsername}-export.json"`,
       );
       res.json(exportData);
     } catch (err) {

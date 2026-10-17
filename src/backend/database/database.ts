@@ -179,9 +179,12 @@ const upload = multer({
 // limit (see plugins/http.ts), and parsing here first would consume the body
 // and silently cap every plugin at this limit instead.
 const coreJsonParser = bodyParser.json({ limit: "2mb" });
+// extended:false uses Node's built-in querystring parser rather than qs.
+// qs has had repeated prototype-pollution and depth-DoS CVEs, and Termix's
+// core routes do not need the nested-bracket syntax qs provides.
 const coreUrlencodedParser = bodyParser.urlencoded({
   limit: "2mb",
-  extended: true,
+  extended: false,
 });
 
 app.use((req, res, next) => {

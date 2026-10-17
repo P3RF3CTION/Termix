@@ -109,6 +109,21 @@ async function createHttpConnectConnection(
   password?: string,
   existingSocket?: net.Socket,
 ): Promise<net.Socket> {
+  // Numeric port coercion before any interpolation: a non-numeric value could
+  // smuggle `\r\n` into the CONNECT request line / Host header.
+  const safePort = Number(targetPort);
+  if (
+    !Number.isInteger(safePort) ||
+    safePort < 1 ||
+    safePort > 65535
+  ) {
+    throw new Error(`invalid target port: ${String(targetPort)}`);
+  }
+  // targetHost already runs through validateHost in callers, but defense in
+  // depth: refuse any CRLF, whitespace, or other request-line separators.
+  if (/[\s"'<>]|%0[ad]/i.test(targetHost) || /[\0\r\n]/.test(targetHost)) {
+    throw new Error(`invalid target host: ${targetHost}`);
+  }
   return new Promise<net.Socket>((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(
@@ -119,7 +134,7 @@ async function createHttpConnectConnection(
     }, 15000);
 
     function sendConnect(socket: net.Socket) {
-      let connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+      let connectReq = `CONNECT ${targetHost}:${safePort} HTTP/1.1\r\nHost: ${targetHost}:${safePort}\r\n`;
       if (username && password) {
         const credentials = Buffer.from(`${username}:${password}`).toString(
           "base64",

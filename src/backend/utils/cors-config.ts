@@ -36,7 +36,11 @@ export function isCorsOriginAllowed(
   if (process.env.ELECTRON_EMBEDDED === "true") {
     return configured.includes(origin) || origin === getRequestOrigin(req);
   }
-  if (configured.length === 0) return true;
+  // Fail closed when nothing is configured: `credentials: true` plus an
+  // echo-anything fallback let any site in a victim's browser read responses
+  // from this backend. Fall back to the request's own origin (so a
+  // single-origin reverse-proxy deployment still works) and require
+  // CORS_ALLOWED_ORIGINS for cross-origin frontends.
   if (configured.includes(origin)) return true;
 
   return origin === getRequestOrigin(req);

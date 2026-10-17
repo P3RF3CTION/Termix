@@ -338,7 +338,11 @@ export function createPluginRouter({
     // multer untouched. database.ts skips its own global parser for
     // /plugin-api so this limit is the one that actually applies.
     outer.use(express.json({ limit }));
-    outer.use(express.urlencoded({ limit, extended: true }));
+    // extended:false uses Node's built-in querystring instead of qs. qs has
+    // had repeated prototype-pollution and depth-DoS CVEs; nothing in Termix
+    // itself needs the nested-bracket syntax qs enables, so narrow the
+    // parser to flat key=value pairs.
+    outer.use(express.urlencoded({ limit, extended: false }));
   }
 
   // After auth, so the actor is the user core authenticated rather than
