@@ -83,7 +83,7 @@ export function createDnsLookupHook(
     lookupOptions: LookupOptions,
     callback: LookupHookCallback,
   ): void {
-    const cleanHost = String(host ?? "").replace(/^[|]$/g, "");
+    const cleanHost = String(host ?? "").replace(/^\[|\]$/g, "");
     const lookupAll = lookupOptions.all === true;
 
     dnsLookup(

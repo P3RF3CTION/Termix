@@ -323,8 +323,13 @@ class SystemCrypto {
 
       const jwt = await import("jsonwebtoken");
       const testPayload = { test: true, timestamp: Date.now() };
-      const token = jwt.default.sign(testPayload, secret, { expiresIn: "1s" });
-      const decoded = jwt.default.verify(token, secret);
+      const token = jwt.default.sign(testPayload, secret, {
+        expiresIn: "1s",
+        algorithm: "HS256",
+      });
+      const decoded = jwt.default.verify(token, secret, {
+        algorithms: ["HS256"],
+      });
 
       return !!decoded;
     } catch (error) {

@@ -65,6 +65,40 @@ async function isPrebuiltCandidate(
   }
 }
 
+/**
+ * Streams a fetch response into a size-capped Buffer, aborting as soon as the
+ * body exceeds the limit — avoids loading an unbounded body into memory.
+ */
+async function readLimitedBuffer(
+  response: Response,
+  limit: number,
+  name: string,
+): Promise<Buffer> {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        throw new Error(`Binary ${name} is larger than the allowed limit`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released */
+    }
+  }
+  return Buffer.concat(chunks);
+}
+
 async function sha256Of(file: string): Promise<string | null> {
   try {
     const hash = createHash("sha256");
@@ -215,7 +249,17 @@ export function createPluginProcess(deps: Deps): PluginProcess {
     if (!response.ok || !response.body) {
       throw new Error(`Download failed with HTTP ${response.status}`);
     }
-    const data = Buffer.from(await response.arrayBuffer());
+    // Cap the download so a plugin pointing at a huge or chunked-infinite URL
+    // cannot OOM the server. MAX_PREBUILT_BYTES mirrors the on-disk check.
+    const declaredLen = Number(response.headers.get("content-length") ?? 0);
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_PREBUILT_BYTES) {
+      throw new Error(`Binary ${spec.name} is larger than the allowed limit`);
+    }
+    const data = await readLimitedBuffer(
+      response,
+      MAX_PREBUILT_BYTES,
+      spec.name,
+    );
     const actual = createHash("sha256").update(data).digest("hex");
     if (actual !== spec.sha256.toLowerCase()) {
       throw new Error(

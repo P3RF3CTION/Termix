@@ -7,9 +7,12 @@ import {
 } from "../../utils/cors-config.js";
 
 function request(headers: Record<string, string> = {}): Request {
+  // Default to a loopback peer so X-Forwarded-* in headers reflects a
+  // request that came through the trusted reverse proxy.
   return {
     headers,
     protocol: "http",
+    socket: { remoteAddress: "127.0.0.1" },
   } as unknown as Request;
 }
 
@@ -31,9 +34,18 @@ describe("isCorsOriginAllowed", () => {
     expect(isCorsOriginAllowed(req, "https://termix.example")).toBe(true);
   });
 
-  it("allows any origin when no allowlist is configured (self-hosted default)", () => {
+  it("rejects an unknown origin even without an allowlist (fail-closed default)", () => {
+    // The previous fallback echoed any origin together with
+    // Access-Control-Allow-Credentials, letting any site a victim visits
+    // read responses from this backend. The default now matches the
+    // configured path's final fallback: only the request's own origin.
     const req = request({ host: "termix.example" });
-    expect(isCorsOriginAllowed(req, "https://anything.example")).toBe(true);
+    expect(isCorsOriginAllowed(req, "https://anything.example")).toBe(false);
+  });
+
+  it("still allows a request from the server's own origin without an allowlist", () => {
+    const req = request({ host: "termix.example" });
+    expect(isCorsOriginAllowed(req, "http://termix.example")).toBe(true);
   });
 
   it("allows an explicitly configured origin", () => {
@@ -89,7 +101,12 @@ describe("createCorsMiddleware", () => {
   function run(origin: string | undefined) {
     const headers: Record<string, string> = { host: "termix.example" };
     if (origin) headers.origin = origin;
-    const req = { headers, method: "POST", protocol: "https" } as never;
+    const req = {
+      headers,
+      method: "POST",
+      protocol: "https",
+      socket: { remoteAddress: "127.0.0.1" },
+    } as never;
     let status: number | undefined;
     let body: unknown;
     const resHeaders: Record<string, string> = {};

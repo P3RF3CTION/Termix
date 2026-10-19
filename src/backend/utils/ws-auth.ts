@@ -2,6 +2,20 @@ import type { IncomingMessage } from "http";
 
 const JWT_PROTOCOL_PREFIX = "termix.jwt.";
 
+// Non-http(s) origins that identify a wrapper/native shell, not an arbitrary
+// web page. Anything NOT in this allowlist and not http/https must still be
+// rejected: a browser extension (chrome-extension://, moz-extension://) could
+// otherwise inherit the user's cookie on a WebSocket upgrade and talk to the
+// backend as them.
+const NATIVE_APP_PROTOCOLS = new Set([
+  "file:",
+  "app:",
+  "tauri:",
+  "capacitor:",
+  "ionic:",
+  "electron:",
+]);
+
 /**
  * A browser attaches the jwt cookie to a socket opened from any page on the
  * same site, including a sibling subdomain. The cookie only counts when the
@@ -21,7 +35,9 @@ export function isCookieOriginAllowed(req: IncomingMessage): boolean {
   } catch {
     return false;
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return true;
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return NATIVE_APP_PROTOCOLS.has(parsed.protocol);
+  }
   const hosts = [req.headers.host, req.headers["x-forwarded-host"]]
     .flatMap((value) => String(value ?? "").split(","))
     .map((value) => value.trim().toLowerCase())

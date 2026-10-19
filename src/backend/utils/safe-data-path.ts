@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 
 /**
@@ -12,9 +13,12 @@ import path from "node:path";
  * point outside it.
  *
  * Returns the resolved absolute path when it stays within `baseDir`, or null
- * when it escapes -- including via `..`, an absolute path, or a symlink-shaped
- * string. Comparison is done on resolved paths with a trailing separator so
- * that `/data-evil` cannot pass as being inside `/data`.
+ * when it escapes -- including via `..`, an absolute path, or a symlink that
+ * points out of the directory. The function also follows symlinks on every
+ * existing ancestor of the resolved path, so a link planted inside the data
+ * directory that points elsewhere cannot be used to escape. Comparison is
+ * done on resolved paths with a trailing separator so that `/data-evil`
+ * cannot pass as being inside `/data`.
  */
 export function resolveWithinDir(
   baseDir: string,
@@ -26,9 +30,43 @@ export function resolveWithinDir(
   const base = path.resolve(baseDir);
   const resolved = path.resolve(base, candidate);
 
-  if (resolved === base) return resolved;
   const baseWithSep = base.endsWith(path.sep) ? base : base + path.sep;
-  return resolved.startsWith(baseWithSep) ? resolved : null;
+  if (resolved !== base && !resolved.startsWith(baseWithSep)) return null;
+
+  // Resolve symlinks on the nearest existing ancestor. If any component
+  // along the chain is a symlink pointing outside the base, reject.
+  let realAncestor: string | null = null;
+  let cursor = resolved;
+  while (cursor !== path.dirname(cursor)) {
+    try {
+      realAncestor = fs.realpathSync(cursor);
+      break;
+    } catch {
+      cursor = path.dirname(cursor);
+    }
+  }
+  if (realAncestor !== null) {
+    const remainder = path.relative(cursor, resolved);
+    const realResolved = path.resolve(realAncestor, remainder);
+    const realBase = (() => {
+      try {
+        return fs.realpathSync(base);
+      } catch {
+        return base;
+      }
+    })();
+    const realBaseWithSep = realBase.endsWith(path.sep)
+      ? realBase
+      : realBase + path.sep;
+    if (
+      realResolved !== realBase &&
+      !realResolved.startsWith(realBaseWithSep)
+    ) {
+      return null;
+    }
+  }
+
+  return resolved;
 }
 
 /**

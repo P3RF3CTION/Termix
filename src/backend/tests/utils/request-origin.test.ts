@@ -9,9 +9,12 @@ import {
 } from "../../utils/request-origin.js";
 
 function request(headers: Record<string, string | string[] | undefined>) {
+  // Default to a loopback peer so the X-Forwarded-* lookups behave as if the
+  // request came through the configured trusted reverse proxy. A test that
+  // needs an untrusted peer builds its own object.
   return {
     headers,
-    socket: {},
+    socket: { remoteAddress: "127.0.0.1" },
   } as Parameters<typeof getRequestBasePath>[0];
 }
 
@@ -214,5 +217,31 @@ describe("getRequestOrigin", () => {
         }),
       ),
     ).toBe("https://termix.test.de");
+  });
+
+  it("ignores X-Forwarded-* when the peer is not a trusted proxy", () => {
+    // A direct hit on the backend (bypassing the reverse proxy) must not be
+    // able to redirect generated callback URLs by spoofing XF headers.
+    const req = {
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "evil.example",
+        host: "termix.internal:3000",
+      },
+      socket: { remoteAddress: "203.0.113.5" },
+    } as Parameters<typeof getRequestOrigin>[0];
+    expect(getRequestOrigin(req)).toBe("http://termix.internal:3000");
+  });
+
+  it("honors X-Forwarded-* from a loopback peer", () => {
+    const req = {
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "termix.example",
+        host: "termix.internal:3000",
+      },
+      socket: { remoteAddress: "127.0.0.1" },
+    } as Parameters<typeof getRequestOrigin>[0];
+    expect(getRequestOrigin(req)).toBe("https://termix.example");
   });
 });
