@@ -121,7 +121,7 @@ export class RoleRepository {
   async assignRoleToUser(input: {
     userId: string;
     roleId: number;
-    grantedBy: string;
+    grantedBy: string | null;
   }): Promise<void> {
     await this.context.drizzle.insert(userRoles).values(input);
     await this.afterWrite();
@@ -130,7 +130,7 @@ export class RoleRepository {
   async assignRoleNameToUser(input: {
     userId: string;
     roleName: string;
-    grantedBy: string;
+    grantedBy: string | null;
   }): Promise<boolean> {
     const role = await this.findRoleByName(input.roleName);
     if (!role) {
@@ -150,7 +150,7 @@ export class RoleRepository {
     userId: string;
     addRoleName: string;
     removeRoleName: string;
-    grantedBy: string;
+    grantedBy: string | null;
   }): Promise<UserRoleNameSwitchResult> {
     const [addRole, removeRole] = await Promise.all([
       this.findRoleByName(input.addRoleName),

@@ -227,6 +227,11 @@ export function fakeAuthManager(state: AuthState) {
       httpOnly: true,
       maxAge,
     })),
+    getStrictCookieOptions: vi.fn((_req: unknown, maxAge: number) => ({
+      httpOnly: true,
+      sameSite: "strict" as const,
+      maxAge,
+    })),
     getClearCookieOptions: vi.fn(() => ({ httpOnly: true })),
     getUserDataKey: vi.fn(() => Buffer.alloc(32, 7)),
   };

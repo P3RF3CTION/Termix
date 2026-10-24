@@ -46,6 +46,13 @@ import {
 
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const PENDING_LOGIN_COOKIE = "termix_pending_login";
+/**
+ * Hard cap on wrong second-factor attempts per pending-login token. Keeps the
+ * effective brute-force window at ≤ this many codes even if the per-user
+ * TOTP rate limiter would otherwise allow several lockout cycles across the
+ * 10-minute token lifetime.
+ */
+const PENDING_LOGIN_MAX_ATTEMPTS = 5;
 
 const pendingLogins = new Map<string, PendingLogin>();
 
@@ -464,6 +471,26 @@ export async function verifySecondFactorAndRespond(
       code: "TOTP_RATE_LIMITED",
     });
   }
+
+  // Hard cap tries per pending-login token so the lifetime of the token (10
+  // min) does not grant the attacker several TOTP-lockout cycles' worth of
+  // guesses. Once exhausted, the pending token is burned and the user must
+  // restart the login.
+  const pendingSpent = lookup.pending?.attempts ?? 0;
+  if (pendingSpent >= PENDING_LOGIN_MAX_ATTEMPTS) {
+    consumePendingLogin(lookup.token);
+    authLogger.warn("Second factor pending token exhausted", {
+      operation: "totp_pending_exhausted",
+      userId: user.id,
+    });
+    return res.status(401).json({
+      error: "Too many attempts. Please sign in again.",
+      code: "SECOND_FACTOR_EXHAUSTED",
+    });
+  }
+  if (lookup.pending) {
+    lookup.pending.attempts = pendingSpent + 1;
+  }
   loginRateLimiter.recordFailedTOTPAttempt(user.id);
 
   const factors = await evaluateSecondFactors(user.id);
@@ -529,10 +556,13 @@ export async function verifySecondFactorAndRespond(
       deviceInfo.type,
       deviceInfo.deviceInfo,
     );
+    // Trust-device cookie is only consumed on the login/2FA endpoints that
+    // check it (never on sibling GETs), so SameSite=Strict is safe here and
+    // keeps the cookie off any cross-site navigation.
     res.cookie(
       TRUST_DEVICE_COOKIE,
       trustToken,
-      AuthManager.getInstance().getSecureCookieOptions(
+      AuthManager.getInstance().getStrictCookieOptions(
         req,
         TRUST_TOKEN_MAX_AGE_MS,
       ),

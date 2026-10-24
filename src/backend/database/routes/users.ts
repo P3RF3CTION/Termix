@@ -1269,8 +1269,10 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
     }
 
     // The password check is an oracle for whoever holds a session (stolen
-    // cookie, unattended browser): limit it per account.
-    const deleteKey = `delete-account:${userId}`;
+    // cookie, unattended browser): limit per (account, IP) so an attacker on
+    // one IP cannot lock out the real owner coming from another IP.
+    const deleteIp = req.ip || req.socket?.remoteAddress || "unknown";
+    const deleteKey = `delete-account:${userId}:${deleteIp}`;
     const deleteLock = loginRateLimiter.isLocked(deleteKey);
     if (deleteLock.locked) {
       return res.status(429).json({
@@ -1362,8 +1364,10 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     return res.status(404).json({ error: "User not found" });
   }
 
-  // Same oracle as delete-account: limit wrong current passwords per account.
-  const changeKey = `change-password:${userId}`;
+  // Same oracle as delete-account: limit wrong current passwords per
+  // (account, IP) so an attacker on one IP cannot lock out the real owner.
+  const changeIp = req.ip || req.socket?.remoteAddress || "unknown";
+  const changeKey = `change-password:${userId}:${changeIp}`;
   const changeLock = loginRateLimiter.isLocked(changeKey);
   if (changeLock.locked) {
     return res.status(429).json({

@@ -14,7 +14,7 @@ function firstHeaderValue(value: string | string[] | undefined): string {
  * spoofable, so we drop them and build the origin from the raw Host header
  * (and TLS state), the same way Express computes req.protocol / req.hostname.
  */
-function peerIsTrustedProxy(req: Request | IncomingMessage): boolean {
+export function peerIsTrustedProxy(req: Request | IncomingMessage): boolean {
   const peer = req.socket?.remoteAddress;
   if (!peer) return false;
   const trustFn = (

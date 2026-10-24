@@ -73,12 +73,14 @@ export async function verifyPasswordLogin(request: {
     user.isExternal &&
     (!user.passwordHash || user.passwordHash.trim() === "")
   ) {
+    loginRateLimiter.recordFailedAttempt(clientIp, username);
     authLogger.warn("External-only user attempted password login", {
       operation: "user_login",
       username,
       userId: user.id,
+      ip: clientIp,
     });
-    throw new LoginMethodError("This user uses external authentication", 403);
+    throw new LoginMethodError("Invalid username or password", 401);
   }
 
   const isMatch = await bcrypt.compare(password, user.passwordHash);
