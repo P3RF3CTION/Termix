@@ -40,4 +40,6 @@ export interface PendingLogin {
   maxSessionSeconds?: number | null;
   idleTimeoutSeconds?: number | null;
   createdAt: number;
+  /** Wrong second-factor attempts spent on this pending token. */
+  attempts?: number;
 }
