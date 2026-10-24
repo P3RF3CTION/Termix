@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "http";
+import { peerIsTrustedProxy } from "./request-origin.js";
 
 const JWT_PROTOCOL_PREFIX = "termix.jwt.";
 
@@ -38,7 +39,13 @@ export function isCookieOriginAllowed(req: IncomingMessage): boolean {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return NATIVE_APP_PROTOCOLS.has(parsed.protocol);
   }
-  const hosts = [req.headers.host, req.headers["x-forwarded-host"]]
+  // Only honor x-forwarded-host when the upgrade reaches us through a loopback
+  // trusted proxy; otherwise a direct client can forge the origin check with
+  // a chosen X-Forwarded-Host value.
+  const forwardedHost = peerIsTrustedProxy(req)
+    ? req.headers["x-forwarded-host"]
+    : undefined;
+  const hosts = [req.headers.host, forwardedHost]
     .flatMap((value) => String(value ?? "").split(","))
     .map((value) => value.trim().toLowerCase())
     .filter(Boolean);

@@ -30,8 +30,31 @@ type ExternalIdentity = Extract<VerifiedIdentity, { kind: "external" }>;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * grantedBy for a role grant that came from an identity provider's group map,
+ * not from an administrator. The user_roles.granted_by column is nullable with
+ * ON DELETE SET NULL, so `null` keeps the FK honest while still letting audit
+ * queries like "who granted admin to user X" tell self-grants from
+ * provider-synced grants apart.
+ */
+const SYSTEM_EXTERNAL_GRANTER: string | null = null;
+
 /** The admin setting that turns external auto-provisioning on. */
 export const EXTERNAL_AUTO_PROVISION_KEY = "external_auto_provision";
+
+/**
+ * Whether the very first user may be auto-promoted to admin from an SSO
+ * identity's `isAdmin` claim. When off (the default), the first SSO sign-in
+ * creates a plain user and an operator must promote them deliberately.
+ * Prevents an attacker who controls the IdP group mapping from owning a fresh
+ * deployment the moment they sign in.
+ */
+function firstSsoAdminAllowed(): boolean {
+  return (
+    (process.env.TERMIX_ALLOW_FIRST_SSO_ADMIN ?? "").trim().toLowerCase() ===
+    "true"
+  );
+}
 
 /** SSO auto-provisioning: the admin setting, or EXTERNAL_ALLOW_REGISTRATION. */
 async function isExternalProvisioningAllowed(): Promise<boolean> {
@@ -92,7 +115,7 @@ async function syncAdmin(
       userId: user.id,
       addRoleName: isAdmin ? "admin" : "user",
       removeRoleName: isAdmin ? "user" : "admin",
-      grantedBy: user.id,
+      grantedBy: SYSTEM_EXTERNAL_GRANTER,
     });
   } catch {
     // Roles follow on the next sign-in; the admin flag itself is saved.
@@ -128,7 +151,7 @@ async function applyRoleSync(
     const assigned = await roleRepository.assignRoleNameToUser({
       userId,
       roleName,
-      grantedBy: userId,
+      grantedBy: SYSTEM_EXTERNAL_GRANTER,
     });
     if (!assigned) {
       authLogger.warn("Role map references a role that does not exist", {
@@ -185,21 +208,37 @@ async function freeUsername(
 async function createUser(
   identity: ExternalIdentity,
   deviceType: string,
+  options: { allowFirstUserAdmin: boolean } = { allowFirstUserAdmin: false },
 ): Promise<UserRecord> {
   const users = createCurrentUserRepository();
   const id = nanoid();
+  // Only grant admin from the IdP claim when:
+  //   - this is not the very first user on the deployment, or
+  //   - the operator has explicitly opted in via TERMIX_ALLOW_FIRST_SSO_ADMIN
+  // Without this, a misconfigured IdP admin-group mapping on a fresh install
+  // would hand the first login full control.
+  const isAdmin = !!identity.isAdmin && options.allowFirstUserAdmin;
+  if (identity.isAdmin && !options.allowFirstUserAdmin) {
+    authLogger.warn(
+      "First SSO user: admin claim ignored (TERMIX_ALLOW_FIRST_SSO_ADMIN not set)",
+      {
+        operation: "external_first_user_admin_blocked",
+        provider: identity.provider,
+      },
+    );
+  }
   const created = await users.createFirstSsoUser({
     id,
     username: await freeUsername(identity.name || identity.subject, null),
     passwordHash: "",
-    isAdmin: !!identity.isAdmin,
+    isAdmin,
   });
 
   try {
     const assigned = await createCurrentRoleRepository().assignRoleNameToUser({
       userId: id,
       roleName: created.user.isAdmin ? "admin" : "user",
-      grantedBy: id,
+      grantedBy: SYSTEM_EXTERNAL_GRANTER,
     });
     if (!assigned) {
       authLogger.warn("Default role not found for a provisioned user", {
@@ -288,7 +327,9 @@ export async function findOrProvisionExternalUser(
         );
       }
     }
-    user = await createUser(identity, deviceType);
+    user = await createUser(identity, deviceType, {
+      allowFirstUserAdmin: isFirstUser && firstSsoAdminAllowed(),
+    });
   } else {
     if (!isAllowed(identity)) {
       authLogger.warn("External user not in the allowed list", {

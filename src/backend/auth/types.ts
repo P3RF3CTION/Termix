@@ -36,4 +36,6 @@ export interface PendingLogin {
   rememberMe: boolean;
   externalSession?: ExternalSessionRef | null;
   createdAt: number;
+  /** Wrong second-factor attempts spent on this pending token. */
+  attempts?: number;
 }

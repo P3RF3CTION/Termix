@@ -196,8 +196,34 @@ app.use((req, res, next) => {
   coreUrlencodedParser(req, res, next);
 });
 app.use(cookieParser());
-app.use((_req, res, next) => {
+app.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
+  // Baseline security headers so deployments without a hardened reverse proxy
+  // still get clickjacking, content-sniffing and (over TLS) downgrade
+  // protection by default. Operators who prefer their proxy to set these can
+  // disable the defaults with TERMIX_DISABLE_DEFAULT_SECURITY_HEADERS=true.
+  if (
+    (process.env.TERMIX_DISABLE_DEFAULT_SECURITY_HEADERS ?? "")
+      .trim()
+      .toLowerCase() !== "true"
+  ) {
+    if (!res.getHeader("X-Content-Type-Options")) {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    }
+    if (!res.getHeader("X-Frame-Options")) {
+      res.setHeader("X-Frame-Options", "DENY");
+    }
+    if (!res.getHeader("Referrer-Policy")) {
+      res.setHeader("Referrer-Policy", "no-referrer");
+    }
+    const overTls = req.secure || req.headers["x-forwarded-proto"] === "https";
+    if (overTls && !res.getHeader("Strict-Transport-Security")) {
+      res.setHeader(
+        "Strict-Transport-Security",
+        "max-age=15552000; includeSubDomains",
+      );
+    }
+  }
   next();
 });
 app.use(syncChangeWatcher);

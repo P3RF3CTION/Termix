@@ -293,7 +293,8 @@ export function registerUserPasswordResetRoutes(
 
       loginRateLimiter.recordResetCodeAttempt(username);
 
-      const resetDataValue = await createCurrentSettingsRepository().get(
+      const settingsRepository = createCurrentSettingsRepository();
+      const resetDataValue = await settingsRepository.get(
         `reset_code_${username}`,
       );
       if (!resetDataValue) {
@@ -315,9 +316,7 @@ export function registerUserPasswordResetRoutes(
       const expiresAt = new Date(resetData.expiresAt);
 
       if (now > expiresAt) {
-        await createCurrentSettingsRepository().delete(
-          `reset_code_${username}`,
-        );
+        await settingsRepository.delete(`reset_code_${username}`);
         authLogger.warn("Reset code verification failed - code expired", {
           operation: "reset_code_verify_failed",
           username,
@@ -331,7 +330,50 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
+      // Hard cap on wrong tries per reset code: destroys the pending reset
+      // after RESET_CODE_PER_ENTRY_MAX_ATTEMPTS, so the attempt-per-minute
+      // throttle cannot be stretched across the 10-minute code lifetime.
+      const RESET_CODE_PER_ENTRY_MAX_ATTEMPTS = 5;
+      const attemptsSpent =
+        typeof resetData.attempts === "number" ? resetData.attempts : 0;
+      if (attemptsSpent >= RESET_CODE_PER_ENTRY_MAX_ATTEMPTS) {
+        await settingsRepository.delete(`reset_code_${username}`);
+        authLogger.warn(
+          "Reset code destroyed after too many wrong attempts on this entry",
+          {
+            operation: "reset_code_exhausted",
+            username,
+          },
+        );
+        return res.status(400).json({
+          error:
+            "Too many wrong attempts. Please request a new password reset.",
+          code: "RESET_CODE_EXHAUSTED",
+        });
+      }
+
       if (!safeEqualHex(resetData.codeHash, hashResetSecret(resetCode))) {
+        const nextAttempts = attemptsSpent + 1;
+        if (nextAttempts >= RESET_CODE_PER_ENTRY_MAX_ATTEMPTS) {
+          await settingsRepository.delete(`reset_code_${username}`);
+          authLogger.warn("Reset code destroyed on final wrong attempt", {
+            operation: "reset_code_exhausted",
+            username,
+          });
+          return res.status(400).json({
+            error:
+              "Too many wrong attempts. Please request a new password reset.",
+            code: "RESET_CODE_EXHAUSTED",
+          });
+        }
+        await settingsRepository.set(
+          `reset_code_${username}`,
+          JSON.stringify({
+            codeHash: resetData.codeHash,
+            expiresAt: resetData.expiresAt,
+            attempts: nextAttempts,
+          }),
+        );
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -352,7 +394,6 @@ export function registerUserPasswordResetRoutes(
 
       // The code is single-use: it is exchanged for the temporary token here
       // and must not be redeemable a second time.
-      const settingsRepository = createCurrentSettingsRepository();
       await settingsRepository.delete(`reset_code_${username}`);
       await settingsRepository.set(
         `temp_reset_token_${username}`,

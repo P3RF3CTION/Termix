@@ -21,20 +21,31 @@ const COLUMNS = [
  * RFC 4180 field escaping.
  *
  * The leading-character guard is not part of RFC 4180: a field starting with
- * `=`, `+`, `-` or `@` is treated as a formula by spreadsheet software, so an
- * audit entry containing an attacker-chosen resource name could execute on
- * open. Prefixing with a single quote neutralises that while keeping the value
- * readable.
+ * `=`, `+`, `-`, `@` (or `|` for DDE on some locales) is treated as a formula
+ * by spreadsheet software, so an audit entry containing an attacker-chosen
+ * resource name could execute on open. Leading whitespace, control characters
+ * and embedded CRs are stripped first so an attacker cannot slip past the
+ * check with " =cmd" or a NUL byte, then a single quote prefixes any
+ * remaining formula trigger.
  */
 export function escapeCsvField(value: unknown): string {
   if (value === null || value === undefined) return "";
 
   let text = typeof value === "boolean" ? String(value) : String(value);
-  if (/^[=+\-@\t\r]/.test(text)) {
+  // Drop NUL bytes outright, and strip embedded CRs so a row cannot be split
+  // in half when a consumer counts CRs as record separators.
+  text = text.replace(/\u0000/g, "").replace(/\r/g, "");
+  // Remove leading whitespace (spaces, tabs, zero-width) so " =cmd" and the
+  // like still get the formula-escape treatment on the next check.
+  text = text.replace(
+    new RegExp("^(?:\\s|\\u200B|\\u200C|\\u200D|\\uFEFF)+"),
+    "",
+  );
+  if (/^[=+\-@|\t]/.test(text)) {
     text = `'${text}`;
   }
 
-  if (/[",\n\r]/.test(text)) {
+  if (/[",\n]/.test(text)) {
     return `"${text.replace(/"/g, '""')}"`;
   }
   return text;
