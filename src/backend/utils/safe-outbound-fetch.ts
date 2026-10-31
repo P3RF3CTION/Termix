@@ -51,6 +51,10 @@ for (const [network, prefix] of blockedIpv4Ranges) {
   blockedAddresses.addSubnet(network, prefix, "ipv4");
   blockedAddresses.addSubnet(`::ffff:${network}`, prefix + 96, "ipv6");
 }
+// Limited broadcast; TCP will never target it in practice but the policy
+// should match RFC 6890 anyway.
+blockedAddresses.addAddress("255.255.255.255", "ipv4");
+blockedAddresses.addAddress("::ffff:255.255.255.255", "ipv6");
 
 for (const [network, prefix] of [
   ["::", 128],
@@ -58,6 +62,14 @@ for (const [network, prefix] of [
   ["fc00::", 7],
   ["fe80::", 10],
   ["ff00::", 8],
+  // IPv6 ranges that project IPv4 addresses into IPv6, letting an attacker
+  // reach loopback or RFC-1918 through a well-formed IPv6 literal unless
+  // these are explicitly blocked.
+  ["2002::", 16], // 6to4 (RFC 3056) — carries any embedded IPv4
+  ["2001::", 32], // Teredo (RFC 4380)
+  ["64:ff9b::", 96], // IPv4/IPv6 translation (RFC 6052)
+  ["64:ff9b:1::", 48], // Local-use IPv4/IPv6 translation (RFC 8215)
+  ["100::", 64], // Discard-only (RFC 6666)
 ] as const) {
   blockedAddresses.addSubnet(network, prefix, "ipv6");
 }
@@ -83,7 +95,11 @@ export function createDnsLookupHook(
     lookupOptions: LookupOptions,
     callback: LookupHookCallback,
   ): void {
-    const cleanHost = String(host ?? "").replace(/^[|]$/g, "");
+    // Strip the brackets undici keeps on an IPv6 literal; the original
+    // regex /^[|]$/g matched only the single character "|", which is a
+    // character-class typo. The sibling URL strip on line below uses the
+    // correct /^\[|\]$/g form.
+    const cleanHost = String(host ?? "").replace(/^\[|\]$/g, "");
     const lookupAll = lookupOptions.all === true;
 
     dnsLookup(

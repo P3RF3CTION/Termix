@@ -118,17 +118,20 @@ export function registerUserAdminRoutes(
         ? await createCurrentUserAuthRepository().listUserIdsWithSecondFactors()
         : new Set<string>();
 
+      // Admin-only columns stay admin-eyes-only; regular users hit this
+      // route to pick sharing targets and don't need to see which accounts
+      // are admins, which authenticate externally, or which have a password
+      // set — all three answers help an attacker prioritise targets.
+      const isAdmin = !!requester?.isAdmin;
       res.json({
         users: pageUsers.map((u) => ({
           userId: u.id,
           username: u.username,
-          is_admin: u.isAdmin,
-          is_external: isExternalAccount(u),
-          password_hash: u.passwordHash ? "set" : null,
-          // Management-only details stay admin-eyes-only; regular users hit
-          // this route to pick sharing targets.
-          ...(requester?.isAdmin
+          ...(isAdmin
             ? {
+                is_admin: u.isAdmin,
+                is_external: isExternalAccount(u),
+                password_hash: u.passwordHash ? "set" : null,
                 data_unlocked: DataCrypto.canUserAccessData(u.id),
                 second_factor_enabled: secondFactorUsers.has(u.id),
               }

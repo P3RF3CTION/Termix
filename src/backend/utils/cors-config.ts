@@ -36,7 +36,15 @@ export function isCorsOriginAllowed(
   if (process.env.ELECTRON_EMBEDDED === "true") {
     return configured.includes(origin) || origin === getRequestOrigin(req);
   }
-  if (configured.length === 0) return true;
+  // Previously an empty allowlist reflected ANY origin while the middleware
+  // ran with `credentials: true`, which turns the backend into an open CORS
+  // target: a victim admin visiting attacker.example could have the
+  // attacker's page read authenticated responses from Termix. Fail closed —
+  // when CORS_ALLOWED_ORIGINS is unset, only same-origin is allowed. Set the
+  // env var explicitly when you need cross-origin access.
+  if (configured.length === 0) {
+    return origin === getRequestOrigin(req);
+  }
   if (configured.includes(origin)) return true;
 
   return origin === getRequestOrigin(req);

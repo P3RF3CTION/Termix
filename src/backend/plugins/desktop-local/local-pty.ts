@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import type { PluginLocalPty } from "@termix-ssh/plugin-sdk/backend";
+import { baseEnvironment } from "../ctx-process.js";
 
 export function resolveLocalShell(
   platform: NodeJS.Platform,
@@ -115,7 +116,16 @@ export function spawnLocalPty(options?: {
       cols,
       rows,
       cwd: os.homedir(),
-      env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" },
+      // ctx.process.run already filters env through baseEnvironment() so the
+      // JWT secret / DB keys / OIDC secrets never reach a plugin-launched
+      // subprocess. The local PTY path forgot the same filter — a plugin
+      // with desktop_local_pty could `env` out the server's secrets. Apply
+      // the same allowlist here.
+      env: {
+        ...baseEnvironment(),
+        TERM: "xterm-256color",
+        COLORTERM: "truecolor",
+      },
     });
 
   let child: ReturnType<NodePty["spawn"]>;
