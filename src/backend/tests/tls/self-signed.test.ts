@@ -8,8 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const execSync = vi.hoisted(() => vi.fn());
-vi.mock("child_process", () => ({ execSync }));
+const execFileSync = vi.hoisted(() => vi.fn());
+vi.mock("child_process", () => ({ execFileSync }));
 vi.mock("../../utils/logger.js", () => {
   const log = {
     info: vi.fn(),
@@ -25,7 +25,7 @@ let dataDir: string;
 
 beforeEach(() => {
   vi.resetModules();
-  execSync.mockReset();
+  execFileSync.mockReset();
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "termix-ssl-"));
   process.env.DATA_DIR = dataDir;
   process.env.ENABLE_SSL = "true";
@@ -45,7 +45,7 @@ describe("AutoSSLSetup with custom paths", () => {
     const { AutoSSLSetup } = await import("../../tls/self-signed.js");
     await AutoSSLSetup.initialize();
 
-    expect(execSync).not.toHaveBeenCalled();
+    expect(execFileSync).not.toHaveBeenCalled();
     const env = fs.readFileSync(path.join(dataDir, ".env"), "utf8");
     expect(env).toContain(`SSL_CERT_PATH=${process.env.SSL_CERT_PATH}`);
     expect(env).toContain("SSL_DOMAIN=termix.example.com");

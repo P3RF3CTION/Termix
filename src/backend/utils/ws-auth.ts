@@ -21,7 +21,11 @@ export function isCookieOriginAllowed(req: IncomingMessage): boolean {
   } catch {
     return false;
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return true;
+  // The Electron renderer fetches assets from file://, and only that case
+  // is a non-http(s) Origin a browser would ever send. Anything else is a
+  // hand-crafted client trying to bypass the same-origin check.
+  if (parsed.protocol === "file:") return true;
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
   const hosts = [req.headers.host, req.headers["x-forwarded-host"]]
     .flatMap((value) => String(value ?? "").split(","))
     .map((value) => value.trim().toLowerCase())

@@ -23,6 +23,24 @@ function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
 }
 
+// Reset codes and temp tokens are kept in the settings table, which is
+// readable by any plugin and ends up in backups. Store a hash so a leak of
+// that table doesn't hand the attacker the plaintext secret.
+function hashSecret(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function normalizeUsernameKey(username: string): string {
+  return username.trim().toLowerCase();
+}
+
 export type PasswordResetOutcome =
   | { status: "reset"; dataWiped: false }
   | { status: "reset"; dataWiped: true }
@@ -184,9 +202,9 @@ export function registerUserPasswordResetRoutes(
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
       await createCurrentSettingsRepository().set(
-        `reset_code_${username}`,
+        `reset_code_${normalizeUsernameKey(username)}`,
         JSON.stringify({
-          code: resetCode,
+          codeHash: hashSecret(resetCode),
           expiresAt: expiresAt.toISOString(),
         }),
       );
@@ -260,9 +278,10 @@ export function registerUserPasswordResetRoutes(
       }
 
       loginRateLimiter.recordResetCodeAttempt(username);
+      const usernameKey = normalizeUsernameKey(username);
 
       const resetDataValue = await createCurrentSettingsRepository().get(
-        `reset_code_${username}`,
+        `reset_code_${usernameKey}`,
       );
       if (!resetDataValue) {
         authLogger.warn("Reset code verification failed - no code found", {
@@ -284,7 +303,7 @@ export function registerUserPasswordResetRoutes(
 
       if (now > expiresAt) {
         await createCurrentSettingsRepository().delete(
-          `reset_code_${username}`,
+          `reset_code_${usernameKey}`,
         );
         authLogger.warn("Reset code verification failed - code expired", {
           operation: "reset_code_verify_failed",
@@ -299,7 +318,16 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
-      if (resetData.code !== resetCode) {
+      // Support rows written before the hash-at-rest migration, then always
+      // use constant-time compare so a reset code can't be peeled off a byte
+      // at a time via response timing.
+      const storedHash =
+        typeof resetData.codeHash === "string"
+          ? resetData.codeHash
+          : typeof resetData.code === "string"
+            ? hashSecret(resetData.code)
+            : null;
+      if (!storedHash || !constantTimeEquals(storedHash, hashSecret(resetCode))) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,
@@ -319,9 +347,9 @@ export function registerUserPasswordResetRoutes(
       const tempTokenExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
       await createCurrentSettingsRepository().set(
-        `temp_reset_token_${username}`,
+        `temp_reset_token_${usernameKey}`,
         JSON.stringify({
-          token: tempToken,
+          tokenHash: hashSecret(tempToken),
           expiresAt: tempTokenExpiry.toISOString(),
         }),
       );
@@ -378,10 +406,26 @@ export function registerUserPasswordResetRoutes(
     }
 
     try {
-      const tempTokenValue = await createCurrentSettingsRepository().get(
-        `temp_reset_token_${username}`,
+      // The temp-token verify endpoint had no rate limit, so an attacker
+      // could burn unlimited guesses against the nanoid for 10 minutes.
+      // Reuse the reset-code limiter bucket so multiple paths of the reset
+      // flow share one lockout rather than being brute-forceable in series.
+      const lockStatus = loginRateLimiter.isResetCodeLocked(username);
+      if (lockStatus.locked) {
+        return res.status(429).json({
+          error: `Rate limited: Too many password-reset attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
+          remainingTime: lockStatus.remainingTime,
+          code: "RESET_CODE_RATE_LIMITED",
+        });
+      }
+
+      const usernameKey = normalizeUsernameKey(username);
+      const settingsRepository = createCurrentSettingsRepository();
+      const tempTokenValue = await settingsRepository.get(
+        `temp_reset_token_${usernameKey}`,
       );
       if (!tempTokenValue) {
+        loginRateLimiter.recordResetCodeAttempt(username);
         return res.status(400).json({ error: "No temporary token found" });
       }
 
@@ -390,15 +434,28 @@ export function registerUserPasswordResetRoutes(
       const expiresAt = new Date(tempTokenData.expiresAt);
 
       if (now > expiresAt) {
-        await createCurrentSettingsRepository().delete(
-          `temp_reset_token_${username}`,
-        );
+        await settingsRepository.delete(`temp_reset_token_${usernameKey}`);
         return res.status(400).json({ error: "Temporary token has expired" });
       }
 
-      if (tempTokenData.token !== tempToken) {
+      const storedTokenHash =
+        typeof tempTokenData.tokenHash === "string"
+          ? tempTokenData.tokenHash
+          : typeof tempTokenData.token === "string"
+            ? hashSecret(tempTokenData.token)
+            : null;
+      if (
+        !storedTokenHash ||
+        !constantTimeEquals(storedTokenHash, hashSecret(tempToken))
+      ) {
+        loginRateLimiter.recordResetCodeAttempt(username);
         return res.status(400).json({ error: "Invalid temporary token" });
       }
+
+      // Burn the token now so a duplicate `/complete-reset` can't ride a
+      // valid token twice (e.g. slow network retry) and so an error in
+      // password hashing below does not leave a usable token behind.
+      await settingsRepository.delete(`temp_reset_token_${usernameKey}`);
 
       const user = await createCurrentUserRepository().findByUsername(username);
       if (!user) {
@@ -423,9 +480,7 @@ export function registerUserPasswordResetRoutes(
 
       authLogger.success(`Password successfully reset for user: ${username}`);
 
-      const settingsRepository = createCurrentSettingsRepository();
-      await settingsRepository.delete(`reset_code_${username}`);
-      await settingsRepository.delete(`temp_reset_token_${username}`);
+      await settingsRepository.delete(`reset_code_${usernameKey}`);
 
       res.json({
         message: "Password has been successfully reset",

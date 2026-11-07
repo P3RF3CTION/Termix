@@ -4,6 +4,14 @@ interface LoginAttempt {
   lockedUntil?: number;
 }
 
+// Rate-limit buckets are keyed on the username. Case-insensitive DB
+// collations treat `admin`, `ADMIN` and `Admin ` as the same user, so
+// without normalization an attacker rotates casing to open a fresh bucket
+// per attempt and sail past the lockout. Normalize keys at every boundary.
+function normalizeUsername(username: string): string {
+  return username.trim().toLowerCase();
+}
+
 class LoginRateLimiter {
   private ipAttempts = new Map<string, LoginAttempt>();
   private usernameAttempts = new Map<string, LoginAttempt>();
@@ -76,6 +84,7 @@ class LoginRateLimiter {
 
   recordFailedAttempt(ip: string, username?: string): void {
     const now = Date.now();
+    const key = username ? normalizeUsername(username) : undefined;
 
     const ipAttempt = this.ipAttempts.get(ip);
     if (!ipAttempt) {
@@ -95,15 +104,15 @@ class LoginRateLimiter {
       }
     }
 
-    if (username) {
-      const userAttempt = this.usernameAttempts.get(username);
+    if (key) {
+      const userAttempt = this.usernameAttempts.get(key);
       if (!userAttempt) {
-        this.usernameAttempts.set(username, {
+        this.usernameAttempts.set(key, {
           count: 1,
           firstAttempt: now,
         });
       } else if (now - userAttempt.firstAttempt > this.WINDOW_MS) {
-        this.usernameAttempts.set(username, {
+        this.usernameAttempts.set(key, {
           count: 1,
           firstAttempt: now,
         });
@@ -119,7 +128,7 @@ class LoginRateLimiter {
   resetAttempts(ip: string, username?: string): void {
     this.ipAttempts.delete(ip);
     if (username) {
-      this.usernameAttempts.delete(username);
+      this.usernameAttempts.delete(normalizeUsername(username));
     }
   }
 
@@ -138,7 +147,7 @@ class LoginRateLimiter {
     }
 
     if (username) {
-      const userAttempt = this.usernameAttempts.get(username);
+      const userAttempt = this.usernameAttempts.get(normalizeUsername(username));
       if (userAttempt?.lockedUntil && userAttempt.lockedUntil > now) {
         return {
           locked: true,
@@ -161,7 +170,7 @@ class LoginRateLimiter {
     }
 
     if (username) {
-      const userAttempt = this.usernameAttempts.get(username);
+      const userAttempt = this.usernameAttempts.get(normalizeUsername(username));
       if (userAttempt && now - userAttempt.firstAttempt <= this.WINDOW_MS) {
         const userRemaining = Math.max(
           0,
@@ -227,15 +236,16 @@ class LoginRateLimiter {
 
   recordResetCodeAttempt(username: string): void {
     const now = Date.now();
+    const key = normalizeUsername(username);
 
-    const resetAttempt = this.resetCodeAttempts.get(username);
+    const resetAttempt = this.resetCodeAttempts.get(key);
     if (!resetAttempt) {
-      this.resetCodeAttempts.set(username, {
+      this.resetCodeAttempts.set(key, {
         count: 1,
         firstAttempt: now,
       });
     } else if (now - resetAttempt.firstAttempt > this.RESET_CODE_WINDOW_MS) {
-      this.resetCodeAttempts.set(username, {
+      this.resetCodeAttempts.set(key, {
         count: 1,
         firstAttempt: now,
       });
@@ -248,7 +258,7 @@ class LoginRateLimiter {
   }
 
   resetResetCodeAttempts(username: string): void {
-    this.resetCodeAttempts.delete(username);
+    this.resetCodeAttempts.delete(normalizeUsername(username));
   }
 
   isResetCodeLocked(username: string): {
@@ -257,7 +267,7 @@ class LoginRateLimiter {
   } {
     const now = Date.now();
 
-    const resetAttempt = this.resetCodeAttempts.get(username);
+    const resetAttempt = this.resetCodeAttempts.get(normalizeUsername(username));
     if (resetAttempt?.lockedUntil && resetAttempt.lockedUntil > now) {
       return {
         locked: true,
@@ -271,7 +281,7 @@ class LoginRateLimiter {
   getRemainingResetCodeAttempts(username: string): number {
     const now = Date.now();
 
-    const resetAttempt = this.resetCodeAttempts.get(username);
+    const resetAttempt = this.resetCodeAttempts.get(normalizeUsername(username));
     if (
       resetAttempt &&
       now - resetAttempt.firstAttempt <= this.RESET_CODE_WINDOW_MS

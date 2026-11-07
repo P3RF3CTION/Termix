@@ -53,15 +53,18 @@ function filterCiphers(list: CipherAlgorithm[]): CipherAlgorithm[] {
   });
 }
 
+// Opt-in legacy algorithms. hmac-md5 and ssh-dss are broken outright and
+// stay out of the opt-in set — the operator who needs them should patch
+// their SSH server, not negotiate them from Termix.
 const LEGACY_KEX: KexAlgorithm[] = [
   "diffie-hellman-group14-sha1",
   "diffie-hellman-group-exchange-sha1",
   "diffie-hellman-group1-sha1",
 ];
 
-const LEGACY_SERVER_HOST_KEY: ServerHostKeyAlgorithm[] = ["ssh-rsa", "ssh-dss"];
+const LEGACY_SERVER_HOST_KEY: ServerHostKeyAlgorithm[] = ["ssh-rsa"];
 
-const LEGACY_HMAC: MacAlgorithm[] = ["hmac-sha1", "hmac-md5"];
+const LEGACY_HMAC: MacAlgorithm[] = ["hmac-sha1"];
 
 const LEGACY_CIPHER = filterCiphers(["3des-cbc"]);
 

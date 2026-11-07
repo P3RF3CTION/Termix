@@ -744,6 +744,14 @@ describe("external identities", () => {
 });
 
 describe("redirect logins", () => {
+  // The returnTo must satisfy isSafeReturnTo. The test fakeRequest carries
+  // `X-Forwarded-Proto: https` + `X-Forwarded-Host: termix.example` so
+  // `getRequestOrigin()` matches the identity's returnTo and the redirect
+  // is allowed.
+  const redirectRequestHeaders = {
+    "x-forwarded-proto": "https",
+    "x-forwarded-host": "termix.example",
+  };
   const identity = {
     kind: "external" as const,
     provider: "3",
@@ -756,7 +764,7 @@ describe("redirect logins", () => {
   it("sets the cookie and redirects with success, carrying the SSO claims", async () => {
     const res = fakeResponse();
     await respondWithRedirectLogin(
-      fakeRequest() as never,
+      fakeRequest({ headers: redirectRequestHeaders }) as never,
       res as never,
       identity,
       { methodId: "oidc", rememberMe: false },
@@ -775,7 +783,7 @@ describe("redirect logins", () => {
   it("puts the token in the URL for app callbacks", async () => {
     const res = fakeResponse();
     await respondWithRedirectLogin(
-      fakeRequest() as never,
+      fakeRequest({ headers: redirectRequestHeaders }) as never,
       res as never,
       { ...identity, returnTo: "http://localhost:4567/oidc-callback" },
       { methodId: "oidc", rememberMe: false },
@@ -803,7 +811,7 @@ describe("redirect logins", () => {
     });
     const res = fakeResponse();
     await respondWithRedirectLogin(
-      fakeRequest() as never,
+      fakeRequest({ headers: redirectRequestHeaders }) as never,
       res as never,
       identity,
       { methodId: "oidc", rememberMe: false },
@@ -838,7 +846,7 @@ describe("redirect logins", () => {
     addUser({ id: "someone", username: "someone" });
     const res = fakeResponse();
     await respondWithRedirectLogin(
-      fakeRequest() as never,
+      fakeRequest({ headers: redirectRequestHeaders }) as never,
       res as never,
       identity,
       { methodId: "oidc", rememberMe: false },

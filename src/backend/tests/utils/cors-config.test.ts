@@ -15,6 +15,7 @@ function request(headers: Record<string, string> = {}): Request {
 afterEach(() => {
   delete process.env.CORS_ALLOWED_ORIGINS;
   delete process.env.ELECTRON_EMBEDDED;
+  delete process.env.TERMIX_CORS_ALLOW_ALL;
 });
 
 describe("isCorsOriginAllowed", () => {
@@ -30,7 +31,13 @@ describe("isCorsOriginAllowed", () => {
     expect(isCorsOriginAllowed(req, "https://termix.example")).toBe(true);
   });
 
-  it("allows any origin when no allowlist is configured (self-hosted default)", () => {
+  it("defaults to same-origin only when no allowlist is configured", () => {
+    const req = request({ host: "termix.example" });
+    expect(isCorsOriginAllowed(req, "https://anything.example")).toBe(false);
+  });
+
+  it("falls back to any-origin when the operator opts in via TERMIX_CORS_ALLOW_ALL", () => {
+    process.env.TERMIX_CORS_ALLOW_ALL = "true";
     const req = request({ host: "termix.example" });
     expect(isCorsOriginAllowed(req, "https://anything.example")).toBe(true);
   });
