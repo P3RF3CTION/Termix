@@ -109,7 +109,7 @@ export class AutoSSLSetup {
   private static async generateSSLCertificates(): Promise<void> {
     try {
       try {
-        execSync("openssl version", { stdio: "pipe" });
+        execFileSync("openssl", ["version"], { stdio: "pipe" });
       } catch {
         throw new Error(
           "OpenSSL is not installed or not available in PATH. Please install OpenSSL to enable SSL certificate generation.",
