@@ -31,6 +31,13 @@ jobs:
         with:
           node-version-file: ".nvmrc"
 
+      # SECURITY NOTE: this action was pinned to @main and runs with
+      # secrets.TERMIX_PAT and secrets.TERMIX_LLM_API_KEY. Anyone with push
+      # access to Termix-SSH/Termix-Registry main could ship replacement
+      # action code that steals or abuses those secrets on the next run.
+      # Pin to a specific commit SHA (and update it deliberately via
+      # Renovate/Dependabot) once a stable commit has been reviewed:
+      #   uses: Termix-SSH/Termix-Registry/translate@<40-char-sha>
       - name: Translate
         uses: Termix-SSH/Termix-Registry/translate@main
         with:

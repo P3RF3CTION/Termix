@@ -201,7 +201,17 @@ export function getConnectionPoolKey(
   const socks5Key = host.useSocks5
     ? `:socks5:${host.socks5Host}:${host.socks5Port}`
     : "";
-  return `${prefix}:${host.userId}:${host.ip}:${host.port}:${host.username}${socks5Key}`;
+  // Previously two distinct host records with the same user/ip/port/username
+  // tuple shared a pooled connection, so one host's auto-accepted TOFU key
+  // could carry a sibling record that pinned a different fingerprint. Key
+  // by host id and by the stored fingerprint when present, so a pooled
+  // connection cannot be handed back to a stricter record.
+  const hostKey =
+    typeof host.id === "number" && host.id > 0 ? `:host:${host.id}` : "";
+  const storedFp = host["hostKeyFingerprint"];
+  const fingerprintKey =
+    typeof storedFp === "string" && storedFp ? `:fp:${storedFp}` : "";
+  return `${prefix}:${host.userId}:${host.ip}:${host.port}:${host.username}${hostKey}${fingerprintKey}${socks5Key}`;
 }
 
 /**

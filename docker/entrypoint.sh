@@ -6,7 +6,16 @@ PGID=${PGID:-1000}
 
 if [ "$(id -u)" = "0" ]; then
     if [ "$PUID" = "0" ]; then
-        echo "Running as root (PUID=0, PGID=$PGID)"
+        # Running the container's backend as root means an RCE in the backend
+        # or in any plugin escalates straight to container root. Refuse the
+        # configuration by default; set TERMIX_ALLOW_ROOT=true if a specific
+        # deployment really needs it (and understands the risk).
+        if [ "${TERMIX_ALLOW_ROOT:-false}" != "true" ]; then
+            echo "ERROR: refusing to run as root. Set PUID/PGID to a non-root uid/gid" >&2
+            echo "       (or TERMIX_ALLOW_ROOT=true to override, which is unsupported)." >&2
+            exit 1
+        fi
+        echo "WARNING: running as root (PUID=0, PGID=$PGID); unsupported"
         chown -R root:root /app/data /app/uploads /tmp/nginx 2>/dev/null || true
     else
         echo "Setting up user permissions (PUID: $PUID, PGID: $PGID)..."

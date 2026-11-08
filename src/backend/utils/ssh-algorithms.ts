@@ -66,7 +66,15 @@ const LEGACY_SERVER_HOST_KEY: ServerHostKeyAlgorithm[] = ["ssh-rsa"];
 
 const LEGACY_HMAC: MacAlgorithm[] = ["hmac-sha1"];
 
-const LEGACY_CIPHER = filterCiphers(["3des-cbc"]);
+// CBC ciphers combine with non-ETM MACs to make the configuration broken by
+// the Terrapin-class attacks; keep them gated behind the legacy opt-in rather
+// than offering them in the modern default.
+const LEGACY_CIPHER = filterCiphers([
+  "aes256-cbc",
+  "aes192-cbc",
+  "aes128-cbc",
+  "3des-cbc",
+]);
 
 export function buildSSHAlgorithms(
   allowLegacy: boolean,
@@ -105,9 +113,6 @@ export function buildSSHAlgorithms(
     "aes256-ctr",
     "aes192-ctr",
     "aes128-ctr",
-    "aes256-cbc",
-    "aes192-cbc",
-    "aes128-cbc",
   ]);
 
   if (allowLegacy) {

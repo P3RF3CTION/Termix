@@ -31,6 +31,7 @@ import {
   pluginDocsUrl,
   pluginEnvVars,
   pluginFeatures,
+  pluginRepositoryUrl,
   youtubeVideoId,
   type PluginEnvVar,
 } from "../../plugins/manifest.js";
@@ -351,10 +352,10 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
           const rawAuthor = manifest?.author as { name?: unknown } | undefined;
           author =
             typeof rawAuthor?.name === "string" ? rawAuthor.name : undefined;
-          repository =
-            typeof manifest?.repository === "string"
-              ? manifest.repository
-              : undefined;
+          // Treat manifest.repository the same as manifest.docs: refuse
+          // non-http(s) schemes so a crafted "javascript:" link cannot run
+          // in the renderer when the user clicks the repo icon.
+          repository = pluginRepositoryUrl(manifest?.repository) ?? undefined;
           videoId = youtubeVideoId(manifest?.video) ?? undefined;
           features = pluginFeatures(manifest?.features);
           docs = pluginDocsUrl(manifest?.docs) ?? undefined;

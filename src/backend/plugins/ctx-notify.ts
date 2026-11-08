@@ -169,6 +169,39 @@ export function createPluginFetch(deps: Deps): PluginFetch {
       if (init.signal?.aborted) controller.abort();
       init.signal?.addEventListener("abort", onAbort, { once: true });
       try {
+        // Previously plugins could pass `rejectUnauthorized: false` and
+        // `allowPrivateHosts: []` straight through, which turned every
+        // `network:outbound` grant into a full MITM-tolerant SSRF primitive
+        // (reach cloud metadata, Kubernetes API, Redis on 127.0.0.1 …).
+        // Only honour either when the operator opted in through an env flag
+        // the plugin cannot forge, and continue to require a pinned CA bundle
+        // when a non-public CA is in play.
+        const allowPluginPrivateHosts =
+          (process.env.TERMIX_PLUGIN_ALLOW_PRIVATE_HOSTS || "")
+            .trim()
+            .toLowerCase() === "true";
+        const allowPluginInsecureTls =
+          (process.env.TERMIX_PLUGIN_ALLOW_INSECURE_TLS || "")
+            .trim()
+            .toLowerCase() === "true";
+        if (
+          !allowPluginInsecureTls &&
+          init.tls?.rejectUnauthorized === false
+        ) {
+          throw new Error(
+            "Plugins cannot disable TLS certificate verification. Supply a pinned CA via init.tls.ca, or set TERMIX_PLUGIN_ALLOW_INSECURE_TLS=true at your own risk.",
+          );
+        }
+        const effectivePrivateHosts = allowPluginPrivateHosts
+          ? (init.allowPrivateHosts ?? []).map((host) => host.toLowerCase())
+          : [];
+        if (!allowPluginPrivateHosts && (init.allowPrivateHosts ?? []).length) {
+          await deps.audit("fetch_private_denied", "outbound request", {
+            success: false,
+            errorMessage:
+              "Plugin requested private hosts but TERMIX_PLUGIN_ALLOW_PRIVATE_HOSTS is off.",
+          });
+        }
         return await safeOutboundFetch(
           url,
           {
@@ -178,10 +211,10 @@ export function createPluginFetch(deps: Deps): PluginFetch {
             body: init.body,
             signal: controller.signal,
           },
-          (init.allowPrivateHosts ?? []).map((host) => host.toLowerCase()),
+          effectivePrivateHosts,
           {
             ...(init.tls?.ca ? { ca: init.tls.ca } : {}),
-            ...(init.tls?.rejectUnauthorized === false
+            ...(allowPluginInsecureTls && init.tls?.rejectUnauthorized === false
               ? { rejectUnauthorized: false }
               : {}),
           },
