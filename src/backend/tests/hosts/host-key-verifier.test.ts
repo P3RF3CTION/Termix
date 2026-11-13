@@ -59,8 +59,11 @@ describe("quick connect host keys", () => {
     expect(await verifyUnsaved(no.socket)).toBe(false);
   });
 
-  it("still connects when there is no socket to ask on", async () => {
-    expect(await verifyUnsaved(null)).toBe(true);
+  it("refuses when there is no socket to confirm the key on", async () => {
+    // Quick-connect without a prompt channel cannot persist the key and
+    // cannot show it to the user, so trusting the first-seen key would open
+    // a permanent MITM window on every background connect. Refuse instead.
+    expect(await verifyUnsaved(null)).toBe(false);
   });
 });
 

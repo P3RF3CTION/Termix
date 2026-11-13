@@ -40,6 +40,9 @@ let relayUrl = "";
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  // The echo server stands in for the SSH host on loopback, which the relay
+  // refuses unless the operator opts in.
+  process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK = "true";
   registerSshRelay();
 
   echo = net.createServer((socket) => socket.pipe(socket));
@@ -65,6 +68,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
   wss.close();
   await new Promise((resolve) => relayServer.close(resolve));
   await new Promise((resolve) => echo.close(resolve));
@@ -147,6 +151,34 @@ describe("ssh relay", () => {
     const { closed } = await open("");
     expect((await closed).code).toBe(1008);
     expect(mocks.resolveHostById).not.toHaveBeenCalled();
+  });
+
+  it("refuses a loopback destination without the opt-in", async () => {
+    delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
+    mocks.openSshTransport.mockResolvedValue({ jumpClient: undefined });
+    const { closed } = await open("?hostId=5");
+    expect(await closed).toEqual({
+      code: 1008,
+      reason: "Destination not allowed",
+    });
+  });
+
+  it("leaves the address to the jump host when it made the stream", async () => {
+    delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
+    const channel = new PassThrough();
+    mocks.openSshTransport.mockImplementation(
+      async (_host: unknown, config: { sock?: unknown }) => {
+        config.sock = channel;
+        return { jumpClient: { end: vi.fn() } };
+      },
+    );
+    const { socket } = await open("?hostId=5");
+    const received = new Promise<string>((resolve) =>
+      socket.once("message", (data) => resolve(data.toString())),
+    );
+    socket.send("ping");
+    expect(await received).toBe("ping");
+    socket.close();
   });
 
   it("closes the socket when the host can't be reached", async () => {

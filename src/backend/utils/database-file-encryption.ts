@@ -283,9 +283,38 @@ class DatabaseFileEncryption {
           throw new Error("v1 encrypted file missing required salt field");
         }
         const salt = Buffer.from(metadata.salt, "hex");
-        const fixedSeed =
-          process.env.DB_FILE_KEY || "termix-database-file-encryption-seed-v1";
-        key = crypto.pbkdf2Sync(fixedSeed, salt, 100000, 32, "sha256");
+        // v1 historically fell back to a hardcoded KDF seed baked into the
+        // source. Anyone who copied database.sqlite.encrypted + its .meta
+        // file could decrypt it with public knowledge of that seed, so the
+        // "encrypted" file was effectively plaintext. Require operators to
+        // acknowledge this when decrypting legacy files: set DB_FILE_KEY to
+        // the public seed value if your install really was running without
+        // one, or (preferred) rotate to a real key out of band.
+        const envSeed = process.env.DB_FILE_KEY;
+        const legacyAck = (
+          process.env.TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED || ""
+        )
+          .trim()
+          .toLowerCase();
+        let seed: string;
+        if (envSeed) {
+          seed = envSeed;
+        } else if (legacyAck === "true") {
+          databaseLogger.error(
+            "Decrypting a v1 database with the public fallback seed. The on-disk file was NOT effectively encrypted at rest. Termix writes the file as v2 (SystemCrypto key) on its next save; remove TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED afterwards.",
+            undefined,
+            {
+              operation: "decrypt_legacy_v1_insecure_seed",
+              path: encryptedPath,
+            },
+          );
+          seed = "termix-database-file-encryption-seed-v1";
+        } else {
+          throw new Error(
+            "v1 encrypted database detected but DB_FILE_KEY is not set. Legacy installs that never set DB_FILE_KEY were effectively unencrypted. To decrypt it once with the public fallback seed, set TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED=true and leave DB_FILE_KEY unset (DB_FILE_KEY, when set, is used as the v1 seed); Termix writes the file as v2 on its next save.",
+          );
+        }
+        key = crypto.pbkdf2Sync(seed, salt, 100000, 32, "sha256");
       } else {
         throw new Error(`Unsupported encryption version: ${metadata.version}`);
       }

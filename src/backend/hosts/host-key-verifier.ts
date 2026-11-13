@@ -90,10 +90,14 @@ export class SSHHostKeyVerifier {
           }
 
           if (!hostId) {
-            sshLogger.info(
-              "Host key verification skipped (no hostId - quick connect)",
+            // Quick-connect with no socket to ask on and no record to compare
+            // against: refuse rather than silently accept any key the remote
+            // offers. A silent accept here hands the connection to whoever
+            // answers (#1397).
+            sshLogger.error(
+              "Host key verification refused (no hostId and no prompt channel)",
               {
-                operation: "host_key_skip",
+                operation: "host_key_quick_connect_no_ws",
                 ip,
                 port,
                 fingerprint,
@@ -101,7 +105,7 @@ export class SSHHostKeyVerifier {
                 userId,
               },
             );
-            verify(true);
+            verify(false);
             return;
           }
 
@@ -157,34 +161,29 @@ export class SSHHostKeyVerifier {
           }
 
           if (!host.hostKeyFingerprint) {
-            if (isJumpHost) {
-              await this.storeHostKey(hostId, fingerprint, keyType, algorithm);
-              sshLogger.info("Jump host key auto-accepted and stored", {
-                operation: "host_key_stored",
-                hostId,
-                ip,
-                port,
-                fingerprint,
-                keyType,
-                userId,
-                isJumpHost: true,
-              });
-              verify(true);
-              return;
-            }
-
             if (!ws) {
+              // Non-interactive first-contact. Previously we silently
+              // accepted and (for jump hosts) persisted the key, which
+              // defeats host-key verification: the status/sync/plugin
+              // paths run here, so an on-path attacker can impersonate the
+              // real host at add-time and the user never sees a prompt.
+              // Refuse until an interactive session (terminal) binds a
+              // trusted fingerprint.
               sshLogger.warn(
-                "No WebSocket available for host key verification prompt",
+                "First-contact SSH host-key verification refused (no prompt channel). " +
+                  "Open an interactive terminal to this host to confirm its fingerprint.",
                 {
-                  operation: "host_key_no_ws",
+                  operation: "host_key_first_contact_no_ws",
                   hostId,
                   ip,
                   port,
+                  fingerprint,
+                  keyType,
                   userId,
+                  isJumpHost,
                 },
               );
-              verify(true);
+              verify(false);
               return;
             }
 

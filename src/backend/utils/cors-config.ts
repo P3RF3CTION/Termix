@@ -36,10 +36,19 @@ export function isCorsOriginAllowed(
   if (process.env.ELECTRON_EMBEDDED === "true") {
     return configured.includes(origin) || origin === getRequestOrigin(req);
   }
-  if (configured.length === 0) return true;
   if (configured.includes(origin)) return true;
+  if (origin === getRequestOrigin(req)) return true;
 
-  return origin === getRequestOrigin(req);
+  // Historically no allowlist meant allow any origin, which combined with
+  // credentials:true lets any website a logged-in user visits read the API
+  // on their behalf. Default to same-origin only; an operator opts back
+  // into the old "open" mode via TERMIX_CORS_ALLOW_ALL=true when they
+  // understand the trade-off (e.g. a pure Bearer-token API, no cookies).
+  if (configured.length === 0 && process.env.TERMIX_CORS_ALLOW_ALL === "true") {
+    return true;
+  }
+
+  return false;
 }
 
 export function createCorsMiddleware(

@@ -494,6 +494,30 @@ export async function verifySecondFactorAndRespond(
     return res.status(401).json({ error: "Invalid temporary token" });
   }
 
+  // The pending record is held in-memory and lost on restart. The JWT still
+  // verifies for 10 minutes, so an attacker who captured a token issued
+  // under a stricter policy (short maxSessionSeconds, bound externalSession)
+  // could otherwise complete 2FA after a restart and inherit the lax defaults
+  // this function would fall back to. Fail closed instead.
+  if (!lookup.pending) {
+    authLogger.warn(
+      "Pending login record missing (likely process restart); refusing second-factor completion",
+      {
+        operation: "second_factor_pending_missing",
+        userId: lookup.userId,
+      },
+    );
+    consumePendingLogin(lookup.token);
+    res.clearCookie(
+      PENDING_LOGIN_COOKIE,
+      AuthManager.getInstance().getClearCookieOptions(req),
+    );
+    return res.status(401).json({
+      error: "Please sign in again",
+      code: "PENDING_LOGIN_EXPIRED",
+    });
+  }
+
   const user = await createCurrentUserRepository().findById(lookup.userId);
   if (!user) return res.status(404).json({ error: "User not found" });
 

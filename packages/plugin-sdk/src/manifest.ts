@@ -26,6 +26,7 @@ export {
   pluginDocsPage,
   pluginDocsUrl,
   pluginEnvVars,
+  pluginRepositoryUrl,
   type PluginEnvVar,
 } from "./docs.js";
 

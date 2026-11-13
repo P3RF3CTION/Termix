@@ -18,6 +18,23 @@ export function pluginDocsUrl(value: unknown): string | null {
   }
 }
 
+/**
+ * A repository link suitable for rendering as an <a href>. Must be https; a
+ * plugin manifest with a `javascript:` or `data:` scheme would otherwise run
+ * code when the user clicks the repository icon in the plugin detail panel.
+ */
+export function pluginRepositoryUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    if (!url.hostname) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 /** Joins a page and anchor onto a plugin's docs URL. */
 export function pluginDocsPage(
   base: string,
