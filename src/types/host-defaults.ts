@@ -232,10 +232,7 @@ export const CORE_HOST_DEFAULTS: readonly CoreHostDefault[] = [
     key: "allowLegacyAlgorithms",
     levels: ALL_LEVELS,
     builtin: true,
-    // SHA-1 and 3DES are only acceptable to opt into per host for legacy
-    // targets; the default negotiates modern algorithms only so a downgrade
-    // MITM cannot force group1-sha1/ssh-rsa-SHA1/hmac-sha1/3des-cbc.
-    normalize: (value) => toBoolean(value, false),
+    normalize: (value) => toBoolean(value, true),
   },
   {
     key: "agentForwarding",

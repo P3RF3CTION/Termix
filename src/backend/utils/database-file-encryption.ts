@@ -291,7 +291,9 @@ class DatabaseFileEncryption {
         // the public seed value if your install really was running without
         // one, or (preferred) rotate to a real key out of band.
         const envSeed = process.env.DB_FILE_KEY;
-        const legacyAck = (process.env.TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED || "")
+        const legacyAck = (
+          process.env.TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED || ""
+        )
           .trim()
           .toLowerCase();
         let seed: string;
@@ -299,7 +301,7 @@ class DatabaseFileEncryption {
           seed = envSeed;
         } else if (legacyAck === "true") {
           databaseLogger.error(
-            "Decrypting a v1 database with the public fallback seed. The on-disk file was NOT effectively encrypted at rest. Re-encrypt immediately: set DB_FILE_KEY to a secret value and restart to migrate to v2.",
+            "Decrypting a v1 database with the public fallback seed. The on-disk file was NOT effectively encrypted at rest. Termix writes the file as v2 (SystemCrypto key) on its next save; remove TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED afterwards.",
             undefined,
             {
               operation: "decrypt_legacy_v1_insecure_seed",
@@ -309,7 +311,7 @@ class DatabaseFileEncryption {
           seed = "termix-database-file-encryption-seed-v1";
         } else {
           throw new Error(
-            "v1 encrypted database detected but DB_FILE_KEY is not set. Legacy installs that never set DB_FILE_KEY were effectively unencrypted. To continue (and immediately re-encrypt to v2 with a real key), set TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED=true alongside the final DB_FILE_KEY.",
+            "v1 encrypted database detected but DB_FILE_KEY is not set. Legacy installs that never set DB_FILE_KEY were effectively unencrypted. To decrypt it once with the public fallback seed, set TERMIX_ALLOW_INSECURE_LEGACY_DB_SEED=true and leave DB_FILE_KEY unset (DB_FILE_KEY, when set, is used as the v1 seed); Termix writes the file as v2 on its next save.",
           );
         }
         key = crypto.pbkdf2Sync(seed, salt, 100000, 32, "sha256");

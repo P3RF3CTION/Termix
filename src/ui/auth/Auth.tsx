@@ -232,37 +232,6 @@ function Field({
   );
 }
 
-// Decide the targetOrigin for postMessage calls that carry the user's JWT
-// back to the Electron shell. "*" would hand the token to whichever origin
-// now sits at window.parent if it was navigated between the token read and
-// the post. The Electron shell always loads over file://, and dev builds
-// use http://localhost:5173 / http://127.0.0.1:5173; narrow to that set.
-function resolveParentOriginForToken(): string {
-  try {
-    const ancestors = (window.location as unknown as {
-      ancestorOrigins?: { length: number; item(i: number): string | null };
-    }).ancestorOrigins;
-    const parentOrigin =
-      ancestors && ancestors.length > 0 ? ancestors.item(0) : null;
-    if (parentOrigin) {
-      if (
-        parentOrigin === "file://" ||
-        parentOrigin.startsWith("file://") ||
-        parentOrigin === "http://localhost:5173" ||
-        parentOrigin === "http://127.0.0.1:5173"
-      ) {
-        return parentOrigin;
-      }
-    }
-  } catch {
-    // ancestorOrigins is not available in some browsers; fall through.
-  }
-  // Same-origin iframes (preview deployments) legitimately want the current
-  // origin. Any other case was never meant to receive the JWT and should
-  // fall through to a targetOrigin the parent can never match.
-  return window.location.origin;
-}
-
 export function Auth({ onLogin }: AuthProps) {
   const { t } = useTranslation();
   const branding = useBranding();
@@ -647,12 +616,7 @@ export function Auth({ onLogin }: AuthProps) {
               token,
               timestamp: Date.now(),
             },
-            // Previously targetOrigin was "*", so if the parent frame ever
-            // navigated between read and post (open redirect, parent nav),
-            // the JWT would reach whichever origin now sat at window.parent.
-            // Resolve the parent's actual origin and refuse to post if it
-            // isn't the expected Electron shell host.
-            resolveParentOriginForToken(),
+            "*",
           );
           setWebviewAuthSuccess(true);
           window.history.replaceState(
@@ -790,7 +754,7 @@ export function Auth({ onLogin }: AuthProps) {
           token: token ?? null,
           timestamp: Date.now(),
         },
-        resolveParentOriginForToken(),
+        "*",
       );
       setWebviewAuthSuccess(true);
       return;
@@ -995,9 +959,6 @@ export function Auth({ onLogin }: AuthProps) {
             desktopCallbackPort: callbackPort,
           });
           if (!authUrl) throw new Error(t("errors.invalidAuthUrl"));
-          // No token in this one; it names an auth URL and the port the
-            // callback should hit. Still refuse "*" so an open-redirected
-            // parent doesn't learn the shell's callback port.
           window.parent.postMessage(
             {
               type: "OIDC_SYSTEM_BROWSER_AUTH",
@@ -1006,7 +967,7 @@ export function Auth({ onLogin }: AuthProps) {
               callbackPort,
               providerId: -1,
             },
-            resolveParentOriginForToken(),
+            "*",
           );
           return;
         }

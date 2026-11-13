@@ -115,38 +115,22 @@ async function handleRelay(
       host: sshHost.ip,
       port: sshHost.port || 22,
     } as MutableConnectConfig;
-    // Refuse before dialing a jump chain if the ultimate target resolves to
-    // loopback or metadata; otherwise an authenticated user turns the relay
-    // into an SSRF primitive against the Termix host itself.
-    if (!(await isRelayDestinationAllowed(String(config.host)))) {
-      sshLogger.warn("Relay refused: destination is restricted", {
-        operation: "ssh_relay_blocked",
-        host: String(config.host),
-        hostId: syncId ? undefined : hostId,
-        syncId,
-        userId,
-      });
-      close(ws, 1008, "Destination not allowed");
-      finish();
-      return;
-    }
     const { jumpClient } = await openSshTransport(sshHost, config);
     jumpEnd = () => jumpClient?.end();
     stream = (config.sock as Duplex | undefined) ?? null;
     if (!stream) {
-      // Re-check after jump-host rewrites config.host; the chain could have
-      // rewritten the final address to something private.
+      // Only a direct dial leaves this process. Behind a jump host the
+      // address is resolved and reached by the jump host (127.0.0.1 there is
+      // the jump host itself, and the name may only resolve on its network),
+      // so the check belongs here and not before openSshTransport.
       if (!(await isRelayDestinationAllowed(String(config.host)))) {
-        sshLogger.warn(
-          "Relay refused after jump-host resolution: destination is restricted",
-          {
-            operation: "ssh_relay_blocked_post_jump",
-            host: String(config.host),
-            hostId: syncId ? undefined : hostId,
-            syncId,
-            userId,
-          },
-        );
+        sshLogger.warn("Relay refused: destination is restricted", {
+          operation: "ssh_relay_blocked",
+          host: String(config.host),
+          hostId: syncId ? undefined : hostId,
+          syncId,
+          userId,
+        });
         close(ws, 1008, "Destination not allowed");
         finish();
         return;

@@ -29,6 +29,7 @@ import {
   getCurrentSettingValue,
 } from "../database/repositories/factory.js";
 import { loginRateLimiter } from "./login-rate-limiter.js";
+import { getClientIp } from "./request-origin.js";
 
 interface AuthenticationResult {
   success: boolean;
@@ -810,9 +811,8 @@ class AuthManager {
     if (force === "false") return false;
     if (req.secure) return true;
     if (
-      (process.env.TERMIX_TRUST_FORWARDED_PROTO || "")
-        .trim()
-        .toLowerCase() === "true"
+      (process.env.TERMIX_TRUST_FORWARDED_PROTO || "").trim().toLowerCase() ===
+      "true"
     ) {
       return req.headers["x-forwarded-proto"] === "https";
     }
@@ -855,12 +855,10 @@ class AuthManager {
       });
       return;
     }
-    const clientIp =
-      (req.headers["x-forwarded-for"] as string | undefined)
-        ?.split(",")[0]
-        ?.trim() ||
-      req.socket?.remoteAddress ||
-      "unknown";
+    // Express resolves req.ip through its trust-proxy policy; reading the raw
+    // X-Forwarded-For header would let any client pick the bucket it is
+    // counted against (bypass, or lock out someone else's address).
+    const clientIp = getClientIp(req);
     // Reject early if this IP has already burned through its budget on
     // password or API-key attempts: bcrypt.compare is expensive, so an
     // unchecked prefix-match flood would saturate a worker.

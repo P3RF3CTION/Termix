@@ -387,9 +387,7 @@ export function registerUserPasswordResetRoutes(
 
       // Consume the one-time reset code: it has done its job, and leaving
       // it callable would widen the window if the temp token leaked.
-      await createCurrentSettingsRepository().delete(
-        `reset_code_${username}`,
-      );
+      await createCurrentSettingsRepository().delete(`reset_code_${username}`);
       await createCurrentSettingsRepository().set(
         `temp_reset_token_${username}`,
         JSON.stringify({

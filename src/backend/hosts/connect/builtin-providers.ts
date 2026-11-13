@@ -98,17 +98,8 @@ async function prepareKey(
   }
 
   if (passphrase) config.passphrase = passphrase;
-  // Historically ssh2 would also offer `password` auth if the key stage
-  // failed, which lets a MITM harvest the stored password even when the user
-  // picked key auth. Only make the password available when the host is
-  // explicitly configured to try password after key, or when the server
-  // forces keyboard-interactive and expects the password that way.
-  const allowPasswordFallback =
-    host["allowPasswordFallbackAfterKey"] === true ||
-    host.forceKeyboardInteractive === true;
-  if (host.password && allowPasswordFallback) {
-    config.password = host.password;
-  }
+  // Lets a server that wants key then password (or password only) still work.
+  if (host.password) config.password = host.password;
 
   const certPublicKey = host.certPublicKey;
   if (certPublicKey && certPublicKey.trim()) {
