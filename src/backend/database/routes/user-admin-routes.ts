@@ -27,6 +27,14 @@ function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
 }
 
+// Mirror of users.ts — the admin create path must enforce the same shape
+// so that filesystem-derived filenames (SQLite export, Content-Disposition)
+// can't escape via path separators or control characters.
+const VALID_USERNAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+function isValidNewUsername(val: unknown): val is string {
+  return typeof val === "string" && VALID_USERNAME_RE.test(val);
+}
+
 async function getUserByPreferredIdentifier(
   userRepository: UserRepository,
   userId: string | null,
@@ -459,6 +467,13 @@ export function registerUserAdminRoutes(
         .json({ error: "Username and password are required" });
     }
 
+    if (!isValidNewUsername(username)) {
+      return res.status(400).json({
+        error:
+          "Username may only contain letters, digits, dot, underscore, or dash, up to 64 characters.",
+      });
+    }
+
     try {
       const existing = await userRepository.findByUsername(username);
       if (existing) {
@@ -867,10 +882,17 @@ export function registerUserAdminRoutes(
         success: true,
       });
 
+      // Strip anything that could break the quoted filename or inject a
+      // second header parameter. Also offer a UTF-8 fallback so non-ASCII
+      // usernames still look right to clients that read filename*.
+      const rawUsername = targetUser.username ?? "user";
+      const asciiUsername =
+        rawUsername.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 64) || "user";
+      const encodedUsername = encodeURIComponent(rawUsername);
       res.setHeader("Content-Type", "application/json");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="termix-user-${targetUser.username}-export.json"`,
+        `attachment; filename="termix-user-${asciiUsername}-export.json"; filename*=UTF-8''termix-user-${encodedUsername}-export.json`,
       );
       res.json(exportData);
     } catch (err) {

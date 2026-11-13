@@ -1,5 +1,5 @@
 import { getErrorMessage } from "../utils/error-message.js";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
 import { systemLogger } from "../utils/logger.js";
@@ -109,7 +109,7 @@ export class AutoSSLSetup {
   private static async generateSSLCertificates(): Promise<void> {
     try {
       try {
-        execSync("openssl version", { stdio: "pipe" });
+        execFileSync("openssl", ["version"], { stdio: "pipe" });
       } catch {
         throw new Error(
           "OpenSSL is not installed or not available in PATH. Please install OpenSSL to enable SSL certificate generation.",
@@ -153,15 +153,30 @@ IP.3 = 0.0.0.0
 
       await fs.writeFile(configFile, opensslConfig);
 
-      execSync(`openssl genrsa -out "${this.KEY_FILE}" 2048`, {
+      // Use execFileSync + argv so a DATA_DIR containing shell metacharacters
+      // cannot inject commands into the certificate bootstrap at startup.
+      execFileSync("openssl", ["genrsa", "-out", this.KEY_FILE, "2048"], {
         stdio: "pipe",
       });
 
-      execSync(
-        `openssl req -new -x509 -key "${this.KEY_FILE}" -out "${this.CERT_FILE}" -days 365 -config "${configFile}" -extensions v3_req`,
-        {
-          stdio: "pipe",
-        },
+      execFileSync(
+        "openssl",
+        [
+          "req",
+          "-new",
+          "-x509",
+          "-key",
+          this.KEY_FILE,
+          "-out",
+          this.CERT_FILE,
+          "-days",
+          "365",
+          "-config",
+          configFile,
+          "-extensions",
+          "v3_req",
+        ],
+        { stdio: "pipe" },
       );
 
       await fs.chmod(this.KEY_FILE, 0o600);
@@ -187,30 +202,18 @@ IP.3 = 0.0.0.0
 
   private static async logCertificateInfo(): Promise<void> {
     try {
-      const subject = execSync(
-        `openssl x509 -in "${this.CERT_FILE}" -noout -subject`,
-        { stdio: "pipe" },
-      )
-        .toString()
-        .trim();
-      const issuer = execSync(
-        `openssl x509 -in "${this.CERT_FILE}" -noout -issuer`,
-        { stdio: "pipe" },
-      )
-        .toString()
-        .trim();
-      const notAfter = execSync(
-        `openssl x509 -in "${this.CERT_FILE}" -noout -enddate`,
-        { stdio: "pipe" },
-      )
-        .toString()
-        .trim();
-      const notBefore = execSync(
-        `openssl x509 -in "${this.CERT_FILE}" -noout -startdate`,
-        { stdio: "pipe" },
-      )
-        .toString()
-        .trim();
+      const readX509 = (flag: string): string =>
+        execFileSync(
+          "openssl",
+          ["x509", "-in", this.CERT_FILE, "-noout", flag],
+          { stdio: "pipe" },
+        )
+          .toString()
+          .trim();
+      const subject = readX509("-subject");
+      const issuer = readX509("-issuer");
+      const notAfter = readX509("-enddate");
+      const notBefore = readX509("-startdate");
 
       systemLogger.info("SSL Certificate Information:", {
         operation: "ssl_cert_info",

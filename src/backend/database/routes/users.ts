@@ -9,6 +9,7 @@ import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
 import { authLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
 import { parseUserAgent } from "../../utils/user-agent-parser.js";
 import { isDesktopAppOrigin } from "../../utils/cors-config.js";
@@ -81,6 +82,21 @@ router.use((req, res, next) => {
 function isNonEmptyString(val: unknown): val is string {
   return typeof val === "string" && val.trim().length > 0;
 }
+
+// Usernames end up in filesystem paths (e.g. the SQLite export temp file
+// uses `termix-export-${username}-...`) and in Content-Disposition
+// filenames. Without a character class an attacker could register
+// `x/../../../tmp/evil` and overwrite arbitrary writable paths. Keep the
+// class conservative; it still covers ascii, digits, dot, underscore and
+// dash and leaves room for existing accounts via the migration below.
+const VALID_USERNAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+function isValidNewUsername(val: unknown): val is string {
+  return typeof val === "string" && VALID_USERNAME_RE.test(val);
+}
+
+// Shared across /create and /change-password so a reset flow can't be used
+// to downgrade the user's password to one character.
+const MIN_PASSWORD_LEN = 8;
 
 function isRegistrationAllowed(): boolean {
   const envVal = process.env.ALLOW_REGISTRATION;
@@ -172,6 +188,24 @@ router.post("/create", async (req, res) => {
     return res
       .status(400)
       .json({ error: "Username and password are required" });
+  }
+
+  if (!isValidNewUsername(username)) {
+    authLogger.warn("Invalid user creation attempt - invalid username", {
+      operation: "user_create",
+      username,
+      reason: "invalid_username",
+    });
+    return res.status(400).json({
+      error:
+        "Username may only contain letters, digits, dot, underscore, or dash, up to 64 characters.",
+    });
+  }
+
+  if (password.length < MIN_PASSWORD_LEN) {
+    return res.status(400).json({
+      error: `Password must be at least ${MIN_PASSWORD_LEN} characters.`,
+    });
   }
 
   try {
@@ -1281,13 +1315,35 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Old and new passwords are required." });
   }
 
+  if (
+    typeof newPassword !== "string" ||
+    newPassword.length < MIN_PASSWORD_LEN
+  ) {
+    return res.status(400).json({
+      error: `New password must be at least ${MIN_PASSWORD_LEN} characters.`,
+    });
+  }
+
   const user = await findCurrentUser(userId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
 
+  // Reuse the login limiter's username bucket so this endpoint can't be
+  // ridden as an unthrottled bcrypt oracle by a stolen JWT. The lockout
+  // is case-insensitive via the limiter's own normalization.
+  const clientIp = (req.ip || req.socket?.remoteAddress || "0.0.0.0") as string;
+  const lockStatus = loginRateLimiter.isLocked(clientIp, user.username);
+  if (lockStatus.locked) {
+    return res.status(429).json({
+      error: `Rate limited: Too many password change attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
+      remainingTime: lockStatus.remainingTime,
+    });
+  }
+
   const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
   if (!isMatch) {
+    loginRateLimiter.recordFailedAttempt(clientIp, user.username);
     authLogger.warn("Password change failed - old password incorrect", {
       operation: "password_change_failed",
       userId,
@@ -1295,6 +1351,7 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     });
     return res.status(401).json({ error: "Incorrect current password" });
   }
+  loginRateLimiter.resetAttempts(clientIp, user.username);
 
   const success = await authManager.changeUserPassword(
     userId,
@@ -1379,13 +1436,16 @@ router.delete("/delete-user", authenticateJWT, async (req, res) => {
       return res.status(403).json({ error: "Not authorized" });
     }
 
-    if (adminUser.username === username) {
-      return res.status(400).json({ error: "Cannot delete your own account" });
-    }
-
     const targetUser = await userRepository.findByUsername(username);
     if (!targetUser) {
       return res.status(404).json({ error: "User not found" });
+    }
+
+    // Compare by id, not username string: a case-insensitive DB collation
+    // ("admin" vs "ADMIN") would otherwise let the admin pass this check
+    // and then self-delete through `findByUsername`.
+    if (targetUser.id === adminUser.id) {
+      return res.status(400).json({ error: "Cannot delete your own account" });
     }
 
     if (targetUser.isAdmin) {

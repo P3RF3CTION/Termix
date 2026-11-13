@@ -781,7 +781,14 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `termix-export-${user.username}-${timestamp}.sqlite`;
+    // Belt-and-braces: new accounts are constrained to a safe character
+    // class, but legacy rows may predate that validation. Strip every byte
+    // that could escape the temp directory or the Content-Disposition
+    // header quoting before we build the file name.
+    const safeUsernamePart =
+      (user.username ?? "").replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 64) ||
+      "user";
+    const filename = `termix-export-${safeUsernamePart}-${timestamp}.sqlite`;
     const tempPath = path.join(tempDir, filename);
 
     apiLogger.info("Creating export database", {
@@ -1053,8 +1060,15 @@ app.post("/database/export", authenticateJWT, async (req, res) => {
       exportDb.close();
     }
 
+    // The on-disk `filename` was already run through the safe-username
+    // sanitizer, but belt-and-braces: never let any wider filename string
+    // into the Content-Disposition header without the same guarantee.
+    const dispositionName = filename.replace(/[^A-Za-z0-9._-]+/g, "_");
     res.setHeader("Content-Type", "application/x-sqlite3");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${dispositionName}"`,
+    );
 
     const fileStream = fs.createReadStream(tempPath);
 

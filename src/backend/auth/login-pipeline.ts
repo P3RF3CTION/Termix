@@ -14,6 +14,7 @@ import type { Request, Response } from "express";
 import { AuthManager } from "../utils/auth-manager.js";
 import { loginRateLimiter } from "../utils/login-rate-limiter.js";
 import { authLogger } from "../utils/logger.js";
+import { getRequestOrigin } from "../utils/request-origin.js";
 import { parseUserAgent } from "../utils/user-agent-parser.js";
 import { logAudit, getRequestMeta } from "../utils/audit-logger.js";
 import {
@@ -645,6 +646,39 @@ export async function verifySecondFactorAndRespond(
  * came from, with a cookie, or with the token in the URL for the desktop and
  * mobile app callbacks that cannot read one.
  */
+// Defense-in-depth for the returnTo used by redirect logins. A plugin
+// `callback()` that trusts a client-supplied returnTo can walk the user to
+// `evil.com/?success=true`; worse, if the plugin's `isTokenCallback` is
+// permissive, the server would stamp the JWT into that URL. Only accept
+// returnTo values that match a known token-callback shape (desktop
+// loopback / mobile scheme) or that point at the same origin the user
+// already reached us on, plus an optional `TERMIX_REDIRECT_ALLOWED_ORIGINS`
+// list for setups where the OIDC callback and the UI live on different
+// hostnames.
+function isSafeReturnTo(
+  req: Request,
+  returnTo: string,
+  isTokenCallback: (url: string) => boolean,
+): boolean {
+  if (isTokenCallback(returnTo)) return true;
+  let parsed: URL;
+  try {
+    parsed = new URL(returnTo);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return false;
+  }
+  const requestOrigin = getRequestOrigin(req);
+  if (requestOrigin && parsed.origin === requestOrigin) return true;
+  const allowList = (process.env.TERMIX_REDIRECT_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return allowList.includes(parsed.origin);
+}
+
 export async function respondWithRedirectLogin(
   req: Request,
   res: Response,
@@ -655,6 +689,14 @@ export async function respondWithRedirectLogin(
   const returnTo = identity.returnTo;
   if (!returnTo) {
     res.status(500).json({ error: "Login method did not say where to return" });
+    return;
+  }
+  if (!isSafeReturnTo(req, returnTo, isTokenCallback)) {
+    authLogger.warn("Refusing redirect login with unsafe returnTo", {
+      operation: "redirect_login_unsafe_return_to",
+      returnTo,
+    });
+    res.status(400).json({ error: "Invalid return URL" });
     return;
   }
   const authManager = AuthManager.getInstance();

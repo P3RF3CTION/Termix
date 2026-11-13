@@ -90,12 +90,14 @@ export class SSHHostKeyVerifier {
           }
 
           if (!hostId) {
-            // Quick-connect with no socket to ask on and no record to compare
-            // against: refuse rather than silently accept any key the remote
-            // offers. A silent accept here hands the connection to whoever
-            // answers (#1397).
+            // Quick-connect with no socket to prompt on: there is nowhere to
+            // persist the fingerprint and no way to show it to the user, so
+            // the first key we see is trusted silently. That turns every
+            // background use of Quick Connect into a permanent MITM window.
+            // Refuse instead and tell the caller to open an interactive
+            // connection so the key can be confirmed.
             sshLogger.error(
-              "Host key verification refused (no hostId and no prompt channel)",
+              "Quick-connect host key refused: no WebSocket to confirm the key on",
               {
                 operation: "host_key_quick_connect_no_ws",
                 ip,
@@ -162,18 +164,18 @@ export class SSHHostKeyVerifier {
 
           if (!host.hostKeyFingerprint) {
             if (!ws) {
-              // Non-interactive first-contact. Previously we silently
-              // accepted and (for jump hosts) persisted the key, which
-              // defeats host-key verification: the status/sync/plugin
-              // paths run here, so an on-path attacker can impersonate the
-              // real host at add-time and the user never sees a prompt.
-              // Refuse until an interactive session (terminal) binds a
-              // trusted fingerprint.
+              // No channel to prompt on (background poller, SFTP, status
+              // check, tunnel, metrics, etc.). Strict TOFU: persist the
+              // first key we see so later connects anchor to it, and log
+              // loudly so a surprise rotation surfaces in the audit trail.
+              // Without the persist this branch would MITM every background
+              // connect to a never-touched host: the key was accepted but
+              // never stored, so !host.hostKeyFingerprint stayed true.
+              await this.storeHostKey(hostId, fingerprint, keyType, algorithm);
               sshLogger.warn(
-                "First-contact SSH host-key verification refused (no prompt channel). " +
-                  "Open an interactive terminal to this host to confirm its fingerprint.",
+                "No prompt channel — first-seen host key stored (strict TOFU). Verify it via an interactive terminal.",
                 {
-                  operation: "host_key_first_contact_no_ws",
+                  operation: "host_key_tofu_background",
                   hostId,
                   ip,
                   port,
@@ -183,7 +185,50 @@ export class SSHHostKeyVerifier {
                   isJumpHost,
                 },
               );
-              verify(false);
+              verify(true);
+              return;
+            }
+
+            if (isJumpHost) {
+              const accepted = await this.promptUserForNewKey(
+                ws,
+                ip,
+                port,
+                host.name || undefined,
+                fingerprint,
+                keyType,
+                algorithm,
+              );
+              if (accepted) {
+                await this.storeHostKey(
+                  hostId,
+                  fingerprint,
+                  keyType,
+                  algorithm,
+                );
+                sshLogger.info("Jump host key accepted by user and stored", {
+                  operation: "host_key_stored",
+                  hostId,
+                  ip,
+                  port,
+                  fingerprint,
+                  keyType,
+                  userId,
+                  isJumpHost: true,
+                });
+              } else {
+                sshLogger.warn("User rejected new jump host key", {
+                  operation: "host_key_rejected",
+                  hostId,
+                  ip,
+                  port,
+                  fingerprint,
+                  keyType,
+                  userId,
+                  isJumpHost: true,
+                });
+              }
+              verify(accepted);
               return;
             }
 

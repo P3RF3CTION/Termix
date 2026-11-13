@@ -243,11 +243,30 @@ describe("ctx.auth.completeRedirectLogin", () => {
     const res = fakeResponse();
     await auth.completeRedirectLogin(
       "corp-sso",
-      fakeRequest({ query: { code: "c", state: "s" } }),
+      // returnTo must be same-origin with the request (or allowlisted).
+      fakeRequest({
+        query: { code: "c", state: "s" },
+        headers: { host: "termix.example", "x-forwarded-proto": "https" },
+      }),
       res,
     );
     expect(res.redirectedTo).toBe("https://termix.example/?success=true");
     expect(res.cookies[0]).toMatchObject({ name: "jwt" });
+  });
+
+  it("refuses to return to an origin the request did not come from", async () => {
+    const { auth } = setup();
+    const res = fakeResponse();
+    await auth.completeRedirectLogin(
+      "corp-sso",
+      fakeRequest({
+        query: { code: "c", state: "s" },
+        headers: { host: "evil.example", "x-forwarded-proto": "https" },
+      }),
+      res,
+    );
+    expect(res.redirectedTo).toBeNull();
+    expect(res.statusCode).toBe(400);
   });
 
   it("refuses a method the plugin did not declare", async () => {

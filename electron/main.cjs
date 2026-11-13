@@ -491,12 +491,16 @@ if (process.platform === "win32" || process.env.ELECTRON_DISABLE_GPU === "1") {
 }
 
 if (isInsecureModeEnabled()) {
+  // The per-origin cert-error handler below already honours
+  // ENABLE_INSECURE_MODE for the user's linked endpoints via
+  // isInvalidCertificateAllowedForUrl. The Chromium-wide switches that
+  // used to live here disabled TLS validation globally — including the
+  // GitHub-releases fetch the auto-updater uses to pick an installer to
+  // download, which is a path we never want MITM-able. Leave the per-
+  // origin path and drop the global switches.
   logToFile(
-    "[security] ENABLE_INSECURE_MODE is enabled; TLS certificate validation is disabled.",
+    "[security] ENABLE_INSECURE_MODE is enabled; TLS validation is relaxed for linked origins only, not globally.",
   );
-  app.commandLine.appendSwitch("--ignore-certificate-errors");
-  app.commandLine.appendSwitch("--ignore-ssl-errors");
-  app.commandLine.appendSwitch("--ignore-certificate-errors-spki-list");
 }
 app.commandLine.appendSwitch("--enable-features=NetworkService");
 
@@ -682,7 +686,15 @@ function cleanupManagedTempFile(tempId) {
 // unbounded allowance would make that an indefinite window rather than a
 // momentary one. The renderer re-registers before each load, which refreshes
 // the expiry, so a live endpoint keeps working while a stale entry lapses.
-const WEB_ENDPOINT_CERTIFICATE_ALLOWLIST_TTL_MS = 5 * 60 * 1000;
+// Keep the window short: any script in the renderer (an XSS, a plugin UI)
+// can call this IPC for an arbitrary origin and then race a fetch to MITM
+// it, so the shorter the window the smaller the race. 30s covers the
+// register-then-load sequence the renderer uses in practice.
+const WEB_ENDPOINT_CERTIFICATE_ALLOWLIST_TTL_MS = 30 * 1000;
+// A single caller can't register more than this many origins at once, so a
+// bug that loops the IPC in the renderer can't bloat the map or widen the
+// attack surface to every public hostname.
+const WEB_ENDPOINT_CERTIFICATE_ALLOWLIST_MAX = 64;
 const webEndpointCertificateAllowlist = new Map();
 
 function isWebEndpointCertificateAllowed(url) {
@@ -704,6 +716,16 @@ function isWebEndpointCertificateAllowed(url) {
   }
 }
 
+// Drop entries whose TTL has lapsed. Called before adding a new origin so a
+// looping renderer can't push the live-entry count past the cap just by
+// outlasting old entries.
+function trimExpiredWebEndpointCertificateAllowlist() {
+  const now = Date.now();
+  for (const [existing, expiresAt] of webEndpointCertificateAllowlist) {
+    if (expiresAt <= now) webEndpointCertificateAllowlist.delete(existing);
+  }
+}
+
 ipcMain.handle("allow-invalid-certificate-for-origin", (_event, origin) => {
   try {
     // Store the PARSED origin, never the caller's string, so a path or a
@@ -711,6 +733,14 @@ ipcMain.handle("allow-invalid-certificate-for-origin", (_event, origin) => {
     const parsed = new URL(String(origin));
     if (parsed.protocol !== "https:") {
       return { success: false };
+    }
+    trimExpiredWebEndpointCertificateAllowlist();
+    if (
+      !webEndpointCertificateAllowlist.has(parsed.origin) &&
+      webEndpointCertificateAllowlist.size >=
+        WEB_ENDPOINT_CERTIFICATE_ALLOWLIST_MAX
+    ) {
+      return { success: false, error: "too_many_origins" };
     }
     webEndpointCertificateAllowlist.set(
       parsed.origin,

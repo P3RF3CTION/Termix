@@ -53,6 +53,10 @@ function filterCiphers(list: CipherAlgorithm[]): CipherAlgorithm[] {
   });
 }
 
+// Legacy algorithms, offered only while allowLegacyAlgorithms is on for the
+// host. ssh-dss and hmac-md5 stay in this set: the setting defaults to on, and
+// dropping them would cut off old appliances without a way back in Termix.
+// Turn legacy off per host, folder or globally (admin host default).
 const LEGACY_KEX: KexAlgorithm[] = [
   "diffie-hellman-group14-sha1",
   "diffie-hellman-group-exchange-sha1",

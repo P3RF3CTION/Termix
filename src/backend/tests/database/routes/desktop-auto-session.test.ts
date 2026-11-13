@@ -203,18 +203,34 @@ describe("resolveDesktopAutoSessionUser", () => {
 });
 
 describe("allowsDesktopAutoSession", () => {
-  it("allows the embedded desktop backend and a development backend", () => {
+  it("allows the embedded desktop backend regardless of other env", () => {
     expect(
       allowsDesktopAutoSession({
         ELECTRON_EMBEDDED: "true",
         NODE_ENV: "production",
       }),
     ).toBe(true);
-    expect(allowsDesktopAutoSession({ NODE_ENV: "development" })).toBe(true);
-    expect(allowsDesktopAutoSession({})).toBe(true);
+  });
+
+  it("requires an explicit opt-in on a non-production backend", () => {
+    expect(
+      allowsDesktopAutoSession({
+        NODE_ENV: "development",
+        ALLOW_DESKTOP_AUTO_SESSION: "true",
+      }),
+    ).toBe(true);
+    // Without the opt-in a bare `node` run must not expose the backdoor.
+    expect(allowsDesktopAutoSession({ NODE_ENV: "development" })).toBe(false);
+    expect(allowsDesktopAutoSession({})).toBe(false);
   });
 
   it("never allows it on a production server", () => {
     expect(allowsDesktopAutoSession({ NODE_ENV: "production" })).toBe(false);
+    expect(
+      allowsDesktopAutoSession({
+        NODE_ENV: "production",
+        ALLOW_DESKTOP_AUTO_SESSION: "true",
+      }),
+    ).toBe(false);
   });
 });
