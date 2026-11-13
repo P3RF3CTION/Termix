@@ -30,6 +30,15 @@ type ExternalIdentity = Extract<VerifiedIdentity, { kind: "external" }>;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * grantedBy for a role grant that came from an identity provider's group map,
+ * not from an administrator. The user_roles.granted_by column is nullable with
+ * ON DELETE SET NULL, so `null` keeps the FK honest while still letting audit
+ * queries like "who granted admin to user X" tell self-grants from
+ * provider-synced grants apart.
+ */
+const SYSTEM_EXTERNAL_GRANTER: string | null = null;
+
 /** The admin setting that turns external auto-provisioning on. */
 export const EXTERNAL_AUTO_PROVISION_KEY = "external_auto_provision";
 
@@ -92,7 +101,7 @@ async function syncAdmin(
       userId: user.id,
       addRoleName: isAdmin ? "admin" : "user",
       removeRoleName: isAdmin ? "user" : "admin",
-      grantedBy: user.id,
+      grantedBy: SYSTEM_EXTERNAL_GRANTER,
     });
   } catch {
     // Roles follow on the next sign-in; the admin flag itself is saved.
@@ -128,7 +137,7 @@ async function applyRoleSync(
     const assigned = await roleRepository.assignRoleNameToUser({
       userId,
       roleName,
-      grantedBy: userId,
+      grantedBy: SYSTEM_EXTERNAL_GRANTER,
     });
     if (!assigned) {
       authLogger.warn("Role map references a role that does not exist", {
@@ -199,7 +208,7 @@ async function createUser(
     const assigned = await createCurrentRoleRepository().assignRoleNameToUser({
       userId: id,
       roleName: created.user.isAdmin ? "admin" : "user",
-      grantedBy: id,
+      grantedBy: SYSTEM_EXTERNAL_GRANTER,
     });
     if (!assigned) {
       authLogger.warn("Default role not found for a provisioned user", {

@@ -1119,22 +1119,41 @@ class AuthManager {
       return true;
     }
 
+    const { ipAddress, userAgent } = getRequestMeta(req);
+    try {
+      await logAudit({
+        userId: adminUserId,
+        username: admin.username,
+        action: "admin_impersonated_request",
+        resourceType: "user",
+        resourceId: targetUserId,
+        resourceName: target.username,
+        details: JSON.stringify({ method: req.method, path }),
+        ipAddress,
+        userAgent,
+        success: true,
+      });
+    } catch (error) {
+      databaseLogger.error(
+        "Failed to record admin impersonation audit — denying",
+        error,
+        {
+          operation: "admin_impersonation_audit_failed",
+          userId: adminUserId,
+          targetUserId,
+          path,
+        },
+      );
+      res.status(503).json({
+        error:
+          "Admin impersonation unavailable: audit log could not be recorded",
+        code: "IMPERSONATION_AUDIT_FAILED",
+      });
+      return true;
+    }
+
     req.userId = targetUserId;
     req.actingAdminUserId = adminUserId;
-
-    const { ipAddress, userAgent } = getRequestMeta(req);
-    void logAudit({
-      userId: adminUserId,
-      username: admin.username,
-      action: "admin_impersonated_request",
-      resourceType: "user",
-      resourceId: targetUserId,
-      resourceName: target.username,
-      details: JSON.stringify({ method: req.method, path }),
-      ipAddress,
-      userAgent,
-      success: true,
-    });
 
     return false;
   }

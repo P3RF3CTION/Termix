@@ -1329,21 +1329,21 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     return res.status(404).json({ error: "User not found" });
   }
 
-  // Reuse the login limiter's username bucket so this endpoint can't be
-  // ridden as an unthrottled bcrypt oracle by a stolen JWT. The lockout
-  // is case-insensitive via the limiter's own normalization.
-  const clientIp = (req.ip || req.socket?.remoteAddress || "0.0.0.0") as string;
-  const lockStatus = loginRateLimiter.isLocked(clientIp, user.username);
-  if (lockStatus.locked) {
+  // Same oracle as delete-account: limit wrong current passwords per
+  // (account, IP) so an attacker on one IP cannot lock out the real owner.
+  const changeIp = req.ip || req.socket?.remoteAddress || "unknown";
+  const changeKey = `change-password:${userId}:${changeIp}`;
+  const changeLock = loginRateLimiter.isLocked(changeKey);
+  if (changeLock.locked) {
     return res.status(429).json({
-      error: `Rate limited: Too many password change attempts. Please wait ${lockStatus.remainingTime} seconds before trying again.`,
-      remainingTime: lockStatus.remainingTime,
+      error: `Rate limited: Too many password change attempts. Please wait ${changeLock.remainingTime} seconds before trying again.`,
+      remainingTime: changeLock.remainingTime,
     });
   }
 
   const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
   if (!isMatch) {
-    loginRateLimiter.recordFailedAttempt(clientIp, user.username);
+    loginRateLimiter.recordFailedAttempt(changeKey);
     authLogger.warn("Password change failed - old password incorrect", {
       operation: "password_change_failed",
       userId,
@@ -1351,7 +1351,7 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
     });
     return res.status(401).json({ error: "Incorrect current password" });
   }
-  loginRateLimiter.resetAttempts(clientIp, user.username);
+  loginRateLimiter.resetAttempts(changeKey);
 
   const success = await authManager.changeUserPassword(
     userId,

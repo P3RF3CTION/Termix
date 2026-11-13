@@ -2,6 +2,7 @@ import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { RequestHandler, Router } from "express";
 import bcrypt from "bcryptjs";
 import { authLogger } from "../../utils/logger.js";
+import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
 import { createCurrentUserRepository } from "../repositories/factory.js";
 import { deleteUserAndRelatedData } from "./delete-user-data.js";
 
@@ -68,13 +69,29 @@ export function registerUserDeleteAccountRoutes(
         });
       }
 
+      // The password check is an oracle for whoever holds a session (stolen
+      // cookie, unattended browser): limit per (account, IP) so it cannot be
+      // brute-forced, and an attacker on one IP cannot lock out the real
+      // owner coming from another IP.
+      const deleteIp = req.ip || req.socket?.remoteAddress || "unknown";
+      const deleteKey = `delete-account:${userId}:${deleteIp}`;
+      const deleteLock = loginRateLimiter.isLocked(deleteKey);
+      if (deleteLock.locked) {
+        return res.status(429).json({
+          error: "Too many attempts. Try again later.",
+          remainingTime: deleteLock.remainingTime,
+        });
+      }
+
       const isMatch = await bcrypt.compare(password, userRecord.passwordHash);
       if (!isMatch) {
+        loginRateLimiter.recordFailedAttempt(deleteKey);
         authLogger.warn(
           `Incorrect password provided for account deletion: ${userRecord.username}`,
         );
         return res.status(401).json({ error: "Incorrect password" });
       }
+      loginRateLimiter.resetAttempts(deleteKey);
 
       if (userRecord.isAdmin && (await userRepository.countAdmins()) <= 1) {
         return res
