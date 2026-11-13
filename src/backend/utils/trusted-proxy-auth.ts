@@ -1,5 +1,6 @@
 import type { IncomingHttpHeaders } from "node:http";
 import { BlockList, isIP } from "node:net";
+import { timingSafeEqual } from "node:crypto";
 
 export interface TrustedProxyAuthConfig {
   enabled: boolean;
@@ -7,6 +8,18 @@ export interface TrustedProxyAuthConfig {
   roleHeader: string;
   trustedProxies: string[];
   roleMap: Map<string, string[]>;
+}
+
+/**
+ * Shared secret the bundled nginx sends in X-Termix-Proxy-Secret. When set,
+ * only a request that presents the matching secret has its
+ * X-Termix-Proxy-Peer honoured over the socket address. Set this to a random
+ * value (and inject it in your nginx config as a static header) in any
+ * deployment where other local processes might reach loopback.
+ */
+function getTrustedProxyPeerSecret(): string | undefined {
+  const raw = (process.env.TERMIX_TRUSTED_PROXY_PEER_SECRET || "").trim();
+  return raw ? raw : undefined;
 }
 
 function enabled(value: string | undefined): boolean {
@@ -120,6 +133,13 @@ function isLoopbackAddress(address: string): boolean {
  * overwriting whatever the client sent, so behind it the proxy that counts
  * is that peer rather than nginx. Any other connection is judged by its
  * socket address.
+ *
+ * Loopback alone is not a trust boundary: on multi-tenant hosts, in Docker
+ * host-network mode, and inside containers that share a network namespace,
+ * other local processes also reach us from loopback. When
+ * TERMIX_TRUSTED_PROXY_PEER_SECRET is set, X-Termix-Proxy-Peer is only
+ * honoured for requests that also present the matching
+ * X-Termix-Proxy-Secret header (constant-time compared).
  */
 export function getTrustedProxySourceAddress(req: {
   headers: IncomingHttpHeaders;
@@ -127,11 +147,23 @@ export function getTrustedProxySourceAddress(req: {
 }): string | undefined {
   const socketAddress = req.socket.remoteAddress;
   const peer = req.headers["x-termix-proxy-peer"];
-  return socketAddress &&
+  const presentedSecret = req.headers["x-termix-proxy-secret"];
+  const expectedSecret = getTrustedProxyPeerSecret();
+
+  const peerHeaderValid =
+    socketAddress &&
     isLoopbackAddress(socketAddress) &&
-    typeof peer === "string"
-    ? peer
-    : socketAddress;
+    typeof peer === "string" &&
+    (expectedSecret === undefined
+      ? true
+      : typeof presentedSecret === "string" &&
+        presentedSecret.length === expectedSecret.length &&
+        timingSafeEqual(
+          Buffer.from(presentedSecret),
+          Buffer.from(expectedSecret),
+        ));
+
+  return peerHeaderValid ? peer : socketAddress;
 }
 
 export function resolveTrustedProxyRoles(

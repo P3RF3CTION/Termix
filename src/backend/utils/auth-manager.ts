@@ -28,6 +28,8 @@ import {
   createCurrentTrustedDeviceRepository,
   getCurrentSettingValue,
 } from "../database/repositories/factory.js";
+import { loginRateLimiter } from "./login-rate-limiter.js";
+import { getClientIp } from "./request-origin.js";
 
 interface AuthenticationResult {
   success: boolean;
@@ -792,13 +794,38 @@ class AuthManager {
     }
   }
 
+  /**
+   * `X-Forwarded-Proto` from the request cannot be trusted on its own: any
+   * client can set the header. Honour the operator's explicit configuration
+   * first, fall back to `req.secure` for direct-TLS deployments, and only
+   * then look at the forwarded-proto header. Set
+   * TERMIX_FORCE_SECURE_COOKIE=true in production, or
+   * TERMIX_TRUST_FORWARDED_PROTO=true when a trusted proxy is validated to
+   * add the header.
+   */
+  private resolveSecureFlag(req: RequestWithHeaders): boolean {
+    const force = (process.env.TERMIX_FORCE_SECURE_COOKIE || "")
+      .trim()
+      .toLowerCase();
+    if (force === "true") return true;
+    if (force === "false") return false;
+    if (req.secure) return true;
+    if (
+      (process.env.TERMIX_TRUST_FORWARDED_PROTO || "").trim().toLowerCase() ===
+      "true"
+    ) {
+      return req.headers["x-forwarded-proto"] === "https";
+    }
+    return false;
+  }
+
   getSecureCookieOptions(
     req: RequestWithHeaders,
     maxAge: number = 24 * 60 * 60 * 1000,
   ) {
     return {
       httpOnly: true,
-      secure: req.secure || req.headers["x-forwarded-proto"] === "https",
+      secure: this.resolveSecureFlag(req),
       sameSite: "lax" as const,
       maxAge: maxAge,
       path: "/",
@@ -808,7 +835,7 @@ class AuthManager {
   getClearCookieOptions(req: RequestWithHeaders) {
     return {
       httpOnly: true,
-      secure: req.secure || req.headers["x-forwarded-proto"] === "https",
+      secure: this.resolveSecureFlag(req),
       sameSite: "lax" as const,
       path: "/",
     };
@@ -828,6 +855,21 @@ class AuthManager {
       });
       return;
     }
+    // Express resolves req.ip through its trust-proxy policy; reading the raw
+    // X-Forwarded-For header would let any client pick the bucket it is
+    // counted against (bypass, or lock out someone else's address).
+    const clientIp = getClientIp(req);
+    // Reject early if this IP has already burned through its budget on
+    // password or API-key attempts: bcrypt.compare is expensive, so an
+    // unchecked prefix-match flood would saturate a worker.
+    const ipLock = loginRateLimiter.isLocked(clientIp);
+    if (ipLock.locked) {
+      res.status(429).json({
+        error: `Rate limited: too many authentication failures. Please wait ${ipLock.remainingTime} seconds before trying again.`,
+        remainingTime: ipLock.remainingTime,
+      });
+      return;
+    }
     try {
       const tokenPrefix = token.substring(0, 12);
       const apiKeyRepository = createCurrentApiKeyRepository();
@@ -836,6 +878,7 @@ class AuthManager {
         await apiKeyRepository.listActiveByTokenPrefix(tokenPrefix);
 
       if (candidates.length === 0) {
+        loginRateLimiter.recordFailedAttempt(clientIp);
         res.status(401).json({ error: "Invalid API key" });
         return;
       }
@@ -849,6 +892,7 @@ class AuthManager {
       }
 
       if (!matchedKey) {
+        loginRateLimiter.recordFailedAttempt(clientIp);
         res.status(401).json({ error: "Invalid API key" });
         return;
       }

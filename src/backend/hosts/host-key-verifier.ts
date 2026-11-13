@@ -206,19 +206,16 @@ export class SSHHostKeyVerifier {
                   keyType,
                   algorithm,
                 );
-                sshLogger.info(
-                  "Jump host key accepted by user and stored",
-                  {
-                    operation: "host_key_stored",
-                    hostId,
-                    ip,
-                    port,
-                    fingerprint,
-                    keyType,
-                    userId,
-                    isJumpHost: true,
-                  },
-                );
+                sshLogger.info("Jump host key accepted by user and stored", {
+                  operation: "host_key_stored",
+                  hostId,
+                  ip,
+                  port,
+                  fingerprint,
+                  keyType,
+                  userId,
+                  isJumpHost: true,
+                });
               } else {
                 sshLogger.warn("User rejected new jump host key", {
                   operation: "host_key_rejected",

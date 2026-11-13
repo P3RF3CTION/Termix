@@ -752,16 +752,22 @@ describe("connectHost", () => {
     dispose();
   });
 
-  it("pools under the old key shape", async () => {
+  it("segments the pool by host id and stored fingerprint", async () => {
     expect(getConnectionPoolKey("fleet", host())).toBe(
-      "fleet:owner-1:10.0.0.7:22:root",
+      "fleet:owner-1:10.0.0.7:22:root:host:7",
     );
     expect(
       getConnectionPoolKey(
         "stats",
         host({ useSocks5: true, socks5Host: "p", socks5Port: 1 }),
       ),
-    ).toBe("stats:owner-1:10.0.0.7:22:root:socks5:p:1");
+    ).toBe("stats:owner-1:10.0.0.7:22:root:host:7:socks5:p:1");
+    expect(
+      getConnectionPoolKey(
+        "fleet",
+        host({ hostKeyFingerprint: "abcdef" } as never),
+      ),
+    ).toBe("fleet:owner-1:10.0.0.7:22:root:host:7:fp:abcdef");
 
     const result = await withHostConnection(
       "fleet:x",

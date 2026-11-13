@@ -21,6 +21,7 @@ export {
   pluginFeatures,
   pluginDocsUrl,
   pluginEnvVars,
+  pluginRepositoryUrl,
   validateThemeCss,
 } from "@termix-ssh/plugin-sdk/manifest";
 

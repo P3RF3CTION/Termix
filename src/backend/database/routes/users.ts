@@ -1315,7 +1315,10 @@ router.post("/change-password", authenticateJWT, async (req, res) => {
       .json({ error: "Old and new passwords are required." });
   }
 
-  if (typeof newPassword !== "string" || newPassword.length < MIN_PASSWORD_LEN) {
+  if (
+    typeof newPassword !== "string" ||
+    newPassword.length < MIN_PASSWORD_LEN
+  ) {
     return res.status(400).json({
       error: `New password must be at least ${MIN_PASSWORD_LEN} characters.`,
     });

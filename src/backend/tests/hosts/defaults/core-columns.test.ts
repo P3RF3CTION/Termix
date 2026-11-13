@@ -11,7 +11,7 @@ describe("core defaults in column form", () => {
     };
     expect(readCoreDefault("keepaliveInterval", row)).toBe(30);
     expect(readCoreDefault("keepaliveCountMax", row)).toBe(5);
-    expect(readCoreDefault("allowLegacyAlgorithms", row)).toBe(false);
+    expect(readCoreDefault("allowLegacyAlgorithms", row)).toBe(true);
   });
 
   it("writes one SSH option and keeps the others", () => {

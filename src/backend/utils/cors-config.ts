@@ -44,10 +44,7 @@ export function isCorsOriginAllowed(
   // on their behalf. Default to same-origin only; an operator opts back
   // into the old "open" mode via TERMIX_CORS_ALLOW_ALL=true when they
   // understand the trade-off (e.g. a pure Bearer-token API, no cookies).
-  if (
-    configured.length === 0 &&
-    process.env.TERMIX_CORS_ALLOW_ALL === "true"
-  ) {
+  if (configured.length === 0 && process.env.TERMIX_CORS_ALLOW_ALL === "true") {
     return true;
   }
 

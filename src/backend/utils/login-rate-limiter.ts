@@ -147,7 +147,9 @@ class LoginRateLimiter {
     }
 
     if (username) {
-      const userAttempt = this.usernameAttempts.get(normalizeUsername(username));
+      const userAttempt = this.usernameAttempts.get(
+        normalizeUsername(username),
+      );
       if (userAttempt?.lockedUntil && userAttempt.lockedUntil > now) {
         return {
           locked: true,
@@ -170,7 +172,9 @@ class LoginRateLimiter {
     }
 
     if (username) {
-      const userAttempt = this.usernameAttempts.get(normalizeUsername(username));
+      const userAttempt = this.usernameAttempts.get(
+        normalizeUsername(username),
+      );
       if (userAttempt && now - userAttempt.firstAttempt <= this.WINDOW_MS) {
         const userRemaining = Math.max(
           0,
@@ -267,7 +271,9 @@ class LoginRateLimiter {
   } {
     const now = Date.now();
 
-    const resetAttempt = this.resetCodeAttempts.get(normalizeUsername(username));
+    const resetAttempt = this.resetCodeAttempts.get(
+      normalizeUsername(username),
+    );
     if (resetAttempt?.lockedUntil && resetAttempt.lockedUntil > now) {
       return {
         locked: true,
@@ -281,7 +287,9 @@ class LoginRateLimiter {
   getRemainingResetCodeAttempts(username: string): number {
     const now = Date.now();
 
-    const resetAttempt = this.resetCodeAttempts.get(normalizeUsername(username));
+    const resetAttempt = this.resetCodeAttempts.get(
+      normalizeUsername(username),
+    );
     if (
       resetAttempt &&
       now - resetAttempt.firstAttempt <= this.RESET_CODE_WINDOW_MS

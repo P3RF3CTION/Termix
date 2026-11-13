@@ -327,7 +327,10 @@ export function registerUserPasswordResetRoutes(
           : typeof resetData.code === "string"
             ? hashSecret(resetData.code)
             : null;
-      if (!storedHash || !constantTimeEquals(storedHash, hashSecret(resetCode))) {
+      if (
+        !storedHash ||
+        !constantTimeEquals(storedHash, hashSecret(resetCode))
+      ) {
         authLogger.warn("Reset code verification failed - invalid code", {
           operation: "reset_code_verify_failed",
           username,

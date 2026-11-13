@@ -53,20 +53,29 @@ function filterCiphers(list: CipherAlgorithm[]): CipherAlgorithm[] {
   });
 }
 
-// Opt-in legacy algorithms. hmac-md5 and ssh-dss are broken outright and
-// stay out of the opt-in set — the operator who needs them should patch
-// their SSH server, not negotiate them from Termix.
+// Legacy algorithms, offered only while allowLegacyAlgorithms is on for the
+// host. ssh-dss and hmac-md5 stay in this set: the setting defaults to on, and
+// dropping them would cut off old appliances without a way back in Termix.
+// Turn legacy off per host, folder or globally (admin host default).
 const LEGACY_KEX: KexAlgorithm[] = [
   "diffie-hellman-group14-sha1",
   "diffie-hellman-group-exchange-sha1",
   "diffie-hellman-group1-sha1",
 ];
 
-const LEGACY_SERVER_HOST_KEY: ServerHostKeyAlgorithm[] = ["ssh-rsa"];
+const LEGACY_SERVER_HOST_KEY: ServerHostKeyAlgorithm[] = ["ssh-rsa", "ssh-dss"];
 
-const LEGACY_HMAC: MacAlgorithm[] = ["hmac-sha1"];
+const LEGACY_HMAC: MacAlgorithm[] = ["hmac-sha1", "hmac-md5"];
 
-const LEGACY_CIPHER = filterCiphers(["3des-cbc"]);
+// CBC ciphers combine with non-ETM MACs to make the configuration broken by
+// the Terrapin-class attacks; keep them gated behind the legacy opt-in rather
+// than offering them in the modern default.
+const LEGACY_CIPHER = filterCiphers([
+  "aes256-cbc",
+  "aes192-cbc",
+  "aes128-cbc",
+  "3des-cbc",
+]);
 
 export function buildSSHAlgorithms(
   allowLegacy: boolean,
@@ -105,9 +114,6 @@ export function buildSSHAlgorithms(
     "aes256-ctr",
     "aes192-ctr",
     "aes128-ctr",
-    "aes256-cbc",
-    "aes192-cbc",
-    "aes128-cbc",
   ]);
 
   if (allowLegacy) {

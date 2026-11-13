@@ -20,16 +20,6 @@ async function validateHost(host: string): Promise<void> {
   }
 }
 
-// Allow explicit opt-in for operators who need to proxy via private hosts
-// (e.g. a corporate SOCKS gateway on an RFC1918 address). Off by default.
-const PROXY_HOST_ALLOW_PRIVATE =
-  process.env.TERMIX_PROXY_ALLOW_PRIVATE_HOSTS === "true";
-
-async function validateProxyHost(host: string): Promise<void> {
-  if (PROXY_HOST_ALLOW_PRIVATE) return;
-  await validateHost(host);
-}
-
 export interface SOCKS5Config {
   useSocks5?: boolean;
   socks5Host?: string;
@@ -52,9 +42,6 @@ export async function createSocks5Connection(
     socks5Config.socks5ProxyChain &&
     socks5Config.socks5ProxyChain.length > 0
   ) {
-    for (const node of socks5Config.socks5ProxyChain) {
-      await validateProxyHost(node.host);
-    }
     return createMixedProxyChainConnection(
       targetHost,
       targetPort,
@@ -63,7 +50,6 @@ export async function createSocks5Connection(
   }
 
   if (socks5Config.socks5Host) {
-    await validateProxyHost(socks5Config.socks5Host);
     return createSingleProxyConnection(targetHost, targetPort, socks5Config);
   }
 

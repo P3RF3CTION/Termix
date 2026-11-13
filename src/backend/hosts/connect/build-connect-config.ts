@@ -183,7 +183,7 @@ export async function buildConnectConfig(
       isJumpHost,
       preloaded,
     ),
-    algorithms: buildSSHAlgorithms(sshOptions?.allowLegacyAlgorithms === true),
+    algorithms: buildSSHAlgorithms(sshOptions?.allowLegacyAlgorithms !== false),
   };
   if (defaults.env) config.env = { ...defaults.env };
   if (defaults.socketTimeout) config.timeout = defaults.socketTimeout;

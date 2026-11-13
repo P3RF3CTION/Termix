@@ -38,8 +38,7 @@ export function allowsDesktopAutoSession(
 ): boolean {
   if (env.ELECTRON_EMBEDDED === "true") return true;
   return (
-    env.NODE_ENV !== "production" &&
-    env.ALLOW_DESKTOP_AUTO_SESSION === "true"
+    env.NODE_ENV !== "production" && env.ALLOW_DESKTOP_AUTO_SESSION === "true"
   );
 }
 

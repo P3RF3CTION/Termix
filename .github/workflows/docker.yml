@@ -65,7 +65,16 @@ jobs:
       # The image reads its version from package.json, so a beta has to say so.
       - name: Stamp beta version
         if: ${{ inputs.build_type == 'Beta' }}
-        run: node scripts/sync-version.cjs --version "${{ inputs.version }}"
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          # Validate before use so an injected ${{ inputs.version }} can't
+          # smuggle shell syntax (`";` curl | sh; echo "`) into run:.
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9]+)?)?$ ]]; then
+            echo "Rejecting invalid version string" >&2
+            exit 1
+          fi
+          node scripts/sync-version.cjs --version "$INPUT_VERSION"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -79,16 +88,36 @@ jobs:
 
       - name: Determine tags
         id: tags
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+          MATRIX_PROFILE: ${{ matrix.profile }}
         run: |
-          VERSION=${{ inputs.version }}
-          BUILD_TYPE=${{ inputs.build_type }}
+          # Pass inputs through env instead of inlining ${{ inputs.* }} into
+          # the shell script, which would evaluate as literal syntax before
+          # the shell runs it and let a crafted version string inject
+          # arbitrary commands.
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9]+)?)?$ ]]; then
+            echo "Rejecting invalid version string" >&2
+            exit 1
+          fi
+          case "$INPUT_BUILD_TYPE" in
+            Production|Beta|Development) ;;
+            *) echo "Rejecting invalid build_type" >&2; exit 1 ;;
+          esac
+          case "$MATRIX_PROFILE" in
+            standard|debian) ;;
+            *) echo "Rejecting invalid matrix profile" >&2; exit 1 ;;
+          esac
+          VERSION="$INPUT_VERSION"
+          BUILD_TYPE="$INPUT_BUILD_TYPE"
 
           TAGS=()
           ALL_TAGS=()
 
           SUFFIX=""
-          if [ "${{ matrix.profile }}" != "standard" ]; then
-            SUFFIX="-${{ matrix.profile }}"
+          if [ "$MATRIX_PROFILE" != "standard" ]; then
+            SUFFIX="-$MATRIX_PROFILE"
           fi
 
           if [ "$BUILD_TYPE" = "Production" ]; then

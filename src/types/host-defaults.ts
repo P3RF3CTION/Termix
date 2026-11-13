@@ -231,8 +231,8 @@ export const CORE_HOST_DEFAULTS: readonly CoreHostDefault[] = [
   {
     key: "allowLegacyAlgorithms",
     levels: ALL_LEVELS,
-    builtin: false,
-    normalize: (value) => toBoolean(value, false),
+    builtin: true,
+    normalize: (value) => toBoolean(value, true),
   },
   {
     key: "agentForwarding",

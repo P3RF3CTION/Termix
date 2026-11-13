@@ -10,6 +10,9 @@
  */
 
 import net from "node:net";
+import { lookup as dnsLookup, type LookupAddress } from "node:dns";
+import { promisify } from "node:util";
+import { isIP, BlockList } from "node:net";
 import type { Duplex } from "node:stream";
 import { createWebSocketStream, type WebSocket } from "ws";
 import type { PluginWebSocketConnection } from "@termix-ssh/plugin-sdk/backend";
@@ -21,6 +24,40 @@ import { registerCoreWsRoute } from "../plugins/ws.js";
 
 const MAX_RELAYS_PER_USER = 100;
 const open = new Map<string, number>();
+
+const dnsLookupAsync = promisify(dnsLookup);
+
+// The relay is a raw-bytes tunnel; without checks a user who can add a host
+// gets to speak arbitrary protocols to anything the Termix process can reach.
+// Blocking loopback and the cloud-metadata address closes the most-dangerous
+// cases (Termix's own admin endpoints and IMDS) without breaking legitimate
+// RFC-1918 fleets that the user actually meant to manage. Operators who need
+// loopback (e.g. a dev-mode nested Termix) can opt in via the env flag.
+const relayBlockList = new BlockList();
+relayBlockList.addSubnet("127.0.0.0", 8, "ipv4");
+relayBlockList.addSubnet("::1", 128, "ipv6");
+relayBlockList.addSubnet("::ffff:127.0.0.0", 104, "ipv6");
+relayBlockList.addAddress("169.254.169.254", "ipv4");
+relayBlockList.addAddress("::ffff:169.254.169.254", "ipv6");
+// GCE metadata.
+relayBlockList.addAddress("169.254.169.253", "ipv4");
+
+async function isRelayDestinationAllowed(host: string): Promise<boolean> {
+  if (process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK === "true") return true;
+  const literal = isIP(host);
+  const addresses: LookupAddress[] = literal
+    ? [{ address: host, family: literal }]
+    : await dnsLookupAsync(host, { all: true, verbatim: true }).catch(
+        () => [] as LookupAddress[],
+      );
+  if (addresses.length === 0) return false;
+  for (const { address, family } of addresses) {
+    if (relayBlockList.check(address, family === 6 ? "ipv6" : "ipv4")) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function close(ws: WebSocket, code: number, reason: string): void {
   try {
@@ -82,6 +119,22 @@ async function handleRelay(
     jumpEnd = () => jumpClient?.end();
     stream = (config.sock as Duplex | undefined) ?? null;
     if (!stream) {
+      // Only a direct dial leaves this process. Behind a jump host the
+      // address is resolved and reached by the jump host (127.0.0.1 there is
+      // the jump host itself, and the name may only resolve on its network),
+      // so the check belongs here and not before openSshTransport.
+      if (!(await isRelayDestinationAllowed(String(config.host)))) {
+        sshLogger.warn("Relay refused: destination is restricted", {
+          operation: "ssh_relay_blocked",
+          host: String(config.host),
+          hostId: syncId ? undefined : hostId,
+          syncId,
+          userId,
+        });
+        close(ws, 1008, "Destination not allowed");
+        finish();
+        return;
+      }
       stream = net.connect({
         host: String(config.host),
         port: Number(config.port),
