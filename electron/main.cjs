@@ -716,6 +716,16 @@ function isWebEndpointCertificateAllowed(url) {
   }
 }
 
+// Drop entries whose TTL has lapsed. Called before adding a new origin so a
+// looping renderer can't push the live-entry count past the cap just by
+// outlasting old entries.
+function trimExpiredWebEndpointCertificateAllowlist() {
+  const now = Date.now();
+  for (const [existing, expiresAt] of webEndpointCertificateAllowlist) {
+    if (expiresAt <= now) webEndpointCertificateAllowlist.delete(existing);
+  }
+}
+
 ipcMain.handle("allow-invalid-certificate-for-origin", (_event, origin) => {
   try {
     // Store the PARSED origin, never the caller's string, so a path or a
@@ -724,13 +734,7 @@ ipcMain.handle("allow-invalid-certificate-for-origin", (_event, origin) => {
     if (parsed.protocol !== "https:") {
       return { success: false };
     }
-    // Trim any stale entries, then cap the live-entry count. If the cap is
-    // already reached and this origin isn't in the map, refuse rather than
-    // let a looping renderer blanket every host on the public internet.
-    const now = Date.now();
-    for (const [existing, expiresAt] of webEndpointCertificateAllowlist) {
-      if (expiresAt <= now) webEndpointCertificateAllowlist.delete(existing);
-    }
+    trimExpiredWebEndpointCertificateAllowlist();
     if (
       !webEndpointCertificateAllowlist.has(parsed.origin) &&
       webEndpointCertificateAllowlist.size >=
@@ -740,7 +744,7 @@ ipcMain.handle("allow-invalid-certificate-for-origin", (_event, origin) => {
     }
     webEndpointCertificateAllowlist.set(
       parsed.origin,
-      now + WEB_ENDPOINT_CERTIFICATE_ALLOWLIST_TTL_MS,
+      Date.now() + WEB_ENDPOINT_CERTIFICATE_ALLOWLIST_TTL_MS,
     );
     return { success: true };
   } catch {
