@@ -59,16 +59,18 @@ export async function verifyPasswordLogin(request: {
   }
 
   const user = await createCurrentUserRepository().findByUsername(username);
+
+  // Burn a bcrypt-equivalent amount of time on every path that does not run
+  // a real bcrypt.compare (user not found; external-only user with no local
+  // hash) so none is measurably faster than a wrong password. Without it,
+  // response timing lets an attacker enumerate valid usernames and tell
+  // which accounts are external-only, without ever hitting the rate limit.
+  // The hash is a frozen dummy at the same cost (10) as real user hashes.
+  const DUMMY_BCRYPT_HASH =
+    "$2a$10$CwTycUXWue0Thq9StjUM0uJ8Xx2v2o4dZEXoW5q4Ju2y.xnqKHr0e";
+
   if (!user) {
-    // Burn a bcrypt-equivalent amount of time so a non-existent username
-    // isn't faster than a wrong password — otherwise response timing lets
-    // an attacker enumerate valid usernames without ever hitting the
-    // rate limit. The hash is a frozen dummy at the same cost (10) as
-    // real user hashes.
-    await bcrypt.compare(
-      password,
-      "$2a$10$CwTycUXWue0Thq9StjUM0uJ8Xx2v2o4dZEXoW5q4Ju2y.xnqKHr0e",
-    );
+    await bcrypt.compare(password, DUMMY_BCRYPT_HASH);
     loginRateLimiter.recordFailedAttempt(clientIp, username);
     authLogger.warn("Login failed: user not found", {
       operation: "user_login",
@@ -82,6 +84,7 @@ export async function verifyPasswordLogin(request: {
     user.isExternal &&
     (!user.passwordHash || user.passwordHash.trim() === "")
   ) {
+    await bcrypt.compare(password, DUMMY_BCRYPT_HASH);
     loginRateLimiter.recordFailedAttempt(clientIp, username);
     authLogger.warn("External-only user attempted password login", {
       operation: "user_login",

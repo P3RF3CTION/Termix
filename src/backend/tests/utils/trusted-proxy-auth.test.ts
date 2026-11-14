@@ -58,6 +58,53 @@ describe("trusted proxy authentication config", () => {
     ).toBe("198.51.100.9");
   });
 
+  it("rejects a peer secret whose UTF-8 bytes do not match without throwing", () => {
+    process.env.TERMIX_TRUSTED_PROXY_PEER_SECRET = "abcd"; // 4 bytes
+    try {
+      // Four characters, eight UTF-8 bytes — timingSafeEqual needs equal
+      // byte lengths and would throw RangeError if the string char count
+      // were taken as the length to compare. The source address must then
+      // fall back to the socket, not 500 the request.
+      expect(
+        getTrustedProxySourceAddress({
+          headers: {
+            "x-termix-proxy-peer": "172.20.0.10",
+            "x-termix-proxy-secret": "éééé",
+          },
+          socket: { remoteAddress: "::ffff:127.0.0.1" },
+        }),
+      ).toBe("::ffff:127.0.0.1");
+    } finally {
+      delete process.env.TERMIX_TRUSTED_PROXY_PEER_SECRET;
+    }
+  });
+
+  it("honours a matching peer secret while rejecting a wrong one", () => {
+    process.env.TERMIX_TRUSTED_PROXY_PEER_SECRET = "s3cret";
+    try {
+      expect(
+        getTrustedProxySourceAddress({
+          headers: {
+            "x-termix-proxy-peer": "172.20.0.10",
+            "x-termix-proxy-secret": "s3cret",
+          },
+          socket: { remoteAddress: "::ffff:127.0.0.1" },
+        }),
+      ).toBe("172.20.0.10");
+      expect(
+        getTrustedProxySourceAddress({
+          headers: {
+            "x-termix-proxy-peer": "172.20.0.10",
+            "x-termix-proxy-secret": "wrong!",
+          },
+          socket: { remoteAddress: "::ffff:127.0.0.1" },
+        }),
+      ).toBe("::ffff:127.0.0.1");
+    } finally {
+      delete process.env.TERMIX_TRUSTED_PROXY_PEER_SECRET;
+    }
+  });
+
   it("fails closed when a supplied external role is not mapped", () => {
     const roleMap = parseTrustedProxyRoleMap(
       JSON.stringify({ operators: ["operator"], viewers: "readonly" }),

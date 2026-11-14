@@ -95,8 +95,9 @@ function isValidNewUsername(val: unknown): val is string {
 }
 
 // Shared across /create and /change-password so a reset flow can't be used
-// to downgrade the user's password to one character.
-const MIN_PASSWORD_LEN = 8;
+// to downgrade the user's password to one character. Also re-used by
+// /complete-reset in user-password-reset-routes.
+export const MIN_PASSWORD_LEN = 8;
 
 function isRegistrationAllowed(): boolean {
   const envVal = process.env.ALLOW_REGISTRATION;

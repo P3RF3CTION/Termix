@@ -37,26 +37,44 @@ const relayBlockList = new BlockList();
 relayBlockList.addSubnet("127.0.0.0", 8, "ipv4");
 relayBlockList.addSubnet("::1", 128, "ipv6");
 relayBlockList.addSubnet("::ffff:127.0.0.0", 104, "ipv6");
+// 0.0.0.0/8 is the "this network" block; connect(0.0.0.0, port) resolves to
+// 127.0.0.1 on Linux, so without this an attacker can reach loopback through
+// the unspecified address. Same for the IPv6 unspecified :: address.
+relayBlockList.addSubnet("0.0.0.0", 8, "ipv4");
+relayBlockList.addAddress("::", "ipv6");
+relayBlockList.addAddress("::ffff:0.0.0.0", "ipv6");
 relayBlockList.addAddress("169.254.169.254", "ipv4");
 relayBlockList.addAddress("::ffff:169.254.169.254", "ipv6");
 // GCE metadata.
 relayBlockList.addAddress("169.254.169.253", "ipv4");
 
-async function isRelayDestinationAllowed(host: string): Promise<boolean> {
-  if (process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK === "true") return true;
+interface AllowedDestination {
+  address: string;
+  family: 4 | 6;
+}
+
+// Returns the resolved address the relay may connect to, or null if the host
+// is disallowed. Returning the address (rather than a boolean) closes a DNS
+// rebinding TOCTOU: the check is against one lookup and the connect uses the
+// same literal, so a second resolution between the check and the dial cannot
+// swap the destination.
+async function resolveAllowedRelayDestination(
+  host: string,
+): Promise<AllowedDestination | null> {
+  const bypass = process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK === "true";
   const literal = isIP(host);
   const addresses: LookupAddress[] = literal
     ? [{ address: host, family: literal }]
     : await dnsLookupAsync(host, { all: true, verbatim: true }).catch(
         () => [] as LookupAddress[],
       );
-  if (addresses.length === 0) return false;
+  if (addresses.length === 0) return null;
   for (const { address, family } of addresses) {
-    if (relayBlockList.check(address, family === 6 ? "ipv6" : "ipv4")) {
-      return false;
-    }
+    const fam = family === 6 ? "ipv6" : "ipv4";
+    if (!bypass && relayBlockList.check(address, fam)) continue;
+    return { address, family: family === 6 ? 6 : 4 };
   }
-  return true;
+  return null;
 }
 
 function close(ws: WebSocket, code: number, reason: string): void {
@@ -123,7 +141,15 @@ async function handleRelay(
       // address is resolved and reached by the jump host (127.0.0.1 there is
       // the jump host itself, and the name may only resolve on its network),
       // so the check belongs here and not before openSshTransport.
-      if (!(await isRelayDestinationAllowed(String(config.host)))) {
+      //
+      // Connect to the resolved IP, not the original host string. A second
+      // DNS lookup inside net.connect would give an attacker with
+      // low-TTL DNS a rebind window: the check sees a public address, the
+      // dial reaches loopback or the cloud metadata endpoint.
+      const destination = await resolveAllowedRelayDestination(
+        String(config.host),
+      );
+      if (!destination) {
         sshLogger.warn("Relay refused: destination is restricted", {
           operation: "ssh_relay_blocked",
           host: String(config.host),
@@ -136,8 +162,9 @@ async function handleRelay(
         return;
       }
       stream = net.connect({
-        host: String(config.host),
+        host: destination.address,
         port: Number(config.port),
+        family: destination.family,
       });
     }
     const pipe = createWebSocketStream(ws);

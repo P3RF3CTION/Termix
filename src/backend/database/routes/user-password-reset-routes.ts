@@ -14,6 +14,7 @@ import {
   createCurrentUserRepository,
 } from "../repositories/factory.js";
 import { pluginEvents, TOPICS } from "../../plugins/events.js";
+import { MIN_PASSWORD_LEN } from "./users.js";
 
 interface UserPasswordResetRoutesDeps {
   authManager: AuthManager;
@@ -201,11 +202,37 @@ export function registerUserPasswordResetRoutes(
         });
       }
 
+      const settingsRepository = createCurrentSettingsRepository();
+      const usernameKey = normalizeUsernameKey(username);
+      // Overwriting an active reset entry resets its per-entry attempts
+      // counter, which an attacker can loop with /verify-reset-code to
+      // extend guessing well past the hard cap. If an unexpired entry
+      // exists, keep it and answer with the same enumeration-resistant
+      // message. The user requested a new code intentionally only in rare
+      // cases; they can wait for this one to expire (15 min) or burn the
+      // remaining attempts to clear it.
+      const existingReset = await settingsRepository.get(
+        `reset_code_${usernameKey}`,
+      );
+      if (existingReset) {
+        try {
+          const parsed = JSON.parse(existingReset) as { expiresAt?: string };
+          if (parsed?.expiresAt && new Date(parsed.expiresAt) > new Date()) {
+            return res.json({
+              message:
+                "If the user exists, a password reset code has been generated. Check docker logs for the code.",
+            });
+          }
+        } catch {
+          // Malformed entry: fall through and replace it.
+        }
+      }
+
       const resetCode = crypto.randomInt(100000, 1000000).toString();
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-      await createCurrentSettingsRepository().set(
-        `reset_code_${normalizeUsernameKey(username)}`,
+      await settingsRepository.set(
+        `reset_code_${usernameKey}`,
         JSON.stringify({
           codeHash: hashSecret(resetCode),
           expiresAt: expiresAt.toISOString(),
@@ -457,6 +484,13 @@ export function registerUserPasswordResetRoutes(
     ) {
       return res.status(400).json({
         error: "Username, temporary token, and new password are required",
+      });
+    }
+    // Share the length rule /create and /change-password enforce so the
+    // reset flow can't be used to downgrade a password past the minimum.
+    if (newPassword.length < MIN_PASSWORD_LEN) {
+      return res.status(400).json({
+        error: `New password must be at least ${MIN_PASSWORD_LEN} characters.`,
       });
     }
 

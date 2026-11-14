@@ -163,6 +163,32 @@ describe("ssh relay", () => {
     });
   });
 
+  it("refuses the unspecified address because Linux routes it to loopback", async () => {
+    delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
+    mocks.resolveHostById.mockResolvedValue({
+      id: 5,
+      ip: "0.0.0.0",
+      port: 22,
+    });
+    mocks.openSshTransport.mockResolvedValue({ jumpClient: undefined });
+    const { closed } = await open("?hostId=5");
+    expect(await closed).toEqual({
+      code: 1008,
+      reason: "Destination not allowed",
+    });
+  });
+
+  it("refuses the IPv6 unspecified address too", async () => {
+    delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
+    mocks.resolveHostById.mockResolvedValue({ id: 5, ip: "::", port: 22 });
+    mocks.openSshTransport.mockResolvedValue({ jumpClient: undefined });
+    const { closed } = await open("?hostId=5");
+    expect(await closed).toEqual({
+      code: 1008,
+      reason: "Destination not allowed",
+    });
+  });
+
   it("leaves the address to the jump host when it made the stream", async () => {
     delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
     const channel = new PassThrough();
