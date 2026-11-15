@@ -29,6 +29,7 @@
 ### Changed
 
 - body-parser is updated to 2.4.0 for a security fix
+- The Release workflow only runs in the upstream repository. In a fork its schedule queued jobs for runners that only exist upstream, which were cancelled after 24 hours
 
 ### Fixed
 

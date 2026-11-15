@@ -37,6 +37,12 @@ concurrency:
 
 jobs:
   prep:
+    # Releases are built and published from the upstream repository only:
+    # the jobs need upstream's Blacksmith runners, signing secrets and
+    # registries. In a fork the Tuesday/Friday schedule otherwise queues a
+    # job no runner ever picks up and it is cancelled after 24h. Skipping
+    # prep skips every job after it, since all of them need its outputs.
+    if: ${{ github.repository_owner == 'Termix-SSH' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       channel: ${{ steps.mode.outputs.channel }}
