@@ -14,7 +14,6 @@ import type { Request, Response } from "express";
 import { AuthManager } from "../utils/auth-manager.js";
 import { loginRateLimiter } from "../utils/login-rate-limiter.js";
 import { authLogger } from "../utils/logger.js";
-import { getRequestOrigin } from "../utils/request-origin.js";
 import { parseUserAgent } from "../utils/user-agent-parser.js";
 import { logAudit, getRequestMeta } from "../utils/audit-logger.js";
 import {
@@ -562,7 +561,10 @@ export async function verifySecondFactorAndRespond(
   if (lookup.pending) {
     lookup.pending.attempts = pendingSpent + 1;
   }
-  loginRateLimiter.recordFailedTOTPAttempt(user.id);
+  // Only count a failed TOTP attempt once the factor has actually rejected
+  // the submission. An exception from evaluateSecondFactors or factor.verify
+  // (DB hiccup, provider glitch) is not a wrong code and must not drain the
+  // user's per-minute budget; the rate limiter cannot tell them apart.
 
   const factors = await evaluateSecondFactors(user.id);
   if (factors.blocked.length > 0) {
@@ -589,6 +591,10 @@ export async function verifySecondFactorAndRespond(
         ...(result.code ? { code: result.code } : {}),
       });
     }
+    // Only count the per-user TOTP bucket once the factor has rejected the
+    // submission. See the note above the evaluateSecondFactors call: an
+    // exception on the way here is not a wrong code.
+    loginRateLimiter.recordFailedTOTPAttempt(user.id);
     authLogger.warn("Second factor verification failed", {
       operation: "totp_verify_failed",
       userId: user.id,
@@ -668,6 +674,24 @@ export async function verifySecondFactorAndRespond(
   return sendSession(req, res, session);
 }
 
+// Host (and port, if any) the request reached us on, as Express derives it
+// after its trust-proxy policy. Default ports are dropped on both sides so
+// `https://termix.example` matches a forwarded `termix.example:443`.
+function sameTrustedHost(req: Request, target: URL): boolean {
+  const rawHost = typeof req.host === "string" ? req.host : "";
+  const hostname = (req.hostname || "").toLowerCase();
+  if (!hostname) return false;
+  let port = "";
+  const portMatch = rawHost.match(/:(\d+)$/);
+  if (portMatch && !rawHost.endsWith("]")) port = portMatch[1];
+  if (port === "80" || port === "443") port = "";
+  const targetHostname = target.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const ownHostname = hostname.replace(/^\[|\]$/g, "");
+  const targetPort =
+    target.port === "80" || target.port === "443" ? "" : target.port;
+  return targetHostname === ownHostname && targetPort === port;
+}
+
 /**
  * Finishes a redirect login (OIDC and friends): back to where the browser
  * came from, with a cookie, or with the token in the URL for the desktop and
@@ -697,8 +721,22 @@ function isSafeReturnTo(
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return false;
   }
-  const requestOrigin = getRequestOrigin(req);
-  if (requestOrigin && parsed.origin === requestOrigin) return true;
+  // Build the "same origin" baseline from fields Express has already run
+  // through the trust-proxy policy (`loopback` here), so a direct request
+  // that tries to forge X-Forwarded-Host or X-Forwarded-Proto is judged by
+  // its real socket. getRequestOrigin reads the raw header unconditionally
+  // and would hand any direct caller control over the open-redirect check.
+  //
+  // The scheme is deliberately not compared: an open redirect needs a
+  // foreign host, and a TLS-terminating proxy that is not on loopback (a
+  // bare-metal install behind Traefik/Caddy on another address) reaches us
+  // over plain http while the browser's returnTo is https. Comparing the
+  // scheme from the untrusted X-Forwarded-Proto would break those OIDC
+  // logins; comparing it from req.protocol would too. Host and port must
+  // still match exactly.
+  if (sameTrustedHost(req, parsed)) {
+    return true;
+  }
   const allowList = (process.env.TERMIX_REDIRECT_ALLOWED_ORIGINS ?? "")
     .split(",")
     .map((value) => value.trim())

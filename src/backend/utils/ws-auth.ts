@@ -26,9 +26,22 @@ export function isCookieOriginAllowed(req: IncomingMessage): boolean {
   // hand-crafted client trying to bypass the same-origin check.
   if (parsed.protocol === "file:") return true;
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
-  const hosts = [req.headers.host, req.headers["x-forwarded-host"]]
-    .flatMap((value) => String(value ?? "").split(","))
-    .map((value) => value.trim().toLowerCase())
+  // X-Forwarded-Host is a hop-by-hop header a client can set directly when
+  // there is no proxy, and a misconfigured proxy that appends rather than
+  // overwrites turns the attacker's value into a valid same-origin candidate.
+  // Only the FIRST value — the one the outermost proxy forwarded, by
+  // convention — is considered, which keeps the deliberate-proxy-rewrite
+  // case (Vite dev, bundled nginx) working without granting that trust to
+  // appended extras.
+  const firstForwardedHost = String(req.headers["x-forwarded-host"] ?? "")
+    .split(",")[0]
+    .trim();
+  const hosts = [req.headers.host, firstForwardedHost]
+    .map((value) =>
+      String(value ?? "")
+        .trim()
+        .toLowerCase(),
+    )
     .filter(Boolean);
   if (hosts.includes(parsed.host.toLowerCase())) return true;
   // The Vite dev proxy rewrites Host, so loopback to loopback is allowed.

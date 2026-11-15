@@ -237,6 +237,18 @@ export function fakeRequest(overrides: Record<string, unknown> = {}) {
     "user-agent": "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0",
     ...(overrides.headers as Record<string, string> | undefined),
   };
+  // Mirror Express's trust-proxy derivation so helpers that read
+  // `req.hostname` / `req.protocol` (e.g. isSafeReturnTo) see the same
+  // values production does when the forwarded headers arrive through a
+  // trusted proxy. The raw forwarded-host may be "host:port"; req.hostname
+  // is just the host.
+  const forwardedHost = headers["x-forwarded-host"];
+  const hostHeader = headers["host"];
+  const hostValue = forwardedHost || hostHeader || "";
+  const hostname = hostValue.split(",")[0].trim().split(":")[0].trim() || null;
+  const forwardedProto = headers["x-forwarded-proto"];
+  const protocol =
+    (forwardedProto && forwardedProto.split(",")[0].trim()) || "http";
   return {
     body: {},
     query: {},
@@ -244,6 +256,8 @@ export function fakeRequest(overrides: Record<string, unknown> = {}) {
     cookies: {},
     ip: "10.0.0.1",
     socket: { remoteAddress: "10.0.0.1" },
+    hostname,
+    protocol,
     ...overrides,
     headers,
     get: (name: string) => headers[name.toLowerCase()],

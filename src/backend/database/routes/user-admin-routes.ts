@@ -888,7 +888,14 @@ export function registerUserAdminRoutes(
       const rawUsername = targetUser.username ?? "user";
       const asciiUsername =
         rawUsername.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 64) || "user";
-      const encodedUsername = encodeURIComponent(rawUsername);
+      // encodeURIComponent leaves `'` unescaped, which is a reserved
+      // delimiter in RFC 5987 `filename*=UTF-8''...`. A legacy username with
+      // an apostrophe (`o'brien`) would otherwise produce a header some
+      // browsers refuse or truncate.
+      const encodedUsername = encodeURIComponent(rawUsername).replace(
+        /'/g,
+        "%27",
+      );
       res.setHeader("Content-Type", "application/json");
       res.setHeader(
         "Content-Disposition",

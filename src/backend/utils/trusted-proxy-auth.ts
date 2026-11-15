@@ -150,18 +150,29 @@ export function getTrustedProxySourceAddress(req: {
   const presentedSecret = req.headers["x-termix-proxy-secret"];
   const expectedSecret = getTrustedProxyPeerSecret();
 
+  let secretValid: boolean;
+  if (expectedSecret === undefined) {
+    secretValid = true;
+  } else if (typeof presentedSecret !== "string") {
+    secretValid = false;
+  } else {
+    // JS .length is char count, not byte count — timingSafeEqual needs equal
+    // byte lengths and throws RangeError otherwise, which would 500 every
+    // proxy-authenticated request if a caller sent a header whose char count
+    // matches but whose UTF-8 encoding differs in size. Convert first, then
+    // compare on the Buffer lengths.
+    const presentedBuf = Buffer.from(presentedSecret, "utf8");
+    const expectedBuf = Buffer.from(expectedSecret, "utf8");
+    secretValid =
+      presentedBuf.length === expectedBuf.length &&
+      timingSafeEqual(presentedBuf, expectedBuf);
+  }
+
   const peerHeaderValid =
     socketAddress &&
     isLoopbackAddress(socketAddress) &&
     typeof peer === "string" &&
-    (expectedSecret === undefined
-      ? true
-      : typeof presentedSecret === "string" &&
-        presentedSecret.length === expectedSecret.length &&
-        timingSafeEqual(
-          Buffer.from(presentedSecret),
-          Buffer.from(expectedSecret),
-        ));
+    secretValid;
 
   return peerHeaderValid ? peer : socketAddress;
 }

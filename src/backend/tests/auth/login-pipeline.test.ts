@@ -856,6 +856,57 @@ describe("redirect logins", () => {
       "https://termix.example/?error=registration_disabled",
     );
   });
+
+  it("accepts an https returnTo when a proxy that is not trusted reached us over http", async () => {
+    // Bare-metal install behind a TLS-terminating proxy on another address:
+    // Express does not trust its X-Forwarded-Proto, so req.protocol is http
+    // while the browser came in over https. Same host, so still safe.
+    const res = fakeResponse();
+    await respondWithRedirectLogin(
+      fakeRequest({
+        headers: { host: "termix.example" },
+        hostname: "termix.example",
+        protocol: "http",
+      }) as never,
+      res as never,
+      identity,
+      { methodId: "oidc", rememberMe: false },
+      () => false,
+    );
+    expect(res.redirectedTo).toBe("https://termix.example/?success=true");
+  });
+
+  it("refuses a returnTo whose host only matches a forged X-Forwarded-Host", async () => {
+    // Direct caller, no trusted proxy: Express keeps req.hostname on the
+    // real Host header, so the forged forwarded host gains nothing.
+    const res = fakeResponse();
+    await respondWithRedirectLogin(
+      fakeRequest({
+        headers: { host: "termix.example", "x-forwarded-host": "evil.example" },
+        hostname: "termix.example",
+        protocol: "http",
+      }) as never,
+      res as never,
+      { ...identity, returnTo: "https://evil.example/" },
+      { methodId: "oidc", rememberMe: false },
+      () => false,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.redirectedTo).toBeNull();
+  });
+
+  it("refuses a returnTo on the same host but another port", async () => {
+    const res = fakeResponse();
+    await respondWithRedirectLogin(
+      fakeRequest({ headers: redirectRequestHeaders }) as never,
+      res as never,
+      { ...identity, returnTo: "https://termix.example:8443/" },
+      { methodId: "oidc", rememberMe: false },
+      () => false,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.redirectedTo).toBeNull();
+  });
 });
 
 describe("lockout guard", () => {
