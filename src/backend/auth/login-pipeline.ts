@@ -674,6 +674,24 @@ export async function verifySecondFactorAndRespond(
   return sendSession(req, res, session);
 }
 
+// Host (and port, if any) the request reached us on, as Express derives it
+// after its trust-proxy policy. Default ports are dropped on both sides so
+// `https://termix.example` matches a forwarded `termix.example:443`.
+function sameTrustedHost(req: Request, target: URL): boolean {
+  const rawHost = typeof req.host === "string" ? req.host : "";
+  const hostname = (req.hostname || "").toLowerCase();
+  if (!hostname) return false;
+  let port = "";
+  const portMatch = rawHost.match(/:(\d+)$/);
+  if (portMatch && !rawHost.endsWith("]")) port = portMatch[1];
+  if (port === "80" || port === "443") port = "";
+  const targetHostname = target.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const ownHostname = hostname.replace(/^\[|\]$/g, "");
+  const targetPort =
+    target.port === "80" || target.port === "443" ? "" : target.port;
+  return targetHostname === ownHostname && targetPort === port;
+}
+
 /**
  * Finishes a redirect login (OIDC and friends): back to where the browser
  * came from, with a cookie, or with the token in the URL for the desktop and
@@ -708,13 +726,15 @@ function isSafeReturnTo(
   // that tries to forge X-Forwarded-Host or X-Forwarded-Proto is judged by
   // its real socket. getRequestOrigin reads the raw header unconditionally
   // and would hand any direct caller control over the open-redirect check.
-  const requestHostname = req.hostname;
-  const requestProtocol = req.protocol;
-  if (
-    requestHostname &&
-    parsed.hostname === requestHostname &&
-    parsed.protocol === `${requestProtocol}:`
-  ) {
+  //
+  // The scheme is deliberately not compared: an open redirect needs a
+  // foreign host, and a TLS-terminating proxy that is not on loopback (a
+  // bare-metal install behind Traefik/Caddy on another address) reaches us
+  // over plain http while the browser's returnTo is https. Comparing the
+  // scheme from the untrusted X-Forwarded-Proto would break those OIDC
+  // logins; comparing it from req.protocol would too. Host and port must
+  // still match exactly.
+  if (sameTrustedHost(req, parsed)) {
     return true;
   }
   const allowList = (process.env.TERMIX_REDIRECT_ALLOWED_ORIGINS ?? "")

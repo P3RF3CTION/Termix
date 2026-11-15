@@ -48,19 +48,14 @@ relayBlockList.addAddress("::ffff:169.254.169.254", "ipv6");
 // GCE metadata.
 relayBlockList.addAddress("169.254.169.253", "ipv4");
 
-interface AllowedDestination {
-  address: string;
-  family: 4 | 6;
-}
-
-// Returns the resolved address the relay may connect to, or null if the host
-// is disallowed. Returning the address (rather than a boolean) closes a DNS
-// rebinding TOCTOU: the check is against one lookup and the connect uses the
-// same literal, so a second resolution between the check and the dial cannot
-// swap the destination.
+// Returns the resolved addresses the relay may connect to, or null if the
+// host is disallowed. Returning the addresses (rather than a boolean) closes
+// a DNS rebinding TOCTOU: the check is against one lookup and the dial is
+// pinned to exactly those results, so a second resolution between the check
+// and the connect cannot swap the destination.
 async function resolveAllowedRelayDestination(
   host: string,
-): Promise<AllowedDestination | null> {
+): Promise<LookupAddress[] | null> {
   const bypass = process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK === "true";
   const literal = isIP(host);
   const addresses: LookupAddress[] = literal
@@ -68,13 +63,37 @@ async function resolveAllowedRelayDestination(
     : await dnsLookupAsync(host, { all: true, verbatim: true }).catch(
         () => [] as LookupAddress[],
       );
-  if (addresses.length === 0) return null;
-  for (const { address, family } of addresses) {
-    const fam = family === 6 ? "ipv6" : "ipv4";
-    if (!bypass && relayBlockList.check(address, fam)) continue;
-    return { address, family: family === 6 ? 6 : 4 };
-  }
-  return null;
+  const allowed = addresses.filter(
+    ({ address, family }) =>
+      bypass || !relayBlockList.check(address, family === 6 ? "ipv6" : "ipv4"),
+  );
+  return allowed.length > 0 ? allowed : null;
+}
+
+// A lookup for net.connect that only ever answers with the addresses that
+// passed the check above. Keeping every allowed address (instead of dialling
+// just the first) preserves Node's Happy-Eyeballs fallback, so a dual-stack
+// LAN host whose IPv6 route is broken still connects over IPv4 as before.
+function pinnedLookup(addresses: LookupAddress[]): net.LookupFunction {
+  return ((
+    _hostname: string,
+    options: { all?: boolean; family?: number | string },
+    callback: (
+      err: NodeJS.ErrnoException | null,
+      address: string | LookupAddress[],
+      family?: number,
+    ) => void,
+  ) => {
+    if (options?.all) {
+      callback(null, addresses);
+      return;
+    }
+    const wanted = Number(options?.family) || 0;
+    const pick =
+      addresses.find((entry) => !wanted || entry.family === wanted) ??
+      addresses[0];
+    callback(null, pick.address, pick.family);
+  }) as unknown as net.LookupFunction;
 }
 
 function close(ws: WebSocket, code: number, reason: string): void {
@@ -142,10 +161,10 @@ async function handleRelay(
       // the jump host itself, and the name may only resolve on its network),
       // so the check belongs here and not before openSshTransport.
       //
-      // Connect to the resolved IP, not the original host string. A second
-      // DNS lookup inside net.connect would give an attacker with
-      // low-TTL DNS a rebind window: the check sees a public address, the
-      // dial reaches loopback or the cloud metadata endpoint.
+      // Dial only the addresses that were checked. A second DNS lookup
+      // inside net.connect would give an attacker with low-TTL DNS a rebind
+      // window: the check sees a public address, the dial reaches loopback
+      // or the cloud metadata endpoint.
       const destination = await resolveAllowedRelayDestination(
         String(config.host),
       );
@@ -162,9 +181,9 @@ async function handleRelay(
         return;
       }
       stream = net.connect({
-        host: destination.address,
+        host: String(config.host),
         port: Number(config.port),
-        family: destination.family,
+        lookup: pinnedLookup(destination),
       });
     }
     const pipe = createWebSocketStream(ws);

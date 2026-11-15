@@ -189,6 +189,45 @@ describe("ssh relay", () => {
     });
   });
 
+  it("refuses a host name that resolves to loopback", async () => {
+    delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
+    mocks.resolveHostById.mockResolvedValue({
+      id: 5,
+      ip: "localhost",
+      port: echoPort,
+    });
+    const { closed } = await open("?hostId=5");
+    expect(await closed).toEqual({
+      code: 1008,
+      reason: "Destination not allowed",
+    });
+  });
+
+  it("dials a host name through the checked addresses, falling back across them", async () => {
+    // "localhost" usually resolves to ::1 and 127.0.0.1, the echo server only
+    // listens on 127.0.0.1: the pinned lookup has to hand net.connect every
+    // checked address so it can fall back, as an unpinned connect would.
+    mocks.resolveHostById.mockResolvedValue({
+      id: 5,
+      ip: "localhost",
+      port: echoPort,
+    });
+    const { socket } = await open("?hostId=5");
+    const received = new Promise<string>((resolve) =>
+      socket.once("message", (data) => resolve(data.toString())),
+    );
+    // The relay attaches its pipe only after the DNS lookup; a frame sent
+    // before that is not buffered, so keep sending until the echo answers.
+    const resend = setInterval(() => socket.send("ping"), 50);
+    try {
+      // TCP may coalesce several echoed pings into one frame.
+      expect(await received).toMatch(/^(ping)+$/);
+    } finally {
+      clearInterval(resend);
+    }
+    socket.close();
+  });
+
   it("leaves the address to the jump host when it made the stream", async () => {
     delete process.env.TERMIX_ALLOW_SSH_RELAY_LOOPBACK;
     const channel = new PassThrough();

@@ -4,13 +4,13 @@
 
 ### Security
 
-- The SSH relay now looks up the destination once and connects to that same IP, so a host name pointing at a public address at check time and loopback at connect time no longer gets a tunnel to this server's own admin port or the cloud metadata address
+- The SSH relay now looks up the destination once and dials only the addresses that passed the check, so a host name pointing at a public address at check time and loopback at connect time no longer gets a tunnel to this server's own admin port or the cloud metadata address. All allowed addresses are kept, so dual-stack hosts still fall back from IPv6 to IPv4; LAN and jump-host destinations are unaffected
 - The SSH relay also refuses the unspecified addresses `0.0.0.0` and `::`, since on Linux a connection to those lands on loopback
 - The password reset flow now enforces the same 8-character minimum the sign-up and change-password endpoints use, so a reset can no longer be used to downgrade a password past the policy
 - Asking for a new password-reset code while one is still valid keeps the pending code instead of overwriting it, so a wrong-attempts counter can no longer be reset to zero by looping new codes
 - A login attempt for an external-only user (SSO) now takes the same time as a wrong password, closing a timing side channel that identified which accounts are SSO
 - The trusted-proxy peer secret is now compared on its UTF-8 bytes, so a header whose character count matches the secret but whose byte count differs no longer 500s the request
-- Open-redirect checks after an OIDC login now use the request's trusted hostname and scheme, so a direct caller that forges `X-Forwarded-Host` can no longer walk a victim to an attacker-controlled page
+- Open-redirect checks after an OIDC login now compare host and port with what Express derives under its trust-proxy policy, so a direct caller that forges `X-Forwarded-Host` no longer moves the same-origin baseline. The scheme is not compared, so installs behind a TLS-terminating proxy that is not on loopback keep working
 - A failed second-factor attempt is now counted only once the factor itself has rejected the code, so a transient server error no longer locks the user out for five minutes after a correct code
 - WebSocket origin checks accept at most one value from `X-Forwarded-Host`, so a reverse proxy that appends rather than overwrites that header no longer treats an attacker's host as same-origin
 - The admin user-export download header now escapes apostrophes in the UTF-8 filename, so legacy usernames like `o'brien` no longer produce a header some browsers refuse or truncate
