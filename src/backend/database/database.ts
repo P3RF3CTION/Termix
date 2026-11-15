@@ -151,7 +151,10 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     const timestamp = Date.now();
-    cb(null, `${timestamp}-${file.originalname}`);
+    // busboy already drops directory parts unless preservePath is set; strip
+    // them here too so the upload directory never depends on that default.
+    const safeName = path.basename(file.originalname).replace(/[/\\]/g, "_");
+    cb(null, `${timestamp}-${safeName}`);
   },
 });
 

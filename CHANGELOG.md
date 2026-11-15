@@ -14,6 +14,10 @@
 - A failed second-factor attempt is now counted only once the factor itself has rejected the code, so a transient server error no longer locks the user out for five minutes after a correct code
 - WebSocket origin checks accept at most one value from `X-Forwarded-Host`, so a reverse proxy that appends rather than overwrites that header no longer treats an attacker's host as same-origin
 - The admin user-export download header now escapes apostrophes in the UTF-8 filename, so legacy usernames like `o'brien` no longer produce a header some browsers refuse or truncate
+- Workflow inputs (`version_override` in the desktop build, `channel`/`mode` in Release, `mode` in Publish SDK) are passed to scripts through environment variables instead of being pasted into the shell command, and `version_override` must look like a version, so a crafted value can no longer run commands on the build runner
+- Table and column names in the legacy SQLite copy and the encryption migration are quoted as identifiers instead of being interpolated raw
+- Session tokens are verified with the algorithm they are signed with (HS256) pinned, instead of whatever the token header names
+- Uploaded database files are stored under their base name only, independently of the multipart parser's path handling
 
 ### Added
 

@@ -69,7 +69,7 @@ describe("RawSqliteUserEncryptionMigrationStore", () => {
     );
 
     expect(db.prepare).toHaveBeenCalledWith(
-      "UPDATE ssh_credentials SET password = ?, key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      'UPDATE "ssh_credentials" SET "password" = ?, "key" = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
     );
     expect(run).toHaveBeenCalledWith("p", "k", 99);
   });

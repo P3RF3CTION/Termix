@@ -23,6 +23,8 @@ jobs:
 
     env:
       NODE_OPTIONS: "--max-old-space-size=4096"
+      # Read as a shell variable, never interpolated into a run: block.
+      INPUT_MODE: ${{ inputs.mode }}
 
     steps:
       - uses: actions/checkout@v7
@@ -43,7 +45,7 @@ jobs:
           VERSION=$(node -p "require('./packages/plugin-sdk/package.json').version")
           if npm view "@termix-ssh/plugin-sdk@$VERSION" version >/dev/null 2>&1; then
             echo "@termix-ssh/plugin-sdk@$VERSION is already on npm. Bump packages/plugin-sdk/package.json first."
-            if [ "${{ inputs.mode }}" = "Publish" ]; then
+            if [ "$INPUT_MODE" = "Publish" ]; then
               exit 1
             fi
           fi
@@ -59,7 +61,7 @@ jobs:
 
       - name: Publish
         run: |
-          if [ "${{ inputs.mode }}" = "Dry run" ]; then
+          if [ "$INPUT_MODE" = "Dry run" ]; then
             npm publish --workspace @termix-ssh/plugin-sdk --provenance --access public --dry-run
           else
             npm publish --workspace @termix-ssh/plugin-sdk --provenance --access public

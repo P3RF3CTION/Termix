@@ -531,7 +531,11 @@ class AuthManager {
     try {
       const jwtSecret = await this.systemCrypto.getJWTSecret();
 
-      const payload = jwt.verify(token, jwtSecret) as JWTPayload;
+      // Pin the algorithm every token here is signed with (jsonwebtoken's
+      // default, HS256), so verification never follows the token header.
+      const payload = jwt.verify(token, jwtSecret, {
+        algorithms: ["HS256"],
+      }) as JWTPayload;
       if (
         payload.purpose !== undefined &&
         !(payload.purpose === "ws" && options.allowSocketTicket)

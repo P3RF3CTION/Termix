@@ -131,12 +131,20 @@ jobs:
       # A beta build has to know it is a beta, or it reports the stable version.
       - name: Stamp beta version
         if: inputs.version_override != ''
-        run: node scripts/sync-version.cjs --version "${{ inputs.version_override }}"
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: node scripts/sync-version.cjs --version "$env:INPUT_VERSION_OVERRIDE"
 
       - name: Get version
         id: package-version
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          $VERSION = "${{ inputs.version_override }}"
+          $VERSION = $env:INPUT_VERSION_OVERRIDE
+          if (-not [string]::IsNullOrEmpty($VERSION) -and $VERSION -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$') {
+            Write-Error "version_override is not a version: $VERSION"
+            exit 1
+          }
           if ([string]::IsNullOrEmpty($VERSION)) {
             $VERSION = (Get-Content package.json | ConvertFrom-Json).version
           }
@@ -314,7 +322,9 @@ jobs:
       # A beta build has to know it is a beta, or it reports the stable version.
       - name: Stamp beta version
         if: inputs.version_override != ''
-        run: node scripts/sync-version.cjs --version "${{ inputs.version_override }}"
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: node scripts/sync-version.cjs --version "$INPUT_VERSION_OVERRIDE"
 
       - name: Build Linux x64
         env:
@@ -438,8 +448,14 @@ jobs:
 
       - name: Get version for Flatpak
         id: flatpak-version
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          VERSION="${{ inputs.version_override }}"
+          VERSION="$INPUT_VERSION_OVERRIDE"
+          if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "version_override is not a version: $VERSION"
+            exit 1
+          fi
           if [ -z "$VERSION" ]; then
             VERSION=$(node -p "require('./package.json').version")
           fi
@@ -572,7 +588,9 @@ jobs:
       # A beta build has to know it is a beta, or it reports the stable version.
       - name: Stamp beta version
         if: inputs.version_override != ''
-        run: node scripts/sync-version.cjs --version "${{ inputs.version_override }}"
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: node scripts/sync-version.cjs --version "$INPUT_VERSION_OVERRIDE"
 
       - name: Check for Code Signing Certificates
         id: check_certs
@@ -752,8 +770,14 @@ jobs:
 
       - name: Get version for Homebrew
         id: homebrew-version
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          VERSION="${{ inputs.version_override }}"
+          VERSION="$INPUT_VERSION_OVERRIDE"
+          if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "version_override is not a version: $VERSION"
+            exit 1
+          fi
           if [ -z "$VERSION" ]; then
             VERSION=$(node -p "require('./package.json').version")
           fi

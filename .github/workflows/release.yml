@@ -52,9 +52,12 @@ jobs:
     steps:
       - name: Resolve channel and mode
         id: mode
+        env:
+          INPUT_CHANNEL: ${{ inputs.channel || 'Beta' }}
+          INPUT_MODE: ${{ inputs.mode || 'Everything' }}
         run: |
-          CHANNEL="${{ inputs.channel || 'Beta' }}"
-          MODE="${{ inputs.mode || 'Everything' }}"
+          CHANNEL="$INPUT_CHANNEL"
+          MODE="$INPUT_MODE"
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           if [ "$CHANNEL" = "Beta" ] && [ "$MODE" = "Overwrite release" ]; then
@@ -65,13 +68,13 @@ jobs:
       - name: Guard branch (release modes)
         if: ${{ github.event_name == 'workflow_dispatch' && steps.mode.outputs.mode != 'Overwrite release' && !startsWith(github.ref, 'refs/heads/dev-') }}
         run: |
-          echo "This mode must be run from a dev branch (got ${{ github.ref }})."
+          echo "This mode must be run from a dev branch (got $GITHUB_REF)."
           exit 1
 
       - name: Guard branch (overwrite mode)
         if: ${{ steps.mode.outputs.mode == 'Overwrite release' && github.ref != 'refs/heads/main' }}
         run: |
-          echo "Overwrite release must be run from main (got ${{ github.ref }})."
+          echo "Overwrite release must be run from main (got $GITHUB_REF)."
           exit 1
 
       - name: Checkout repository

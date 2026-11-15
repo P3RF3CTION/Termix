@@ -177,6 +177,18 @@ describe("AuthManager token handling", () => {
     expect(await authManager.verifyJWTToken(token)).toBeNull();
   });
 
+  it("only verifies tokens signed with HS256", async () => {
+    const hs256 = jwt.sign({ userId: "user-1", sessionId: "s1" }, jwtSecret, {
+      expiresIn: "1h",
+    });
+    expect((await authManager.verifyJWTToken(hs256))?.userId).toBe("user-1");
+    const hs512 = jwt.sign({ userId: "user-1", sessionId: "s1" }, jwtSecret, {
+      expiresIn: "1h",
+      algorithm: "HS512",
+    });
+    expect(await authManager.verifyJWTToken(hs512)).toBeNull();
+  });
+
   it("rejects a token whose session has expired", async () => {
     const token = jwt.sign(
       { userId: "user-1", sessionId: "expired" },
