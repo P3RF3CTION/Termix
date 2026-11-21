@@ -16,6 +16,8 @@ const h = vi.hoisted(() => ({
   policyError: null as Error | null,
   logins: [] as Array<{ hostId: number; outcome: unknown }>,
   connectError: null as Error | null,
+  // Saved hosts the permission mock knows: id -> address and who may connect.
+  saved: new Map<number, { ip: string; port: number; users: string[] }>(),
 }));
 
 vi.mock("../../utils/logger.js", () => {
@@ -118,7 +120,22 @@ vi.mock("../../plugins/host-status-provider.js", () => ({
       h.logins.push({ hostId, outcome }),
   },
 }));
+vi.mock("../../utils/permission-manager.js", () => ({
+  PermissionManager: {
+    getInstance: () => ({
+      canAccessHost: async (userId: string, hostId: number) => ({
+        hasAccess: !!h.saved.get(hostId)?.users.includes(userId),
+      }),
+    }),
+  },
+}));
 vi.mock("../../database/repositories/factory.js", () => ({
+  createCurrentHostResolutionRepository: () => ({
+    findHostById: async (hostId: number) => {
+      const saved = h.saved.get(hostId);
+      return saved ? { id: hostId, ip: saved.ip, port: saved.port } : null;
+    },
+  }),
   createCurrentUserAuthRepository: () => ({
     recordSecondFactor: async (
       userId: string,
@@ -179,6 +196,7 @@ beforeEach(() => {
   h.pooled = [];
   h.logins = [];
   h.connectError = null;
+  h.saved = new Map();
 });
 
 describe("ctx.ssh", () => {
@@ -349,6 +367,79 @@ describe("ctx.ssh", () => {
     const host = (await first.resolveHost(5))!;
     await second.connect({ ...host });
     expect(h.connects[0].target).not.toHaveProperty("password");
+  });
+
+  it("forces only tuning overrides, never the target or the host key check", async () => {
+    h.granted = new Set(["ssh:connect", "credentials:use"]);
+    const ssh = createPluginSsh({
+      manifest: manifest(["ssh:connect", "credentials:use"]),
+      bag: new DisposableBag("fixture"),
+      audit: vi.fn(async () => {}),
+    });
+    await ssh.connect(5, {
+      overrides: {
+        host: "attacker.example",
+        port: 2222,
+        hostVerifier: () => true,
+        username: "other",
+        agent: "/tmp/agent.sock",
+        readyTimeout: 60000,
+        keepaliveInterval: "nope",
+      },
+    });
+    expect(h.connects[0].options.overrides).toEqual({ readyTimeout: 60000 });
+  });
+
+  it("passes only the ask function of a prompt, never a host key socket", async () => {
+    h.granted = new Set(["ssh:connect", "credentials:use"]);
+    const ssh = createPluginSsh({
+      manifest: manifest(["ssh:connect", "credentials:use"]),
+      bag: new DisposableBag("fixture"),
+      audit: vi.fn(async () => {}),
+    });
+    const ask = vi.fn(async () => "123456");
+    await ssh.connect(5, {
+      prompt: { ask, hostKeySocket: { on: vi.fn(), send: vi.fn() } } as never,
+    });
+    const prompt = h.connects[0].options.prompt as Record<string, unknown>;
+    expect(Object.keys(prompt)).toEqual(["ask"]);
+    await (prompt.ask as (r: unknown) => Promise<string>)({ kind: "totp" });
+    expect(ask).toHaveBeenCalled();
+  });
+
+  it("drops the id of a plugin-built host the user may not act as", async () => {
+    h.granted = new Set(["ssh:connect", "credentials:use"]);
+    h.saved.set(40, { ip: "10.0.0.40", port: 22, users: ["victim"] });
+    h.saved.set(41, { ip: "10.0.0.41", port: 22, users: ["user-1"] });
+    const ssh = createPluginSsh({
+      manifest: manifest(["ssh:connect", "credentials:use"]),
+      bag: new DisposableBag("fixture"),
+      audit: vi.fn(async () => {}),
+    });
+    // Someone else's host: its key must not be re-pinned.
+    await ssh.connect({
+      id: 40,
+      ip: "attacker",
+      port: 22,
+      username: "x",
+    } as never);
+    expect(h.connects[0].target).not.toHaveProperty("id");
+    // A host the user can reach, but pointed at another address.
+    await ssh.connect({
+      id: 41,
+      ip: "attacker",
+      port: 22,
+      username: "x",
+    } as never);
+    expect(h.connects[1].target).not.toHaveProperty("id");
+    // The same host at its saved address keeps its id.
+    await ssh.connect({
+      id: 41,
+      ip: "10.0.0.41",
+      port: 22,
+      username: "x",
+    } as never);
+    expect(h.connects[2].target).toMatchObject({ id: 41 });
   });
 
   it("passes a given stream through to the pipeline, gated like any connect", async () => {

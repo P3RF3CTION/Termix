@@ -30,31 +30,79 @@ describe("trusted proxy authentication config", () => {
   });
 
   it("judges requests relayed by the bundled nginx by nginx's own peer", () => {
-    const viaNginx = (peer?: string) => ({
-      headers: peer ? { "x-termix-proxy-peer": peer } : {},
+    const token = "per-boot-token";
+    const viaNginx = (
+      peer?: string,
+      sentToken: string | undefined = token,
+    ) => ({
+      headers: {
+        ...(peer ? { "x-termix-proxy-peer": peer } : {}),
+        ...(sentToken ? { "x-termix-proxy-token": sentToken } : {}),
+      },
       socket: { remoteAddress: "::ffff:127.0.0.1" },
     });
-    expect(getTrustedProxySourceAddress(viaNginx("172.20.0.10"))).toBe(
+    expect(getTrustedProxySourceAddress(viaNginx("172.20.0.10"), token)).toBe(
       "172.20.0.10",
     );
     // A client reaching nginx directly is reported as itself, so trusting
     // the auth proxy no longer means trusting nginx on loopback.
     expect(
       isTrustedProxyAddress(
-        getTrustedProxySourceAddress(viaNginx("203.0.113.7")),
+        getTrustedProxySourceAddress(viaNginx("203.0.113.7"), token),
         ["127.0.0.1"],
       ),
     ).toBe(false);
     // A local reverse proxy that does not set the header keeps working.
-    expect(getTrustedProxySourceAddress(viaNginx())).toBe("::ffff:127.0.0.1");
+    expect(getTrustedProxySourceAddress(viaNginx(), token)).toBe(
+      "::ffff:127.0.0.1",
+    );
+  });
+
+  it("ignores the peer header from loopback without nginx's token", () => {
+    const local = (headers: Record<string, string>) => ({
+      headers,
+      socket: { remoteAddress: "127.0.0.1" },
+    });
+    // A plugin or other local process talking to the backend port directly.
+    expect(
+      getTrustedProxySourceAddress(
+        local({ "x-termix-proxy-peer": "172.20.0.10" }),
+        "per-boot-token",
+      ),
+    ).toBe("127.0.0.1");
+    expect(
+      getTrustedProxySourceAddress(
+        local({
+          "x-termix-proxy-peer": "172.20.0.10",
+          "x-termix-proxy-token": "guess",
+        }),
+        "per-boot-token",
+      ),
+    ).toBe("127.0.0.1");
+    // No token configured (not behind the bundled nginx): never trusted.
+    expect(
+      getTrustedProxySourceAddress(
+        local({
+          "x-termix-proxy-peer": "172.20.0.10",
+          "x-termix-proxy-token": "",
+        }),
+        undefined,
+      ),
+    ).toBe("127.0.0.1");
   });
 
   it("ignores the peer header on connections that are not from loopback", () => {
     expect(
-      getTrustedProxySourceAddress({
-        headers: { "x-termix-proxy-peer": "172.20.0.10" },
-        socket: { remoteAddress: "198.51.100.9" },
-      }),
+      getTrustedProxySourceAddress(
+        {
+          headers: {
+            "x-termix-proxy-peer": "172.20.0.10",
+            "x-termix-proxy-token": "per-boot-token",
+          },
+          socket: { remoteAddress: "198.51.100.9" },
+        },
+        "per-boot-token",
+      ),
     ).toBe("198.51.100.9");
   });
 

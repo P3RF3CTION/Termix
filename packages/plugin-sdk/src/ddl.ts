@@ -471,6 +471,59 @@ const REFUSED_FUNCTIONS = new Set([
   "SYS_EVAL",
 ]);
 
+/**
+ * Core tables holding login material (session tokens, key and invite hashes,
+ * second factors, shared secrets, other plugins' stored values). A migration
+ * may reference them but never copy rows out of them: copying sessions would
+ * hand the plugin live bearer tokens.
+ */
+const SECRET_CORE_TABLES = new Set([
+  "sessions",
+  "trusted_devices",
+  "user_external_identities",
+  "user_second_factors",
+  "ssh_credentials",
+  "host_protocol_auth",
+  "shared_host_auth_overrides",
+  "shared_folder_auth_overrides",
+  "shared_host_secrets",
+  "shared_credential_secrets",
+  "api_keys",
+  "user_invites",
+  "settings",
+  "plugin_storage",
+  "plugin_settings",
+  "sync_link",
+]);
+
+/** Words that end a FROM item instead of naming its alias. */
+const SOURCE_TERMINATORS = new Set([
+  "WHERE",
+  "JOIN",
+  "INNER",
+  "LEFT",
+  "RIGHT",
+  "FULL",
+  "CROSS",
+  "NATURAL",
+  "OUTER",
+  "ON",
+  "USING",
+  "GROUP",
+  "ORDER",
+  "LIMIT",
+  "OFFSET",
+  "HAVING",
+  "UNION",
+  "EXCEPT",
+  "INTERSECT",
+  "WINDOW",
+  "RETURNING",
+  "SET",
+  "VALUES",
+  "FOR",
+]);
+
 const CREATE_MODIFIERS = [
   "OR",
   "REPLACE",
@@ -492,7 +545,10 @@ const CREATE_MODIFIERS = [
  * than matching one pattern: a comment between a keyword and a name, bracket
  * quoting, a second name in a DROP list, a schema-qualified name and
  * `ALTER ... RENAME TO users` are all seen. Reads (FROM, JOIN, REFERENCES)
- * are allowed; writes outside the plugin's prefix are not.
+ * are allowed, except from core tables holding login material; writes
+ * outside the plugin's prefix are not. A view may only read the plugin's own
+ * tables, since it would otherwise be a live, possibly writable, window onto
+ * core data that the runtime SQL guard counts as the plugin's own table.
  *
  * `ownedLegacy` lists the legacy core tables this plugin adopts.
  */
@@ -559,6 +615,49 @@ export function findUnownedTableWrites(
       return -1;
     };
 
+    /**
+     * The tables a statement reads after FROM or JOIN, including comma
+     * lists (FROM a, b) and schema-qualified names. Subqueries are walked
+     * because their own FROM is found by the same scan.
+     */
+    const readSources = (): Array<{ at: number; name: string }> => {
+      const found: Array<{ at: number; name: string }> = [];
+      for (let at = 0; at < tokens.length; at++) {
+        const word = upper(at);
+        if (word !== "FROM" && word !== "JOIN") continue;
+        let cursor = skip(at + 1, ["ONLY", "LATERAL"]);
+        for (;;) {
+          const name = tokens[cursor];
+          if (!name || name.kind === "punct") break;
+          let last = cursor;
+          if (tokens[cursor + 1]?.value === "." && tokens[cursor + 2]) {
+            last = cursor + 2;
+          }
+          found.push({ at: cursor, name: tokens[last].value });
+          cursor = last + 1;
+          // An optional alias: [AS] name.
+          if (upper(cursor) === "AS") cursor++;
+          if (
+            tokens[cursor] &&
+            tokens[cursor].kind !== "punct" &&
+            !SOURCE_TERMINATORS.has(upper(cursor))
+          ) {
+            cursor++;
+          }
+          if (tokens[cursor]?.value !== ",") break;
+          cursor++;
+        }
+      }
+      return found;
+    };
+    for (const source of readSources()) {
+      if (SECRET_CORE_TABLES.has(source.name.toLowerCase())) {
+        problems.push(
+          `reads "${source.name}", a core table a plugin migration may not copy from`,
+        );
+      }
+    }
+
     const first = upper(0);
     if (REFUSED_STATEMENTS.has(first)) {
       problems.push(`${first} is not allowed in a plugin migration`);
@@ -611,6 +710,18 @@ export function findUnownedTableWrites(
           `${first} ${object || tokens[at]?.value || ""} is not allowed in a plugin migration`.trim(),
         );
         continue;
+      }
+      if (object === "VIEW" && first === "CREATE") {
+        for (const source of readSources()) {
+          if (
+            tokens[source.at + 1]?.value === "." ||
+            (!source.name.startsWith(prefix) && !ownedLegacy.has(source.name))
+          ) {
+            problems.push(
+              `view reads "${source.name}", which is not prefixed "${prefix}"`,
+            );
+          }
+        }
       }
       at = table(skip(at + 1, ["IF", "NOT", "EXISTS", "ONLY"]));
       // DROP TABLE a, b drops both.

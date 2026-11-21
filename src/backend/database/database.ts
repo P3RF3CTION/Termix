@@ -2018,6 +2018,9 @@ async function importHostProtocolLogins(
   );
 }
 
+const IMPORT_PLUGIN_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const UNSAFE_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 /**
  * What an exported host carries for plugins: the plugin_settings rows a 2.9
  * export writes, plus the whole row in camelCase so a plugin's import
@@ -2032,7 +2035,11 @@ function importedHostPluginSettings(
     raw[column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())] = value;
   }
 
-  const pluginSettings: Record<string, Record<string, unknown>> = {};
+  // Null-prototype maps: plugin_id and key come from an uploaded file, and a
+  // "__proto__" plugin_id on a plain object would write to Object.prototype.
+  const pluginSettings: Record<string, Record<string, unknown>> = Object.create(
+    null,
+  );
   try {
     const rows = importDb
       .prepare(
@@ -2050,7 +2057,15 @@ function importedHostPluginSettings(
       } catch {
         continue;
       }
-      (pluginSettings[row.plugin_id] ??= {})[row.key] = value;
+      if (
+        typeof row.plugin_id !== "string" ||
+        typeof row.key !== "string" ||
+        !IMPORT_PLUGIN_ID.test(row.plugin_id) ||
+        UNSAFE_OBJECT_KEYS.has(row.key)
+      ) {
+        continue;
+      }
+      (pluginSettings[row.plugin_id] ??= Object.create(null))[row.key] = value;
     }
   } catch {
     // A 2.8 export has no plugin_settings table.

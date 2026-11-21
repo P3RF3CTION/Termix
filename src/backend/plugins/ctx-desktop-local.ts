@@ -76,11 +76,22 @@ export function createPluginDesktopLocal(deps: Deps): PluginDesktopLocal {
         !subPath.startsWith("/") ||
         subPath.startsWith("//") ||
         subPath.includes("\\") ||
-        /(^|\/)\.\.?(\/|\?|$)/.test(subPath)
+        // %2e%2e is ".." to a WHATWG URL parser, and %2f / %5c are slashes
+        // to some routers, so encoded dots and slashes are refused too.
+        /%(2e|2f|5c)/i.test(subPath) ||
+        /(^|\/)\.\.?(\/|\?|#|$)/.test(subPath)
       ) {
         throw new Error("Invalid plugin route path");
       }
       const route = `/plugin-api/${manifest.id}${subPath}`;
+      const ownPrefix = `/plugin-api/${manifest.id}/`;
+      const resolved = new URL(route, "http://127.0.0.1").pathname;
+      if (
+        resolved !== ownPrefix.slice(0, -1) &&
+        !resolved.startsWith(ownPrefix)
+      ) {
+        throw new Error("Invalid plugin route path");
+      }
       const headers: Record<string, string> = { ...init?.headers };
       for (const name of Object.keys(headers)) {
         if (/^(authorization|cookie|host)$/i.test(name)) delete headers[name];

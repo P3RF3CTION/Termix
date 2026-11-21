@@ -387,7 +387,8 @@ export async function applyPluginHostImportSettings(
       const carried = exported[manifest.id];
       if (carried && typeof carried === "object") {
         for (const field of declaredFields(manifest, "host")) {
-          if (field.type === "secret" || !(field.key in carried)) continue;
+          if (field.type === "secret" || !Object.hasOwn(carried, field.key))
+            continue;
           if (actorId && !(await mayWrite(actorId, manifest, field.key)))
             continue;
           await setSetting(

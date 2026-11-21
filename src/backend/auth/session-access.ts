@@ -5,6 +5,7 @@
 
 import { listSecondFactors } from "./registry.js";
 import { SECOND_FACTOR_SETUP } from "./policy.js";
+import { canonicalRoutePath } from "../utils/route-path.js";
 
 const PLUGIN_ROUTE_PATH = /^\/plugin-(?:api|ws)\/([a-z][a-z0-9-]*)(\/|$)/;
 
@@ -14,6 +15,8 @@ const PLUGIN_ROUTE_PATH = /^\/plugin-(?:api|ws)\/([a-z][a-z0-9-]*)(\/|$)/;
 const PLUGIN_SESSION_BLOCKLIST = [
   /^\/users\/(change-password|api-keys|link-external-to-password|unlink-external-from-password|admin\/reset-password)(\/|$)/,
   /^\/users\/admin\/[^/]+\/second-factors(\/|$)/,
+  // Registering a passkey or WebAuthn factor would outlive the session too.
+  /^\/plugins\/[^/]+\/passkey-steps(\/|$)/,
 ];
 
 // What a session that must set up a second factor first may call: who am I,
@@ -79,9 +82,10 @@ export interface SessionRefusal {
 /** Why this session may not reach this path, or null when it may. */
 export function sessionAccessRefusal(
   session: SessionAccessInput,
-  path: string,
+  rawPath: string,
   method = "GET",
 ): SessionRefusal | null {
+  const path = canonicalRoutePath(rawPath);
   if (session.pendingTOTP) {
     return {
       status: 401,

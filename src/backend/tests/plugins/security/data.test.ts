@@ -109,6 +109,38 @@ describe("the migration checker", () => {
       "SELECT query_to_xml('DELETE FROM users', true, true, '')",
     ],
     ["setval on a core sequence", "SELECT setval('users_id_seq', 1)"],
+    [
+      "a view over a core table",
+      "CREATE VIEW p_foo_s AS SELECT * FROM sessions",
+    ],
+    [
+      "a view joining a core table",
+      "CREATE VIEW p_foo_v AS SELECT a.id FROM p_foo_a a JOIN users u ON u.id = a.id",
+    ],
+    [
+      "a view over a comma-listed core table",
+      "CREATE VIEW p_foo_v AS SELECT * FROM p_foo_a, users",
+    ],
+    [
+      "a view over a schema-qualified table",
+      "CREATE VIEW p_foo_v AS SELECT * FROM main.p_foo_a",
+    ],
+    [
+      "copying session tokens",
+      "INSERT INTO p_foo_a SELECT jwt_token FROM sessions",
+    ],
+    [
+      "copying session tokens with CREATE TABLE AS",
+      'CREATE TABLE p_foo_a AS SELECT * FROM "sessions"',
+    ],
+    [
+      "copying api keys through a subquery",
+      "INSERT INTO p_foo_a SELECT id FROM p_foo_b WHERE id IN (SELECT id FROM api_keys)",
+    ],
+    [
+      "copying another plugin's settings",
+      "INSERT INTO p_foo_a SELECT value FROM p_foo_b, plugin_settings",
+    ],
   ])("refuses %s", (_label, sql) => {
     expect(findUnownedTableWrites("foo", sql)).not.toEqual([]);
   });
@@ -135,6 +167,11 @@ describe("the migration checker", () => {
       "SELECT setval(pg_get_serial_sequence('p_foo_a', 'id'), 1)",
     ],
     ["its own sequence", "CREATE SEQUENCE IF NOT EXISTS p_foo_seq"],
+    [
+      "a view over its own tables",
+      "CREATE VIEW p_foo_v AS SELECT a.id FROM p_foo_a AS a LEFT JOIN p_foo_b b ON b.id = a.id",
+    ],
+    ["dropping its own view", "DROP VIEW IF EXISTS p_foo_v"],
   ])("allows %s", (_label, sql) => {
     expect(findUnownedTableWrites("foo", sql)).toEqual([]);
   });

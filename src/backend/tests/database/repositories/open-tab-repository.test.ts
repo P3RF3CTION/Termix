@@ -121,9 +121,27 @@ describe("OpenTabRepository", () => {
     expect(
       await repo.updateForUser("user-1", "tab-1", { label: "Renamed" }),
     ).toBe(true);
+    // Only the client-editable columns change; a body carrying userId, id or
+    // tabType can't move the tab into another account.
+    expect(
+      await repo.updateForUser("user-1", "tab-1", {
+        label: "Moved?",
+        userId: "user-2",
+        id: "tab-x",
+        tabType: "settings",
+      } as never),
+    ).toBe(true);
+    expect(
+      await repo.listRecentForUser("user-2", "2000-01-01T00:00:00.000Z"),
+    ).toEqual([]);
+    expect(
+      (await repo.listRecentForUser("user-1", "2000-01-01T00:00:00.000Z")).find(
+        (tab) => tab.id === "tab-1",
+      ),
+    ).toMatchObject({ label: "Moved?", tabType: "terminal" });
     expect(await repo.deleteForUser("user-1", "tab-2")).toBe(1);
     expect(await repo.deleteByUserId("user-1")).toBe(1);
     expect(await repo.deleteByUserId("user-1")).toBe(0);
-    expect(writeCount).toBe(4);
+    expect(writeCount).toBe(5);
   });
 });

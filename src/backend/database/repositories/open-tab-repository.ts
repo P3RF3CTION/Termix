@@ -114,7 +114,7 @@ export class OpenTabRepository {
   ): Promise<boolean> {
     const result = await this.context.drizzle
       .update(userOpenTabs)
-      .set({ ...update, updatedAt })
+      .set({ ...pickOpenTabUpdate(update), updatedAt })
       .where(and(eq(userOpenTabs.id, id), eq(userOpenTabs.userId, userId)));
 
     if (rowsAffected(result) > 0) {
@@ -164,4 +164,25 @@ export class OpenTabRepository {
   private async afterWrite(): Promise<void> {
     await this.onWrite?.();
   }
+}
+
+/**
+ * Only the columns a client may change. The route hands over the request body,
+ * and spreading it would let a caller rewrite userId, id or tabType.
+ */
+function pickOpenTabUpdate(update: OpenTabUpdate): OpenTabUpdate {
+  const picked: OpenTabUpdate = {};
+  const raw = (update ?? {}) as Record<string, unknown>;
+  if (raw.hostId === null || Number.isInteger(raw.hostId)) {
+    picked.hostId = raw.hostId as number | null;
+  }
+  if (typeof raw.label === "string") picked.label = raw.label;
+  if (Number.isInteger(raw.tabOrder)) picked.tabOrder = raw.tabOrder as number;
+  if (
+    raw.backendSessionId === null ||
+    typeof raw.backendSessionId === "string"
+  ) {
+    picked.backendSessionId = raw.backendSessionId as string | null;
+  }
+  return picked;
 }

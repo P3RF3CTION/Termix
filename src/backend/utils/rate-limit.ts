@@ -12,6 +12,7 @@
 import crypto from "crypto";
 import type { NextFunction, Request, Response } from "express";
 import { getClientIp } from "./request-origin.js";
+import { canonicalRoutePath } from "./route-path.js";
 
 export interface RateLimit {
   /** Requests allowed per window. */
@@ -100,7 +101,7 @@ export function rateLimitMiddleware(rules: RateLimitRule[]) {
     if (process.env.TERMIX_AUTHZ_NO_RATE_LIMITS === "1") return next();
     for (const rule of rules) {
       if (!rule.methods.includes(req.method)) continue;
-      if (!rule.path.test(req.path)) continue;
+      if (!rule.path.test(canonicalRoutePath(req.path))) continue;
       if (rule.perIp) {
         const wait = hit(`${rule.name}:ip:${getClientIp(req)}`, rule.perIp);
         if (wait) return refuse(res, wait);
