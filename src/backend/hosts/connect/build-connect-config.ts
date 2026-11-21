@@ -281,7 +281,15 @@ export async function buildConnectConfig(
     Object.assign(config, await provider.connectOptions(host, options.purpose));
   }
   if (options.overrides) {
-    Object.assign(config, options.overrides);
+    // Overrides tune the connection; they never retarget it or replace the
+    // host key check built above.
+    const {
+      host: _host,
+      port: _port,
+      hostVerifier: _hostVerifier,
+      ...tuning
+    } = options.overrides as Record<string, unknown>;
+    Object.assign(config, tuning);
   }
 
   const outcome = await provider.prepare(config, host, env);

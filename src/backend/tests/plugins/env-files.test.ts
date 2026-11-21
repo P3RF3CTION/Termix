@@ -65,6 +65,24 @@ describe("ctx.files.readEnvFile", () => {
     ).rejects.toThrow(/"file": true/);
   });
 
+  it.each([
+    "DATABASE_KEY_FILE",
+    "DATABASE_KEY_PREVIOUS_FILE",
+    "INTERNAL_AUTH_TOKEN_FILE",
+    "OIDC_SYSTEM_SECRET_FILE",
+    "WEBAUTHN_SYSTEM_SECRET_FILE",
+  ])("never reads core's %s or the file it names", async (name) => {
+    await expect(
+      readPluginEnvFile(manifest([fileVar(name)]), name, { [name]: keyFile }),
+    ).rejects.toThrow(/Termix's own variables/);
+    await expect(
+      readPluginEnvFile(manifest([fileVar("MY_FILE")]), "MY_FILE", {
+        MY_FILE: keyFile,
+        [name]: keyFile,
+      }),
+    ).rejects.toThrow(/Termix's own files/);
+  });
+
   it("never reads core's own key files or the data folder", async () => {
     await expect(
       readPluginEnvFile(

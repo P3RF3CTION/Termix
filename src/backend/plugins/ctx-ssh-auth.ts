@@ -63,6 +63,7 @@ import type {
   SshConnectHost,
   SshConnectProfile,
   SshConnectPurpose,
+  SshPromptChannel,
 } from "../hosts/connect/types.js";
 import { answeredSync } from "./api1-sync.js";
 
@@ -152,6 +153,77 @@ function withOverrides(
   for (const field of set) merged[field] = source[field];
   if (typeof source.authType === "string") merged.authType = source.authType;
   return merged as unknown as SshConnectHost;
+}
+
+/**
+ * ssh2 config fields a plugin may force through `overrides`. Anything that
+ * picks the destination, the host key check or the login (host, port,
+ * hostVerifier, sock, username, password, agent, ...) stays core's, or a
+ * plugin could send a saved host's stored password to a server of its own.
+ */
+const SAFE_CONNECT_OVERRIDES: Record<string, "number" | "boolean"> = {
+  readyTimeout: "number",
+  timeout: "number",
+  keepaliveInterval: "number",
+  keepaliveCountMax: "number",
+  forceIPv4: "boolean",
+  forceIPv6: "boolean",
+  strictVendor: "boolean",
+};
+
+function safeConnectOverrides(
+  overrides: unknown,
+): Partial<MutableConnectConfig> | undefined {
+  if (!overrides || typeof overrides !== "object") return undefined;
+  const picked: Record<string, unknown> = {};
+  for (const [key, type] of Object.entries(SAFE_CONNECT_OVERRIDES)) {
+    const value = (overrides as Record<string, unknown>)[key];
+    if (typeof value === type) picked[key] = value;
+  }
+  return picked as Partial<MutableConnectConfig>;
+}
+
+/**
+ * Only the plugin's ask function crosses over. A plugin-made hostKeySocket
+ * would let it answer core's host key prompts itself and re-pin any key.
+ */
+function safePromptChannel(prompt: unknown): SshPromptChannel | undefined {
+  const ask = (prompt as { ask?: unknown } | null | undefined)?.ask;
+  if (typeof ask !== "function") return undefined;
+  return { ask: ask.bind(prompt) } as SshPromptChannel;
+}
+
+/**
+ * Whether a host object the plugin built itself may act as saved host `id`
+ * for host key checks: the user must have connect access to it and the
+ * object must point at the address that host is saved with. Otherwise a
+ * plugin could pin its own server's key on someone else's host.
+ */
+async function mayActAsSavedHost(
+  id: unknown,
+  ip: unknown,
+  port: unknown,
+  userId: string,
+): Promise<boolean> {
+  if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) return false;
+  const { PermissionManager } = await import("../utils/permission-manager.js");
+  const access = await PermissionManager.getInstance().canAccessHost(
+    userId,
+    id,
+    "connect",
+  );
+  if (!access.hasAccess) return false;
+  const { createCurrentHostResolutionRepository } =
+    await import("../database/repositories/factory.js");
+  const saved = await createCurrentHostResolutionRepository().findHostById(
+    id,
+    userId,
+  );
+  if (!saved) return false;
+  return (
+    String(saved.ip ?? "") === String(ip ?? "") &&
+    Number(saved.port || 22) === Number(port || 22)
+  );
 }
 
 export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
@@ -259,14 +331,22 @@ export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
    * access check). An object core handed out maps back to what core resolved;
    * any other object is the plugin's own, so it runs as the actor.
    */
-  const toConnectHost = (
+  const toConnectHost = async (
     host: number | PluginSshHost,
     userId: string,
-  ): number | SshConnectHost => {
+  ): Promise<number | SshConnectHost> => {
     if (typeof host === "number") return host;
     const known = lookup(host);
     if (known) return withOverrides(known.host, host);
-    return { ...(host as unknown as SshConnectHost), userId };
+    const own = { ...(host as unknown as SshConnectHost), userId };
+    if (!(await mayActAsSavedHost(own.id, own.ip, own.port, userId))) {
+      // Treated as an unsaved host: its key is never pinned anywhere.
+      const unsaved = own as unknown as Record<string, unknown>;
+      delete unsaved.id;
+      delete unsaved.syncId;
+      delete unsaved.serverHostId;
+    }
+    return own;
   };
 
   /** A working login to a saved host core resolved marks it online. */
@@ -303,14 +383,14 @@ export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
     }
     const { connectHost } = await import("../hosts/connect/connect-host.js");
     try {
-      const connection = await connectHost(toConnectHost(host, userId), {
+      const connection = await connectHost(await toConnectHost(host, userId), {
         userId,
         purpose: purposeOf(options),
         profile: profileOf(options),
         origin: pluginId,
         timeoutMs: options?.timeoutMs,
-        prompt: options?.prompt,
-        overrides: options?.overrides as Partial<MutableConnectConfig>,
+        prompt: safePromptChannel(options?.prompt),
+        overrides: safeConnectOverrides(options?.overrides),
         sock: options?.sock as MutableConnectConfig["sock"],
       });
       await audit("ssh_connect", describeHost(host), { success: true });
@@ -421,7 +501,7 @@ export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
         await import("../hosts/connect/connect-host.js");
       const userId = userFor(host);
       const resolved = await resolveConnectHost(
-        toConnectHost(host, userId),
+        await toConnectHost(host, userId),
         userId,
       );
       remember(resolved, resolved, userId);
@@ -559,7 +639,17 @@ export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
       await checkSsh(true);
       await assertCapability(pluginId, "credentials:read", declared);
       const userId = userFor(host);
-      const target = toConnectHost(host, userId) as SshConnectHost;
+      const target = (await toConnectHost(host, userId)) as SshConnectHost;
+      const serverHostId =
+        options.serverHostId !== undefined &&
+        (await mayActAsSavedHost(
+          options.serverHostId,
+          target.ip,
+          target.port,
+          userId,
+        ))
+          ? options.serverHostId
+          : undefined;
       const { buildConnectConfig } =
         await import("../hosts/connect/build-connect-config.js");
       const built = await buildConnectConfig(target, {
@@ -567,7 +657,7 @@ export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
         purpose: purposeOf(options),
         profile: profileOf(options),
         client: options.client as never,
-        serverHostId: options.serverHostId,
+        serverHostId,
         log: options.log,
         interactive: options.interactive,
         origin: pluginId,
@@ -595,7 +685,10 @@ export function createPluginSsh({ manifest, bag, audit }: Deps): PluginSsh {
 
     openTransport: async (host, config, transportOptions) => {
       await checkSsh(true);
-      const target = toConnectHost(host, userFor(host)) as SshConnectHost;
+      const target = (await toConnectHost(
+        host,
+        userFor(host),
+      )) as SshConnectHost;
       const { openSshTransport } =
         await import("../hosts/connect/transport.js");
       let opened: Awaited<ReturnType<typeof openSshTransport>>;

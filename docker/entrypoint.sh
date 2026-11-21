@@ -76,8 +76,14 @@ else
     NGINX_CONF_SOURCE="/app/nginx/nginx.conf.template"
 fi
 
+# A per-boot secret nginx sends with X-Termix-Proxy-Peer, so core believes
+# that header only from nginx and not from other local processes (plugins).
+TERMIX_PROXY_PEER_TOKEN=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+export TERMIX_PROXY_PEER_TOKEN
+
 mkdir -p /tmp/nginx
-envsubst '${PORT} ${SSL_PORT} ${SSL_CERT_PATH} ${SSL_KEY_PATH}' < $NGINX_CONF_SOURCE > /tmp/nginx/nginx.conf
+(umask 077 && envsubst '${PORT} ${SSL_PORT} ${SSL_CERT_PATH} ${SSL_KEY_PATH} ${TERMIX_PROXY_PEER_TOKEN}' < $NGINX_CONF_SOURCE > /tmp/nginx/nginx.conf)
+chmod 600 /tmp/nginx/nginx.conf
 
 # Which proxies may set the client IP through X-Forwarded-For. Unset keeps
 # the private ranges in the template.
@@ -95,6 +101,7 @@ if [ -n "$TRUSTED_PROXIES" ]; then
         /# END TRUSTED_PROXIES/ { skip = 0; next }
         !skip
     ' /tmp/nginx/nginx.conf > /tmp/nginx/nginx.conf.tmp
+    chmod 600 /tmp/nginx/nginx.conf.tmp
     mv /tmp/nginx/nginx.conf.tmp /tmp/nginx/nginx.conf
 fi
 

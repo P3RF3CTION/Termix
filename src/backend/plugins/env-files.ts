@@ -8,15 +8,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { PluginManifest } from "@termix-ssh/plugin-sdk/manifest";
-import { isPassableEnv } from "./sandbox/launcher/policy.js";
+import { CORE_ONLY_ENV, isPassableEnv } from "./sandbox/launcher/policy.js";
 
 export const MAX_ENV_FILE_BYTES = 5 * 1024 * 1024;
 
-/** Variables core reads its own secret files from. */
+/**
+ * Variables core reads its own secret files from: NAME_FILE and
+ * NAME_PREVIOUS_FILE for every core-only secret (DATABASE_KEY_FILE,
+ * INTERNAL_AUTH_TOKEN_FILE, ...), derived so a new core secret is covered
+ * without remembering this list, plus the TLS key and certificate.
+ */
 const CORE_FILE_ENV = [
-  "ENCRYPTION_KEY_FILE",
-  "ENCRYPTION_KEY_PREVIOUS_FILE",
-  "JWT_SECRET_FILE",
+  ...[...CORE_ONLY_ENV].flatMap((name) => [
+    `${name}_FILE`,
+    `${name}_PREVIOUS_FILE`,
+  ]),
   "SSL_KEY_PATH",
   "SSL_CERT_PATH",
 ];

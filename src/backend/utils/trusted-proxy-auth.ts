@@ -1,4 +1,5 @@
 import type { IncomingHttpHeaders } from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { BlockList, isIP } from "node:net";
 
 export interface TrustedProxyAuthConfig {
@@ -115,23 +116,43 @@ function isLoopbackAddress(address: string): boolean {
 }
 
 /**
- * The address checked against the allowlist. The bundled nginx always
- * connects from loopback and sets X-Termix-Proxy-Peer to its own TCP peer,
- * overwriting whatever the client sent, so behind it the proxy that counts
- * is that peer rather than nginx. Any other connection is judged by its
- * socket address.
+ * The address checked against the allowlist. The bundled nginx connects from
+ * loopback and sets X-Termix-Proxy-Peer to its own TCP peer, overwriting
+ * whatever the client sent, so behind it the proxy that counts is that peer
+ * rather than nginx. Loopback alone does not prove the request came from
+ * nginx: plugins and other local processes can reach the backend port too.
+ * So the peer header is only believed together with X-Termix-Proxy-Token,
+ * a per-boot secret the Docker entrypoint gives nginx and core and nothing
+ * else. Any other connection is judged by its socket address.
  */
-export function getTrustedProxySourceAddress(req: {
-  headers: IncomingHttpHeaders;
-  socket: { remoteAddress?: string };
-}): string | undefined {
+export function getTrustedProxySourceAddress(
+  req: {
+    headers: IncomingHttpHeaders;
+    socket: { remoteAddress?: string };
+  },
+  peerToken: string | undefined = process.env.TERMIX_PROXY_PEER_TOKEN,
+): string | undefined {
   const socketAddress = req.socket.remoteAddress;
   const peer = req.headers["x-termix-proxy-peer"];
-  return socketAddress &&
-    isLoopbackAddress(socketAddress) &&
-    typeof peer === "string"
-    ? peer
-    : socketAddress;
+  if (
+    !socketAddress ||
+    !isLoopbackAddress(socketAddress) ||
+    typeof peer !== "string" ||
+    !proxyTokenMatches(req.headers["x-termix-proxy-token"], peerToken)
+  ) {
+    return socketAddress;
+  }
+  return peer;
+}
+
+function proxyTokenMatches(
+  supplied: string | string[] | undefined,
+  expected: string | undefined,
+): boolean {
+  if (!expected || typeof supplied !== "string") return false;
+  const a = createHash("sha256").update(supplied).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 export function resolveTrustedProxyRoles(
